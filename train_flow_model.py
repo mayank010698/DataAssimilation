@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 from model import MLP
 
 
+
+
 path = "/Users/mayankshrivastava/Desktop/DataAssimilation/FlowDAS/experiments/lorenz/data/dataset/train.h5"
 with h5py.File(path, "r") as f:
     print("Keys:", list(f.keys()))
@@ -35,8 +37,7 @@ optimizer = torch.optim.Adam(net.parameters(), lr=lr, weight_decay=1e-5)
 criterion = nn.MSELoss()   # between predicted drift and (x1 - x0)
 
 
-
-epochs = 5                   
+epochs = 20                  
 losses = []
 
 net.train()
