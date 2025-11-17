@@ -1,15 +1,4 @@
-# Data Assimilation with Bootstrap Particle Filters
-
-A research project implementing Bootstrap Particle Filters (BPF) for data assimilation on the Lorenz 63 chaotic dynamical system, with support for different proposal distributions including learned Rectified Flow models.
-
-## Overview
-
-This project explores advanced data assimilation techniques using particle filtering methods on the Lorenz 63 system. The main focus is on comparing different proposal distributions for Bootstrap Particle Filters, including:
-
-1. **Standard Transition Proposals** - Using the system dynamics
-2. **Rectified Flow Proposals** - Neural network-based learned proposals
-
-The implementation supports various observation operators (linear projection and nonlinear arctan) and preprocessing options for normalized state spaces.
+# Data Assimilation with Particle Filters
 
 ## Project Structure
 
@@ -143,15 +132,6 @@ The project generates:
 - **Metrics**: Mean RMSE, log-likelihood, effective sample size
 - **Wandb logs**: Comprehensive experiment tracking
 - **Checkpoints**: Trained RF models for reuse
-
-## Research Focus
-
-This work investigates:
-1. **Proposal distribution effectiveness** for particle filtering
-2. **Impact of preprocessing** on filter performance  
-3. **Neural network proposals** vs. traditional approaches
-4. **Nonlinear observation operators** in chaotic systems
-5. **Computational efficiency** of different methods
 
 ## TODO
 
