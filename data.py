@@ -8,7 +8,7 @@ from typing import Dict, Any, Optional, Tuple, Callable, Union
 import h5py
 from pathlib import Path
 from dataclasses import dataclass
-from scipy.integrate import solve_ivp
+from torchdiffeq import odeint
 import logging
 
 
@@ -27,7 +27,7 @@ class DataAssimilationConfig:
     obs_noise_std: float = 0.1
     obs_frequency: int = 1
     obs_components: list = None
-    observation_operator: Union[Callable, np.ndarray, None] = None
+    observation_operator: Union[Callable, torch.Tensor, None] = None
 
     # Data splits
     train_ratio: float = 0.8
@@ -43,7 +43,7 @@ class DataAssimilationConfig:
         if self.system_params is None:
             self.system_params = {}
         if self.observation_operator is None:
-            self.observation_operator = np.arctan
+            self.observation_operator = torch.arctan
 
 
 class DynamicalSystem(ABC):
@@ -60,55 +60,57 @@ class DynamicalSystem(ABC):
         pass
 
     @abstractmethod
-    def dynamics(self, t: float, x: np.ndarray) -> np.ndarray:
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
         """System dynamics dx/dt = f(x, t)"""
         pass
 
     @abstractmethod
-    def get_default_initial_state(self) -> np.ndarray:
+    def get_default_initial_state(self) -> torch.Tensor:
         """Get a default initial state"""
         pass
 
-    def sample_initial_state(self, n_samples: int = 1) -> np.ndarray:
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
         """Sample initial states. Override for custom sampling."""
         default_state = self.get_default_initial_state()
         if n_samples == 1:
-            return default_state + 0.1 * np.random.randn(*default_state.shape)
+            return default_state + 0.1 * torch.randn(*default_state.shape)
         else:
-            return default_state[None, :] + 0.1 * np.random.randn(
+            return default_state[None, :] + 0.1 * torch.randn(
                 n_samples, *default_state.shape
             )
 
-    def integrate(self, x0: np.ndarray, n_steps: int, dt: float = None) -> np.ndarray:
+    def integrate(self, x0: torch.Tensor, n_steps: int, dt: float = None) -> torch.Tensor:
         """Integrate the system forward in time"""
         if dt is None:
             dt = self.config.dt
+            
+        t_span = (0, (n_steps - 1) * dt)
+        t_eval = torch.arange(0, n_steps * dt, dt)
 
         if x0.ndim == 1:
-            t_span = (0, (n_steps - 1) * dt)
-            t_eval = np.arange(0, n_steps * dt, dt)
-            sol = solve_ivp(
-                self.dynamics,
-                t_span,
-                x0,
-                t_eval=t_eval,
-                method="RK45",
-                rtol=1e-8,
-                atol=1e-11,
-            )
-            return sol.y.T
+            x0_batched = x0.unsqueeze(0)         # (1, dim)
+            single = True
         else:
-            n_particles = x0.shape[0]
-            trajectories = []
-            for i in range(n_particles):
-                traj = self.integrate(x0[i], n_steps, dt)
-                trajectories.append(traj)
-            return np.stack(trajectories, axis=0)
+            x0_batched = x0                      # (batch, dim)
+            single = False
+            
+        sol = odeint(
+            self.dynamics,                        # f(t, x)
+            x0_batched,                           # initial state (batch, dim)
+            t_eval,                              
+            method='rk4'            
+        )  
 
-    def apply_observation_operator(self, x: np.ndarray) -> np.ndarray:
+        
+        if single:
+            return sol[:, 0, :] 
+        else:
+            return sol.permute(1, 0, 2) 
+
+    def apply_observation_operator(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the observation operator h(x)"""
 
-        if isinstance(self.config.observation_operator, np.ndarray):
+        if isinstance(self.config.observation_operator, torch.Tensor):
             H = self.config.observation_operator
             if x.ndim == 1:
                 return H @ x
@@ -124,12 +126,12 @@ class DynamicalSystem(ABC):
         else:
             raise TypeError("observation_operator must be callable or numpy array")
 
-    def observe(self, x: np.ndarray, add_noise: bool = True) -> np.ndarray:
+    def observe(self, x: torch.Tensor, add_noise: bool = True) -> torch.Tensor:
         """Apply observation operator h(x) + noise"""
         observed = self.apply_observation_operator(x)
 
         if add_noise:
-            noise = self.config.obs_noise_std * np.random.randn(*observed.shape)
+            noise = self.config.obs_noise_std * torch.randn(*observed.shape)
             observed = observed + noise
 
         return observed
@@ -152,44 +154,95 @@ class Lorenz63(DynamicalSystem):
         self.rho = config.system_params["rho"]
         self.beta = config.system_params["beta"]
 
-        self.init_mean = np.array([0.0, 0.0, 25.0])
-        self.init_cov = np.array(
+        self.init_mean = torch.tensor([0.0, 0.0, 25.0], dtype=torch.float32)
+
+        self.init_cov = torch.tensor(
             [
                 [64.0, 50.0, 0.0],
                 [50.0, 81.0, 0.0],
                 [0.0, 0.0, 75.0],
-            ]
+            ],
+            dtype=torch.float32,
         )
-        self.init_std = np.sqrt(np.diag(self.init_cov))
+        self.init_std = torch.sqrt(torch.diag(self.init_cov))
 
     def get_state_dim(self) -> int:
         return 3
 
-    def dynamics(self, t: float, x: np.ndarray) -> np.ndarray:
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
         """Lorenz 63 dynamics"""
-        dxdt = np.zeros_like(x)
+        dxdt = torch.zeros_like(x)
         dxdt[0] = self.sigma * (x[1] - x[0])
         dxdt[1] = x[0] * (self.rho - x[2]) - x[1]
         dxdt[2] = x[0] * x[1] - self.beta * x[2]
         return dxdt
 
-    def get_default_initial_state(self) -> np.ndarray:
+    def get_default_initial_state(self) -> torch.Tensor:
         return [1.0, 1.0, 1.0]
 
-    def sample_initial_state(self, n_samples: int = 1) -> np.ndarray:
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
         if n_samples == 1:
-            return np.random.multivariate_normal(self.init_mean, self.init_cov)
+            return torch.random.multivariate_normal(self.init_mean, self.init_cov)
         else:
-            return np.random.multivariate_normal(
+            return torch.random.multivariate_normal(
                 self.init_mean, self.init_cov, size=n_samples
             )
 
-    def preprocess(self, x: np.ndarray) -> np.ndarray:
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
         return (x - self.init_mean) / self.init_std
 
-    def postprocess(self, x: np.ndarray) -> np.ndarray:
+    def postprocess(self, x: torch.Tensor) -> torch.Tensor:
         return self.init_mean + self.init_std * x
 
+
+class Lorenz96(DynamicalSystem):
+    """Lorenz 96 system implementation"""
+
+    def __init__(self, config: DataAssimilationConfig):
+        default_params = {"F":8,"dim":40}
+        if config.system_params is None:
+            config.system_params = default_params
+        else:
+            for key, val in default_params.items():
+                if key not in config.system_params:
+                    config.system_params[key] = val
+
+        super().__init__(config)
+        self.forcing = config.system_params["F"]
+        self.dim = config.system_params["dim"]
+        
+        
+        self.init_mean = torch.zeros(self.dim)
+        self.init_std = 1.0
+        self.init_cov = (self.init_std ** 2) * torch.eye(self.dim)
+    def get_state_dim(self) -> int:
+        return 40
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        """Lorenz 96 dynamics"""
+        x_p1 = x.roll(-1, -1)
+        x_m2 = x.roll(2, -1)
+        x_m1 = x.roll(1, -1)
+        return (x_p1 - x_m2) * x_m1 - x + self.forcing
+        
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        initial_state = torch.zeros((1,self.dim))
+        return initial_state
+        
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        if n_samples == 1:
+            return self.init_mean + self.init_std * torch.randn(
+                self.dim, device=self.init_mean.device
+            )
+        else:
+            eps = torch.randn(n_samples, self.dim, device=self.init_mean.device)
+            return self.init_mean.unsqueeze(0) + self.init_std * eps
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+    def postprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
 class DataAssimilationDataset(Dataset):
     """Dataset for data assimilation experiments"""
@@ -197,9 +250,9 @@ class DataAssimilationDataset(Dataset):
     def __init__(
         self,
         system: DynamicalSystem,
-        trajectories: np.ndarray,
-        observations: np.ndarray,
-        obs_mask: np.ndarray,
+        trajectories: torch.Tensor,
+        observations: torch.Tensor,
+        obs_mask: torch.Tensor,
         mode: str = "inference",
     ):
         """
@@ -219,7 +272,7 @@ class DataAssimilationDataset(Dataset):
         self.n_trajectories, self.n_steps, self.state_dim = trajectories.shape
         self.obs_dim = observations.shape[-1]
 
-        self.obs_time_indices = np.where(obs_mask)[0]
+        self.obs_time_indices = torch.where(torch.tensor(obs_mask))[0]
 
         if mode == "inference":
             self.items = [
@@ -249,10 +302,10 @@ class DataAssimilationDataset(Dataset):
 
         has_observation = self.obs_mask[time_idx]
         if has_observation:
-            obs_idx = np.where(self.obs_time_indices == time_idx)[0][0]
+            obs_idx = torch.where(self.obs_time_indices == time_idx)[0][0]
             y_curr = self.observations[trajectory_idx, obs_idx]
         else:
-            y_curr = np.zeros(self.obs_dim)
+            y_curr = torch.zeros(self.obs_dim)
 
         return {
             "trajectory_idx": torch.LongTensor([trajectory_idx]),
@@ -321,17 +374,17 @@ class DataAssimilationDataModule(pl.LightningDataModule):
         if self.config.use_preprocessing:
             trajectories = self.system.preprocess(trajectories)
 
-        obs_mask = np.zeros(self.config.len_trajectory, dtype=bool)
+        obs_mask = torch.zeros(self.config.len_trajectory, dtype=bool)
         obs_mask[:: self.config.obs_frequency] = True
 
-        obs_time_indices = np.where(obs_mask)[0]
+        obs_time_indices = torch.where(obs_mask)[0]
         observations = []
 
         for t in obs_time_indices:
             obs_t = self.system.observe(trajectories[:, t, :], add_noise=True)
             observations.append(obs_t)
 
-        observations = np.stack(observations, axis=1)
+        observations = torch.stack(observations, axis=1)
 
         n_train = int(self.config.train_ratio * self.config.num_trajectories)
         n_val = int(self.config.val_ratio * self.config.num_trajectories)
@@ -433,7 +486,7 @@ class DataAssimilationDataModule(pl.LightningDataModule):
 def create_projection_matrix(state_dim, obs_components):
     """Create projection matrix to select specific state components"""
     obs_dim = len(obs_components)
-    H = np.zeros((obs_dim, state_dim))
+    H = torch.zeros((obs_dim, state_dim))
     for i, comp in enumerate(obs_components):
         H[i, comp] = 1.0
     return H
@@ -446,7 +499,7 @@ def identity_operator(x):
 
 def arctan_operator(x):
     """Arctan observation operator: h(x) = arctan(x)"""
-    return np.arctan(x)
+    return torch.arctan(x)
 
 
 if __name__ == "__main__":
@@ -471,7 +524,7 @@ if __name__ == "__main__":
     )
 
     system = Lorenz63(config_linear)
-    test_state = np.array([1.5, -2.3, 25.6])
+    test_state = torch.array([1.5, -2.3, 25.6])
     result = system.apply_observation_operator(test_state)
     print(f"Test state: {test_state}")
     print(f"Observed (linear): {result}")
@@ -480,12 +533,12 @@ if __name__ == "__main__":
     print("\n2. Nonlinear arctan:")
     config_arctan = DataAssimilationConfig(
         obs_components=[0],
-        observation_operator=np.arctan,
+        observation_operator=torch.arctan,
     )
     system_arctan = Lorenz63(config_arctan)
     result_arctan = system_arctan.apply_observation_operator(test_state)
     print(f"Test state: {test_state}")
     print(f"Observed (arctan): {result_arctan}")
-    print(f"Expected: {np.arctan(test_state[0]):.3f}")
+    print(f"Expected: {torch.arctan(test_state[0]):.3f}")
 
     print("\nAll tests passed!")

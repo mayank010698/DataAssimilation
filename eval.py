@@ -125,9 +125,9 @@ def run_particle_filter_on_trajectory(
             trajectory_data.append(
                 {
                     "time_idx": time_idx,
-                    "x_true": x_curr.cpu().numpy(),
+                    "x_true": x_curr,
                     "x_est": metrics["x_est"],
-                    "observation": y_curr.cpu().numpy() if y_curr is not None else None,
+                    "observation": y_curr if y_curr is not None else None,
                     "has_observation": batch["has_observation"].item(),
                     "rmse": metrics["rmse"],
                 }

@@ -58,7 +58,7 @@ class TransitionProposal(ProposalDistribution):
     ) -> torch.Tensor:
         """Sample from transition dynamics with process noise - CORRECTED for preprocessing"""
         # Convert to numpy for integration
-        x_prev_np = x_prev.cpu().numpy()
+        x_prev_np = x_prev
 
         if self.use_preprocessing:
             # x_prev is in normalized space, need to convert to original space
@@ -95,7 +95,7 @@ class TransitionProposal(ProposalDistribution):
     ) -> torch.Tensor:
         """Compute log probability under transition dynamics - CORRECTED for preprocessing"""
         # For bootstrap proposal, this is the process noise likelihood
-        x_prev_np = x_prev.cpu().numpy()
+        x_prev_np = x_prev
 
         if self.use_preprocessing:
             # Convert to original space, integrate, convert back

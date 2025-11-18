@@ -93,8 +93,8 @@ class BootstrapParticleFilter(FilteringMethod):
         self.particles = torch.stack(new_particles)
 
         if self.step_count % 1 == 0:
-            mean_pos = torch.mean(self.particles, dim=0).cpu().numpy()
-            std_pos = torch.std(self.particles, dim=0).cpu().numpy()
+            mean_pos = torch.mean(self.particles, dim=0)
+            std_pos = torch.std(self.particles, dim=0)
             logging.debug(
                 f"Step {self.step_count}: Particle mean = {mean_pos}, std = {std_pos}"
             )
@@ -109,7 +109,7 @@ class BootstrapParticleFilter(FilteringMethod):
 
         for i in range(self.n_particles):
             # Get expected next state from deterministic dynamics
-            x_prev_np = x_prev[i].cpu().numpy()
+            x_prev_np = x_prev[i]
 
             if self.use_preprocessing:
                 # Convert to original space, integrate, convert back
@@ -142,7 +142,7 @@ class BootstrapParticleFilter(FilteringMethod):
 
     def apply_observation_operator_torch(self, particles: torch.Tensor) -> torch.Tensor:
         """Apply observation operator to particles"""
-        particles_np = particles.cpu().numpy()
+        particles_np = particles
 
         if particles_np.ndim == 1:
             expected_obs = self.system.apply_observation_operator(particles_np)
@@ -151,7 +151,7 @@ class BootstrapParticleFilter(FilteringMethod):
             for i in range(particles_np.shape[0]):
                 obs = self.system.apply_observation_operator(particles_np[i])
                 expected_obs_list.append(obs)
-            expected_obs = np.array(expected_obs_list)
+            expected_obs = torch.stack(expected_obs_list)
 
         return torch.tensor(expected_obs, dtype=torch.float32, device=self.device)
 
