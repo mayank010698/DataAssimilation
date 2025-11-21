@@ -184,6 +184,11 @@ def plot_trajectory_comparison(
     x_est = np.array([d["x_est"] for d in trajectory_data])
     rmse_values = np.array([d["rmse"] for d in trajectory_data])
 
+    # Create mapping from time_idx to array position
+    # time_idx values (e.g., [1,2,...,14]) need to map to array indices [0,1,...,13]
+    # This is needed because the dataset starts from time_idx=1 (not 0) for inference mode
+    time_to_idx = {t: idx for idx, t in enumerate(time_steps)}
+
     if config.use_preprocessing:
         print(
             "Converting normalized trajectories back to original space for plotting..."
@@ -199,14 +204,19 @@ def plot_trajectory_comparison(
     obs_times = []
     obs_values = []
     obs_true_x = []
+    obs_indices = []  # Array indices corresponding to obs_times
 
     for d in trajectory_data:
         if d["has_observation"] and d["observation"] is not None:
-            obs_times.append(d["time_idx"])
+            time_idx = d["time_idx"]
+            array_idx = time_to_idx[time_idx]
+            obs_times.append(time_idx)
             obs_values.append(d["observation"])
-            obs_true_x.append(x_true_orig[d["time_idx"]][0])
+            obs_true_x.append(x_true_orig[array_idx][0])
+            obs_indices.append(array_idx)
 
     obs_times = np.array(obs_times)
+    obs_indices = np.array(obs_indices) if len(obs_indices) > 0 else np.array([])
     if len(obs_values) > 0:
         obs_values = np.array(obs_values)
         obs_true_x = np.array(obs_true_x)
@@ -234,13 +244,13 @@ def plot_trajectory_comparison(
     )
 
     if len(obs_times) > 0:
-        valid_obs_mask = obs_times < len(x_true_orig)
-        valid_obs_times = obs_times[valid_obs_mask]
-        if len(valid_obs_times) > 0:
+        valid_obs_mask = obs_indices < len(x_true_orig)
+        valid_obs_indices = obs_indices[valid_obs_mask]
+        if len(valid_obs_indices) > 0:
             ax1.scatter(
-                x_true_orig[valid_obs_times, 0],
-                x_true_orig[valid_obs_times, 1],
-                x_true_orig[valid_obs_times, 2],
+                x_true_orig[valid_obs_indices, 0],
+                x_true_orig[valid_obs_indices, 1],
+                x_true_orig[valid_obs_indices, 2],
                 c="red",
                 s=30,
                 alpha=0.8,
@@ -278,15 +288,16 @@ def plot_trajectory_comparison(
         )
 
         if i in config.obs_components and len(obs_times) > 0:
-            valid_obs_mask = obs_times < len(time_steps)
+            valid_obs_mask = obs_indices < len(x_true_orig)
             valid_obs_times = obs_times[valid_obs_mask]
+            valid_obs_indices = obs_indices[valid_obs_mask]
 
             if len(valid_obs_times) > 0:
                 obs_component_idx = config.obs_components.index(i)
 
                 ax.scatter(
                     valid_obs_times,
-                    x_true_orig[valid_obs_times, i],
+                    x_true_orig[valid_obs_indices, i],
                     color="red",
                     s=30,
                     alpha=0.8,
@@ -453,9 +464,9 @@ def main():
 
         config = DataAssimilationConfig(
             num_trajectories=50,
-            len_trajectory=100,  # small for testing
+            len_trajectory=15,  # small for testing
             warmup_steps=1024,
-            dt=0.01,
+            dt=0.025,
             obs_noise_std=0.25,
             obs_frequency=2,
             obs_components=config_dict["obs_components"],

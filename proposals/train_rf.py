@@ -89,6 +89,7 @@ def train_rectified_flow(
         batch_size=batch_size,
         num_workers=num_workers,
         window=1,
+        use_preprocessing=use_preprocessing,
     )
     
     # Create model

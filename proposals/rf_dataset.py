@@ -74,12 +74,14 @@ class RFDataModule(pl.LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 4,
         window: int = 1,
+        use_preprocessing: bool = False,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.window = window
+        self.use_preprocessing = use_preprocessing
         
         self.train_dataset = None
         self.val_dataset = None
@@ -87,7 +89,8 @@ class RFDataModule(pl.LightningDataModule):
     
     def setup(self, stage: Optional[str] = None):
         """Load data and create datasets"""
-        data_file = self.data_dir / "data.h5"
+        filename = "data_scaled.h5" if self.use_preprocessing else "data.h5"
+        data_file = self.data_dir / filename
         
         if not data_file.exists():
             raise FileNotFoundError(

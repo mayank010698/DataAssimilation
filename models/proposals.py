@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import Optional, Any
 
 
 # =============================================================================
@@ -57,34 +57,48 @@ class TransitionProposal(ProposalDistribution):
         self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
     ) -> torch.Tensor:
         """Sample from transition dynamics with process noise - CORRECTED for preprocessing"""
-        # Convert to numpy for integration
-        x_prev_np = x_prev.cpu().numpy()
-
+        # Supports both single particle (D,) and batch (N, D)
+        is_batch = x_prev.ndim > 1
+        
         if self.use_preprocessing:
             # x_prev is in normalized space, need to convert to original space
-            x_prev_orig = self.system.postprocess(x_prev_np)
-            # Integrate in original space
-            x_next_orig = self.system.integrate(x_prev_orig, 2, dt)[1]
+            x_prev_orig = self.system.postprocess(x_prev)
+            
+            # Integrate in original space. Returns (T, D) or (batch, T, D)
+            integration = self.system.integrate(x_prev_orig, 2, dt)
+            
+            if is_batch:
+                x_next_orig = integration[:, 1, :]
+            else:
+                x_next_orig = integration[1, :]
+                
             # Convert back to normalized space
-            x_next = self.system.preprocess(x_next_orig.reshape(1, 1, -1))[0, 0]
+            # preprocess expects (..., D). It handles batching.
+            x_next = self.system.preprocess(x_next_orig)
+            
             # Scale noise by normalization factor
             noise_std = (
-                self.process_noise_std / self.init_std
+                self.process_noise_std / self.init_std.to(x_prev.device)
                 if self.init_std is not None
                 else self.process_noise_std
             )
         else:
             # No preprocessing, operate directly in original space
-            x_next = self.system.integrate(x_prev_np, 2, dt)[1]
+            integration = self.system.integrate(x_prev, 2, dt)
+            if is_batch:
+                x_next = integration[:, 1, :]
+            else:
+                x_next = integration[1, :]
+                
             noise_std = self.process_noise_std
 
-        # Convert everything to tensors for consistency
-        noise_std = torch.tensor(noise_std, dtype=torch.float32, device=x_prev.device)
-        x_next_tensor = torch.tensor(x_next, dtype=torch.float32, device=x_prev.device)
+        # Convert noise_std to tensor if it's not already
+        if not torch.is_tensor(noise_std):
+             noise_std = torch.tensor(noise_std, dtype=torch.float32, device=x_prev.device)
 
         # Add process noise
-        noise = noise_std * torch.randn(self.state_dim, device=x_prev.device)
-        return x_next_tensor + noise
+        noise = noise_std * torch.randn_like(x_next)
+        return x_next + noise
 
     def log_prob(
         self,
@@ -95,38 +109,59 @@ class TransitionProposal(ProposalDistribution):
     ) -> torch.Tensor:
         """Compute log probability under transition dynamics - CORRECTED for preprocessing"""
         # For bootstrap proposal, this is the process noise likelihood
-        x_prev_np = x_prev.cpu().numpy()
-
+        # Supports batch (N, D)
+        is_batch = x_prev.ndim > 1
+        
         if self.use_preprocessing:
             # Convert to original space, integrate, convert back
-            x_prev_orig = self.system.postprocess(x_prev_np)
-            x_expected_orig = self.system.integrate(x_prev_orig, 2, dt)[1]
-            x_expected = self.system.preprocess(x_expected_orig.reshape(1, 1, -1))[0, 0]
+            x_prev_orig = self.system.postprocess(x_prev)
+            
+            integration = self.system.integrate(x_prev_orig, 2, dt)
+            if is_batch:
+                x_expected_orig = integration[:, 1, :]
+            else:
+                x_expected_orig = integration[1, :]
+                
+            x_expected = self.system.preprocess(x_expected_orig)
+            
             # Scale noise by normalization factor
             noise_std = (
-                self.process_noise_std / self.init_std
+                self.process_noise_std / self.init_std.to(x_prev.device)
                 if self.init_std is not None
                 else self.process_noise_std
             )
         else:
             # No preprocessing, operate in original space
-            x_expected = self.system.integrate(x_prev_np, 2, dt)[1]
+            integration = self.system.integrate(x_prev, 2, dt)
+            if is_batch:
+                x_expected = integration[:, 1, :]
+            else:
+                x_expected = integration[1, :]
+                
             noise_std = self.process_noise_std
 
-        x_expected_tensor = torch.tensor(
-            x_expected, dtype=torch.float32, device=x_prev.device
-        )
-
-        # Convert everything to tensors for consistency
-        noise_std = torch.tensor(noise_std, dtype=torch.float32, device=x_prev.device)
+        # Convert noise_std to tensor
+        if not torch.is_tensor(noise_std):
+             noise_std = torch.tensor(noise_std, dtype=torch.float32, device=x_prev.device)
 
         # Compute Gaussian log-likelihood of the noise
-        diff = x_curr - x_expected_tensor
+        diff = x_curr - x_expected
         noise_var = noise_std**2
 
-        log_prob = -0.5 * torch.sum(diff**2 / noise_var)
-        log_prob -= 0.5 * torch.sum(torch.log(2 * np.pi * noise_var))
+        # If is_batch, sum over dim 1, else sum over dim 0 (all dims)
+        if is_batch:
+             reduce_dim = 1
+        else:
+             reduce_dim = 0
+             
+        log_prob = -0.5 * torch.sum(diff**2 / noise_var, dim=reduce_dim)
+        log_prob -= 0.5 * torch.sum(torch.log(2 * np.pi * noise_var)) # Note: this sum might need adjustment for dimensions
 
+        # Correction for log term: 
+        # For D dimensions, we have D independent Gaussians.
+        # log(prod (1/sqrt(2pi*sigma^2))) = sum -0.5 log(2pi*sigma^2)
+        # If noise_var is (D,), then sum(log(...)) is correct.
+        
         return log_prob
 
 
@@ -261,11 +296,21 @@ class RectifiedFlowProposal(ProposalDistribution):
     Note: RF currently doesn't use observations (y_curr), but interface supports it.
     """
     
-    def __init__(self, checkpoint_path: str, device: str = "cpu"):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        num_likelihood_steps: Optional[int] = None,
+        num_sampling_steps: Optional[int] = None,
+        system: Optional[Any] = None,
+    ):
         """
         Args:
             checkpoint_path: Path to trained RFProposal checkpoint (.ckpt file)
             device: Device to run model on ('cpu' or 'cuda')
+            num_likelihood_steps: Override number of steps for likelihood computation
+            num_sampling_steps: Override number of steps for sampling
+            system: DynamicalSystem instance (required for pre/post processing)
         """
         import sys
         from pathlib import Path
@@ -282,7 +327,14 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.rf_model.eval()
         self.rf_model.to(device)
         self.device = device
+        self.system = system
         
+        # Override steps if provided
+        if num_likelihood_steps is not None:
+            self.rf_model.num_likelihood_steps = num_likelihood_steps
+        if num_sampling_steps is not None:
+            self.rf_model.num_sampling_steps = num_sampling_steps
+            
         # Get state_dim from model
         self.state_dim = self.rf_model.state_dim
         
@@ -303,9 +355,20 @@ class RectifiedFlowProposal(ProposalDistribution):
         # Ensure x_prev is on correct device
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
-        
+
+        # Preprocess input (unscaled -> scaled)
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
         # RF model's sample method already handles the interface
-        return self.rf_model.sample(x_prev, y_curr, dt)
+        # RF expects and produces scaled data
+        x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt)
+        
+        # Postprocess output (scaled -> unscaled)
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+            
+        return x_curr_scaled
     
     def log_prob(
         self,
@@ -332,8 +395,12 @@ class RectifiedFlowProposal(ProposalDistribution):
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
         
+        # Preprocess inputs (unscaled -> scaled)
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+            
         # RF model's log_prob method already handles the interface
+        # We compute log probability in scaled space.
+        # Since weight update does normalization, we don't strictly need Jacobian correction.
         return self.rf_model.log_prob(x_curr, x_prev, y_curr, dt)
-
-
-# Note: No top-level executable test code here; import these classes from models.proposals
