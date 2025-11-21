@@ -121,8 +121,8 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         self.particles = torch.stack(new_particles)
 
         if self.step_count % 1 == 0:
-            mean_pos = torch.mean(self.particles, dim=0).cpu().numpy()
-            std_pos = torch.std(self.particles, dim=0).cpu().numpy()
+            mean_pos = torch.mean(self.particles, dim=0)
+            std_pos = torch.std(self.particles, dim=0)
             logging.debug(
                 f"Step {self.step_count}: Particle mean = {mean_pos}, std = {std_pos}"
             )

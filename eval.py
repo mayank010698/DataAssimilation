@@ -116,6 +116,83 @@ def plot_trajectory_comparison(
     return fig
 
 
+def get_all_trajectory_indices(dataloader) -> List[int]:
+    """Get all unique trajectory indices from the dataloader"""
+    trajectory_indices = set()
+    for batch in dataloader:
+        trajectory_indices.add(batch["trajectory_idx"].item())
+    return sorted(list(trajectory_indices))
+
+
+def run_particle_filter_on_trajectory(
+    pf: FilteringMethod,
+    dataloader,
+    trajectory_idx: int,
+    collect_trajectory_data: bool = False,
+) -> Dict[str, Any]:
+    """Run filtering method on a single trajectory and collect metrics"""
+    trajectory_metrics = []
+    trajectory_data = []
+
+    for batch in dataloader:
+        batch_traj_idx = batch["trajectory_idx"].item()
+        if batch_traj_idx != trajectory_idx:
+            continue
+
+        metrics = pf.test_step(batch, 0)
+        trajectory_metrics.append(metrics)
+
+        if collect_trajectory_data:
+            x_curr = batch["x_curr"].squeeze(0)
+            y_curr = batch["y_curr"].squeeze(0) if batch["has_observation"].item() else None
+            time_idx = batch["time_idx"].item()
+            
+            trajectory_data.append(
+                {
+                    "time_idx": time_idx,
+                    "x_true": x_curr,
+                    "x_est": metrics["x_est"],
+                    "observation": y_curr if y_curr is not None else None,
+                    "has_observation": batch["has_observation"].item(),
+                    "rmse": metrics["rmse"],
+                }
+            )
+
+    rmse_values = [m["rmse"] for m in trajectory_metrics]
+    ll_values = [
+        m["log_likelihood"] for m in trajectory_metrics if m["log_likelihood"] != 0.0
+    ]
+    
+    # Collect additional metrics if available
+    ess_values = [m.get("ess", 0.0) for m in trajectory_metrics if "ess" in m]
+    resample_counts = [m.get("resampled", False) for m in trajectory_metrics]
+    step_times = [m.get("step_time", 0.0) for m in trajectory_metrics if "step_time" in m]
+
+    if collect_trajectory_data:
+        trajectory_data.sort(key=lambda x: x["time_idx"])
+
+    result = {
+        "trajectory_idx": trajectory_idx,
+        "mean_rmse": np.mean(rmse_values) if rmse_values else 0.0,
+        "std_rmse": np.std(rmse_values) if rmse_values else 0.0,
+        "min_rmse": np.min(rmse_values) if rmse_values else 0.0,
+        "max_rmse": np.max(rmse_values) if rmse_values else 0.0,
+        "mean_log_likelihood": np.mean(ll_values) if ll_values else 0.0,
+        "total_log_likelihood": np.sum(ll_values) if ll_values else 0.0,
+        "n_observations": len(ll_values),
+        "n_steps": len(rmse_values),
+        "mean_ess": np.mean(ess_values) if ess_values else 0.0,
+        "min_ess": np.min(ess_values) if ess_values else 0.0,
+        "n_resamples": sum(resample_counts),
+        "mean_step_time": np.mean(step_times) if step_times else 0.0,
+        "total_time": np.sum(step_times) if step_times else 0.0,
+        "metrics": trajectory_metrics,
+        "trajectory_data": trajectory_data if collect_trajectory_data else None,
+    }
+
+    return result
+
+
 def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate metrics across all trajectories"""
     if not trajectory_results:

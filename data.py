@@ -93,11 +93,13 @@ class DynamicalSystem(ABC):
         k3 = self.dynamics(0, x + dt * k2 / 2)
         k4 = self.dynamics(0, x + dt * k3)
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
-
     def integrate(self, x0: torch.Tensor, n_steps: int, dt: float = None) -> torch.Tensor:
         """Integrate the system forward in time"""
         if dt is None:
             dt = self.config.dt
+            
+        t_span = (0, (n_steps - 1) * dt)
+        t_eval = torch.arange(0, n_steps * dt, dt)
 
         # Ensure input is tensor
         if not isinstance(x0, torch.Tensor):
@@ -181,13 +183,14 @@ class Lorenz63(DynamicalSystem):
         self.rho = config.system_params["rho"]
         self.beta = config.system_params["beta"]
 
-        self.init_mean = torch.tensor([0.0, 0.0, 25.0])
+        self.init_mean = torch.tensor([0.0, 0.0, 25.0], dtype=torch.float32)
         self.init_cov = torch.tensor(
             [
                 [64.0, 50.0, 0.0],
                 [50.0, 81.0, 0.0],
                 [0.0, 0.0, 75.0],
-            ]
+            ],
+            dtype=torch.float32,
         )
         self.init_std = torch.sqrt(torch.diag(self.init_cov))
 
@@ -246,6 +249,55 @@ class Lorenz63(DynamicalSystem):
         device = x.device
         return self.init_mean.to(device) + self.init_std.to(device) * x
 
+
+class Lorenz96(DynamicalSystem):
+    """Lorenz 96 system implementation"""
+
+    def __init__(self, config: DataAssimilationConfig):
+        default_params = {"F":8,"dim":40}
+        if config.system_params is None:
+            config.system_params = default_params
+        else:
+            for key, val in default_params.items():
+                if key not in config.system_params:
+                    config.system_params[key] = val
+
+        super().__init__(config)
+        self.forcing = config.system_params["F"]
+        self.dim = config.system_params["dim"]
+        
+        
+        self.init_mean = torch.zeros(self.dim)
+        self.init_std = 1.0
+        self.init_cov = (self.init_std ** 2) * torch.eye(self.dim)
+    def get_state_dim(self) -> int:
+        return 40
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        """Lorenz 96 dynamics"""
+        x_p1 = x.roll(-1, -1)
+        x_m2 = x.roll(2, -1)
+        x_m1 = x.roll(1, -1)
+        return (x_p1 - x_m2) * x_m1 - x + self.forcing
+        
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        initial_state = torch.zeros((1,self.dim))
+        return initial_state
+        
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        if n_samples == 1:
+            return self.init_mean + self.init_std * torch.randn(
+                self.dim, device=self.init_mean.device
+            )
+        else:
+            eps = torch.randn(n_samples, self.dim, device=self.init_mean.device)
+            return self.init_mean.unsqueeze(0) + self.init_std * eps
+
+    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return x
+    def postprocess(self, x: torch.Tensor) -> torch.Tensor:
+        return x
 
 class DataAssimilationDataset(Dataset):
     """Dataset for data assimilation experiments"""

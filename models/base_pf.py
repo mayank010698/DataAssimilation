@@ -99,9 +99,9 @@ class FilteringMethod(pl.LightningModule, ABC):
         metrics = {
             "rmse": rmse,
             "log_likelihood": log_likelihood,
-            "x_est": x_est.cpu().numpy(),
-            "P_est": P_est.cpu().numpy(),
-            "error": error.cpu().numpy(),
+            "x_est": x_est,
+            "P_est": P_est,
+            "error": error,
             "trajectory_idx": trajectory_idx,
             "time_idx": time_idx,
         }
