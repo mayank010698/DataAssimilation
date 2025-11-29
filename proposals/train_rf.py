@@ -17,9 +17,16 @@ import sys
 # Add parent directory to path if running as script
 if __name__ == "__main__":
     sys.path.append(str(Path(__file__).parent))
+    # Also add root for data imports if needed
+    sys.path.append(str(Path(__file__).parent.parent))
 
 from rectified_flow import RFProposal
 from rf_dataset import RFDataModule
+try:
+    from eval_proposal import run_proposal_eval
+except ImportError:
+    # Fallback if running from root
+    from proposals.eval_proposal import run_proposal_eval
 
 
 def setup_logging(log_dir: Path):
@@ -40,6 +47,7 @@ def train_rectified_flow(
     data_dir: str,
     output_dir: str,
     state_dim: int = 3,
+    obs_dim: int = 0,
     hidden_dim: int = 128,
     depth: int = 4,
     batch_size: int = 64,
@@ -47,6 +55,7 @@ def train_rectified_flow(
     max_epochs: int = 500,
     num_workers: int = 4,
     use_preprocessing: bool = True,
+    use_observations: bool = False,
     gpus: int = 1,
 ):
     """
@@ -56,6 +65,7 @@ def train_rectified_flow(
         data_dir: Directory containing data.h5
         output_dir: Directory to save checkpoints and logs
         state_dim: Dimension of state space
+        obs_dim: Dimension of observation space
         hidden_dim: Hidden dimension of velocity network
         depth: Depth of velocity network
         batch_size: Training batch size
@@ -63,6 +73,7 @@ def train_rectified_flow(
         max_epochs: Maximum number of epochs
         num_workers: Number of dataloader workers
         use_preprocessing: Whether data is preprocessed/normalized
+        use_observations: Whether to condition on observations
         gpus: Number of GPUs to use
     """
     output_dir = Path(output_dir)
@@ -75,6 +86,8 @@ def train_rectified_flow(
     logger_obj.info(f"Data directory: {data_dir}")
     logger_obj.info(f"Output directory: {output_dir}")
     logger_obj.info(f"State dimension: {state_dim}")
+    logger_obj.info(f"Observation dimension: {obs_dim}")
+    logger_obj.info(f"Use observations: {use_observations}")
     logger_obj.info(f"Hidden dimension: {hidden_dim}")
     logger_obj.info(f"Network depth: {depth}")
     logger_obj.info(f"Batch size: {batch_size}")
@@ -90,11 +103,13 @@ def train_rectified_flow(
         num_workers=num_workers,
         window=1,
         use_preprocessing=use_preprocessing,
+        use_observations=use_observations,
     )
     
     # Create model
     model = RFProposal(
         state_dim=state_dim,
+        obs_dim=obs_dim,
         hidden_dim=hidden_dim,
         depth=depth,
         learning_rate=learning_rate,
@@ -136,6 +151,8 @@ def train_rectified_flow(
     # Log hyperparameters
     wandb_logger.log_hyperparams({
         "state_dim": state_dim,
+        "obs_dim": obs_dim,
+        "use_observations": use_observations,
         "hidden_dim": hidden_dim,
         "depth": depth,
         "batch_size": batch_size,
@@ -171,97 +188,7 @@ def train_rectified_flow(
     trainer.save_checkpoint(final_model_path)
     logger_obj.info(f"Final model saved to: {final_model_path}")
     
-    return model, checkpoint_callback.best_model_path
-
-
-def evaluate_model(
-    checkpoint_path: str,
-    data_dir: str,
-    n_trajectories: int = 5,
-    n_steps: int = 100,
-):
-    """
-    Evaluate a trained RF model by generating trajectories
-    
-    Args:
-        checkpoint_path: Path to model checkpoint
-        data_dir: Directory containing data for initial states
-        n_trajectories: Number of trajectories to generate
-        n_steps: Number of steps per trajectory
-    """
-    import matplotlib.pyplot as plt
-    import h5py
-    
-    logger = logging.getLogger(__name__)
-    logger.info("\n" + "="*80)
-    logger.info("Evaluating Trained Model")
-    logger.info("="*80)
-    
-    # Load model
-    model = RFProposal.load_from_checkpoint(checkpoint_path)
-    model.eval()
-    
-    # Load some test trajectories for initial states
-    data_file = Path(data_dir) / "data.h5"
-    with h5py.File(data_file, "r") as f:
-        test_traj = f["test/trajectories"][:]
-    
-    logger.info(f"Generating {n_trajectories} trajectories with {n_steps} steps each...")
-    
-    # Generate trajectories
-    generated_trajs = []
-    true_trajs = []
-    
-    for i in range(min(n_trajectories, len(test_traj))):
-        x_init = torch.FloatTensor(test_traj[i, 0])
-        
-        # Generate trajectory
-        gen_traj = model.generate_trajectory(x_init, n_steps=n_steps, return_all=True)
-        generated_trajs.append(gen_traj)
-        
-        # Get corresponding true trajectory
-        true_traj = test_traj[i, :n_steps+1]
-        true_trajs.append(true_traj)
-    
-    # Compute metrics
-    generated_trajs = torch.tensor(generated_trajs)  # (n_traj, n_steps+1, state_dim)
-    true_trajs = torch.tensor(true_trajs)
-    
-    rmse = torch.sqrt(torch.mean((generated_trajs - true_trajs) ** 2))
-    logger.info(f"Average RMSE: {rmse:.4f}")
-    
-    # Plot comparison
-    fig, axes = plt.subplots(3, 1, figsize=(12, 10))
-    
-    for i, (gen_traj, true_traj) in enumerate(zip(generated_trajs, true_trajs)):
-        for dim in range(3):
-            axes[dim].plot(
-                true_traj[:, dim].numpy(),
-                label=f'True {i+1}' if dim == 0 else '',
-                alpha=0.7,
-                linewidth=2,
-            )
-            axes[dim].plot(
-                gen_traj[:, dim].numpy(),
-                label=f'Generated {i+1}' if dim == 0 else '',
-                alpha=0.7,
-                linestyle='--',
-                linewidth=2,
-            )
-            axes[dim].set_ylabel(f'Dimension {dim+1}')
-            axes[dim].grid(True, alpha=0.3)
-    
-    axes[0].set_title('Generated vs True Trajectories')
-    axes[0].legend()
-    axes[2].set_xlabel('Time Step')
-    
-    plt.tight_layout()
-    save_path = Path(checkpoint_path).parent.parent / "trajectory_comparison.png"
-    plt.savefig(save_path, dpi=150, bbox_inches='tight')
-    logger.info(f"Comparison plot saved to: {save_path}")
-    plt.close()
-    
-    logger.info("Evaluation completed!")
+    return model, checkpoint_callback.best_model_path, wandb_logger
 
 
 def main():
@@ -276,6 +203,8 @@ def main():
     # Model arguments
     parser.add_argument('--state_dim', type=int, default=3,
                         help='State dimension')
+    parser.add_argument('--obs_dim', type=int, default=1,
+                        help='Observation dimension')  # state and obs dim should come from dataset / config at some point
     parser.add_argument('--hidden_dim', type=int, default=128,
                         help='Hidden dimension')
     parser.add_argument('--depth', type=int, default=4,
@@ -296,6 +225,8 @@ def main():
     # Other arguments
     parser.add_argument('--use_preprocessing', action='store_true',
                         help='Whether data is preprocessed/normalized')
+    parser.add_argument('--use_observations', action='store_true',
+                        help='Use observation conditioning')
     parser.add_argument('--evaluate', action='store_true',
                         help='Evaluate after training')
     parser.add_argument('--checkpoint', type=str, default=None,
@@ -309,11 +240,13 @@ def main():
         args.output_dir = f"./rf_runs/run_{timestamp}"
     
     # Train model
+    wandb_logger = None
     if args.checkpoint is None:
-        model, best_checkpoint = train_rectified_flow(
+        model, best_checkpoint, wandb_logger = train_rectified_flow(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             state_dim=args.state_dim,
+            obs_dim=args.obs_dim,
             hidden_dim=args.hidden_dim,
             depth=args.depth,
             batch_size=args.batch_size,
@@ -321,6 +254,7 @@ def main():
             max_epochs=args.max_epochs,
             num_workers=args.num_workers,
             use_preprocessing=args.use_preprocessing,
+            use_observations=args.use_observations,
             gpus=args.gpus,
         )
         checkpoint_to_eval = best_checkpoint
@@ -329,11 +263,19 @@ def main():
     
     # Evaluate model
     if args.evaluate:
-        evaluate_model(
+        # Use the wandb run from the logger if available
+        wandb_run = None
+        if wandb_logger and hasattr(wandb_logger, 'experiment'):
+             wandb_run = wandb_logger.experiment
+
+        run_proposal_eval(
             checkpoint_path=checkpoint_to_eval,
             data_dir=args.data_dir,
-            n_trajectories=5,
-            n_steps=100,
+            n_trajectories=None,  # Evaluate on ALL trajectories
+            n_vis_trajectories=10, # Visualize only the first 10
+            batch_size=args.batch_size,
+            device='cuda' if (args.gpus > 0 and torch.cuda.is_available()) else 'cpu',
+            wandb_run=wandb_run
         )
 
 

@@ -33,10 +33,12 @@ class VelocityNetwork(nn.Module):
         hidden_dim: int = 128,
         depth: int = 4,
         time_embed_dim: int = 64,
+        obs_dim: int = 0,
     ):
         super().__init__()
         self.state_dim = state_dim
         self.time_embed_dim = time_embed_dim
+        self.obs_dim = obs_dim
         
         # Time embedding: map s ∈ [0,1] to higher dimensional space
         self.time_embed = nn.Sequential(
@@ -45,8 +47,8 @@ class VelocityNetwork(nn.Module):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
         
-        # Main network: [x, time_embed, x_prev] -> velocity
-        input_dim = state_dim + time_embed_dim + state_dim
+        # Main network: [x, time_embed, x_prev, y] -> velocity
+        input_dim = state_dim + time_embed_dim + state_dim + obs_dim
         
         layers = []
         layers.append(nn.Linear(input_dim, hidden_dim))
@@ -60,14 +62,21 @@ class VelocityNetwork(nn.Module):
         
         self.net = nn.Sequential(*layers)
         
-    def forward(self, x: torch.Tensor, s: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        s: torch.Tensor, 
+        x_prev: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
-        Compute velocity v_θ(x, s | x_prev)
+        Compute velocity v_θ(x, s | x_prev, y)
         
         Args:
             x: Current position in flow, shape (batch, state_dim)
             s: Flow time ∈ [0,1], shape (batch, 1) or (batch,)
             x_prev: Conditioning (previous state), shape (batch, state_dim)
+            y: Observation conditioning, shape (batch, obs_dim) or None
             
         Returns:
             Velocity vector, shape (batch, state_dim)
@@ -79,7 +88,10 @@ class VelocityNetwork(nn.Module):
         s_embed = self.time_embed(s)
         
         # Concatenate all inputs
-        net_input = torch.cat([x, s_embed, x_prev], dim=-1)
+        if self.obs_dim > 0 and y is not None:
+            net_input = torch.cat([x, s_embed, x_prev, y], dim=-1)
+        else:
+            net_input = torch.cat([x, s_embed, x_prev], dim=-1)
         
         return self.net(net_input)
 
@@ -101,11 +113,13 @@ class RFProposal(pl.LightningModule):
         num_sampling_steps: int = 10,  # small for testing
         num_likelihood_steps: int = 10,  # small for testing
         use_preprocessing: bool = False,
+        obs_dim: int = 0,
     ):
         super().__init__()
         self.save_hyperparameters()
         
         self.state_dim = state_dim
+        self.obs_dim = obs_dim
         self.learning_rate = learning_rate
         self.num_sampling_steps = num_sampling_steps
         self.num_likelihood_steps = num_likelihood_steps
@@ -116,30 +130,39 @@ class RFProposal(pl.LightningModule):
             state_dim=state_dim,
             hidden_dim=hidden_dim,
             depth=depth,
+            obs_dim=obs_dim,
         )
         
         # For tracking training progress
         self.training_step_outputs = []
         self.validation_step_outputs = []
         
-    def forward(self, x: torch.Tensor, s: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        s: torch.Tensor, 
+        x_prev: torch.Tensor,
+        y: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Compute velocity field"""
-        return self.velocity_net(x, s, x_prev)
+        return self.velocity_net(x, s, x_prev, y)
     
     def compute_rf_loss(
         self,
         x_prev: torch.Tensor,
         x_curr: torch.Tensor,
+        y_curr: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute Rectified Flow training loss
         
-        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev) - (x_curr - z)||^2
+        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev, y) - (x_curr - z)||^2
         where x(t) = (1-t)*z + t*x_curr is the straight-line interpolation
         
         Args:
             x_prev: Previous states, shape (batch, state_dim)
             x_curr: Current states, shape (batch, state_dim)
+            y_curr: Current observations, shape (batch, obs_dim) or None
             
         Returns:
             loss: Scalar loss
@@ -160,7 +183,7 @@ class RFProposal(pl.LightningModule):
         target_velocity = x_curr - z
         
         # Predicted velocity
-        pred_velocity = self.velocity_net(x_s, s, x_prev)
+        pred_velocity = self.velocity_net(x_s, s, x_prev, y_curr)
         
         # MSE loss
         loss = torch.mean((pred_velocity - target_velocity) ** 2)
@@ -179,9 +202,10 @@ class RFProposal(pl.LightningModule):
         # Extract pairs from batch
         x_prev = batch['x_prev']
         x_curr = batch['x_curr']
+        y_curr = batch.get('y_curr', None)
         
         # Compute loss
-        loss, metrics = self.compute_rf_loss(x_prev, x_curr)
+        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr)
         
         # Log metrics
         self.log('train_loss', metrics['loss'], on_step=True, on_epoch=True, prog_bar=True)
@@ -195,8 +219,9 @@ class RFProposal(pl.LightningModule):
         """Validation step"""
         x_prev = batch['x_prev']
         x_curr = batch['x_curr']
+        y_curr = batch.get('y_curr', None)
         
-        loss, metrics = self.compute_rf_loss(x_prev, x_curr)
+        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr)
         
         # Log metrics
         self.log('val_loss', metrics['loss'], on_step=False, on_epoch=True, prog_bar=True)
@@ -251,10 +276,22 @@ class RFProposal(pl.LightningModule):
         y_curr: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
     ) -> torch.Tensor:
-        """Sample using Euler method"""
+        """
+        Sample x_t ~ q(x_t | x_{t-1}, y_t) using Euler method
+        
+        Args:
+            x_prev: Previous state, shape (state_dim,) or (batch, state_dim)
+            y_curr: Current observation, shape (obs_dim,) or (batch, obs_dim) or None
+            dt: Time step (unused, for interface compatibility)
+            
+        Returns:
+            Sampled next state, shape same as x_prev
+        """
         was_1d = x_prev.dim() == 1
         if was_1d:
             x_prev = x_prev.unsqueeze(0)
+            if y_curr is not None:
+                y_curr = y_curr.unsqueeze(0)
         
         batch_size = x_prev.shape[0]
         
@@ -267,7 +304,7 @@ class RFProposal(pl.LightningModule):
         for i in range(self.num_sampling_steps):
             s = i * ds
             s_tensor = torch.full((batch_size, 1), s, device=self.device)
-            v = self.velocity_net(x, s_tensor, x_prev)
+            v = self.velocity_net(x, s_tensor, x_prev, y_curr)
             x = x + v * ds  # Euler step
         
         if was_1d:
@@ -282,12 +319,21 @@ class RFProposal(pl.LightningModule):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
+        use_exact_trace: bool = True,
     ) -> torch.Tensor:
-        """Compute log prob using Euler method"""
+        """
+        Compute log prob using Euler method.
+        
+        Args:
+            use_exact_trace: If True, computes exact Jacobian trace (deterministic, O(D^2)).
+                             If False, uses Hutchinson trace estimator (stochastic, O(D)).
+        """
         was_1d = x_curr.dim() == 1
         if was_1d:
             x_curr = x_curr.unsqueeze(0)
             x_prev = x_prev.unsqueeze(0)
+            if y_curr is not None:
+                y_curr = y_curr.unsqueeze(0)
         
         batch_size = x_curr.shape[0]
         
@@ -305,20 +351,51 @@ class RFProposal(pl.LightningModule):
             # Compute velocity and divergence
             with torch.enable_grad():
                 x_for_grad = x.detach().requires_grad_(True)
-                v = self.velocity_net(x_for_grad, s_tensor, x_prev)
                 
-                # Hutchinson trace estimator
-                eps = torch.randn_like(x)
-                vjp = torch.autograd.grad(
-                    v, x_for_grad,
-                    grad_outputs=eps,
-                    create_graph=False,
-                )[0]
-                trace_estimate = torch.sum(vjp * eps, dim=-1)
+                if use_exact_trace:
+                    # EXACT TRACE COMPUTATION
+                    
+                    # We need a function that takes x and returns v for jacobian computation
+                    def v_func(x_in):
+                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr)
+
+                    # Compute velocity for the step
+                    v = v_func(x_for_grad)
+                    
+                    # Compute exact trace
+                    divergence = torch.zeros(batch_size, device=self.device)
+                    
+                    # Iterate over state dimensions to compute diagonal of Jacobian
+                    for k in range(self.state_dim):
+                        # Create basis vector e_k
+                        # We want d(v_k)/d(x_k)
+                        grad_k = torch.autograd.grad(
+                            v[:, k], 
+                            x_for_grad, 
+                            grad_outputs=torch.ones_like(v[:, k]),
+                            create_graph=False,
+                            retain_graph=True
+                        )[0]
+                        
+                        # grad_k is [d(v_k)/dx_1, d(v_k)/dx_2, ...]
+                        # We only want the k-th component: d(v_k)/dx_k
+                        divergence += grad_k[:, k]
+                        
+                else:
+                    # HUTCHINSON TRACE ESTIMATOR (Stochastic)
+                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
+                    
+                    eps = torch.randn_like(x)
+                    vjp = torch.autograd.grad(
+                        v, x_for_grad,
+                        grad_outputs=eps,
+                        create_graph=False,
+                    )[0]
+                    divergence = torch.sum(vjp * eps, dim=-1)
             
             # Backward Euler step
             x = x - v.detach() * ds
-            log_prob_correction = log_prob_correction + trace_estimate.detach() * ds
+            log_prob_correction = log_prob_correction + divergence.detach() * ds
         
         # Base log prob of final z
         log_prob_base = -0.5 * torch.sum(x ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)

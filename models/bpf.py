@@ -42,6 +42,10 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         self.weights = None
         self.log_weights = None
 
+        # Debug stats
+        self.last_proposal_log_probs = None
+        self.last_obs_log_likelihoods = None
+
         self.step_count = 0
         self.resampling_history = []
 
@@ -237,6 +241,19 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         importance_weights = (
             obs_log_likelihoods + transition_log_probs - proposal_log_probs
         )
+        
+        # --- DEBUGGING ---
+        print(f"Step {self.step_count}:")
+        print(f"  proposal_log_probs (first 5): {proposal_log_probs[:5].detach().cpu().numpy()}")
+        print(f"  obs_log_probs (first 5): {obs_log_likelihoods[:5].detach().cpu().numpy()}")
+        print(f"  transition_log_probs (first 5): {transition_log_probs[:5].detach().cpu().numpy()}")
+        print(f"  log_weights before norm (first 5): {self.log_weights[:5].detach().cpu().numpy()}")
+        print(f"  log_weights stats: min={self.log_weights.min().item():.4f}, max={self.log_weights.max().item():.4f}, std={self.log_weights.std().item():.4f}")
+        # -----------------
+        
+        self.last_proposal_log_probs = proposal_log_probs
+        self.last_obs_log_likelihoods = obs_log_likelihoods
+
         self.log_weights += importance_weights
 
         max_ll = torch.max(obs_log_likelihoods).item()
@@ -368,6 +385,11 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         self.step_count += 1
         metrics = super().step(x_prev, x_curr, y_curr, dt, trajectory_idx, time_idx)
         resampled = self.resample()
+        
+        if self.last_proposal_log_probs is not None:
+             metrics["proposal_log_prob_mean"] = self.last_proposal_log_probs.mean().item()
+        if self.last_obs_log_likelihoods is not None:
+             metrics["obs_log_prob_mean"] = self.last_obs_log_likelihoods.mean().item()
 
         metrics["resampled"] = resampled
         metrics["ess"] = (1.0 / torch.sum(self.weights**2)).item()
@@ -431,6 +453,10 @@ class BootstrapParticleFilter(FilteringMethod):
         self.particles_prev = None
         self.weights = None
         self.log_weights = None
+
+        # Debug stats
+        self.last_proposal_log_probs = None
+        self.last_obs_log_likelihoods = None
 
         # Per-batch metrics
         self.step_count = 0
@@ -592,6 +618,18 @@ class BootstrapParticleFilter(FilteringMethod):
         importance_weights = (
             obs_log_likelihoods + transition_log_probs - proposal_log_probs
         )
+        
+        # --- DEBUGGING ---
+        print(f"Step {self.step_count} (Batch 0):")
+        print(f"  proposal_log_probs (first 5): {proposal_log_probs[0, :5].detach().cpu().numpy()}")
+        print(f"  obs_log_probs (first 5): {obs_log_likelihoods[0, :5].detach().cpu().numpy()}")
+        print(f"  transition_log_probs (first 5): {transition_log_probs[0, :5].detach().cpu().numpy()}")
+        print(f"  log_weights before norm (first 5): {self.log_weights[0, :5].detach().cpu().numpy()}")
+        # -----------------
+        
+        self.last_proposal_log_probs = proposal_log_probs
+        self.last_obs_log_likelihoods = obs_log_likelihoods
+
         self.log_weights += importance_weights
 
     def resample(self) -> List[bool]:
@@ -780,6 +818,9 @@ class BootstrapParticleFilter(FilteringMethod):
         
         ess = 1.0 / torch.sum(self.weights**2, dim=1)
         
+        prop_means = self.last_proposal_log_probs.mean(dim=1) if self.last_proposal_log_probs is not None else torch.zeros(x_curr.shape[0], device=self.device)
+        obs_means = self.last_obs_log_likelihoods.mean(dim=1) if self.last_obs_log_likelihoods is not None else torch.zeros(x_curr.shape[0], device=self.device)
+        
         for i in range(x_curr.shape[0]):
             metrics = {
                 "rmse": rmse[i].item(),
@@ -791,7 +832,9 @@ class BootstrapParticleFilter(FilteringMethod):
                 "time_idx": time_idxs[i].item(),
                 "resampled": resampled_flags[i],
                 "ess": ess[i].item(),
-                "step_time": elapsed_time
+                "step_time": elapsed_time,
+                "proposal_log_prob_mean": prop_means[i].item(),
+                "obs_log_prob_mean": obs_means[i].item(),
             }
             results.append(metrics)
             

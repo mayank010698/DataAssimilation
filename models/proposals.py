@@ -303,6 +303,8 @@ class RectifiedFlowProposal(ProposalDistribution):
         num_likelihood_steps: Optional[int] = None,
         num_sampling_steps: Optional[int] = None,
         system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -311,6 +313,8 @@ class RectifiedFlowProposal(ProposalDistribution):
             num_likelihood_steps: Override number of steps for likelihood computation
             num_sampling_steps: Override number of steps for sampling
             system: DynamicalSystem instance (required for pre/post processing)
+            obs_mean: Mean of observations for scaling (if preprocessing used)
+            obs_std: Std of observations for scaling (if preprocessing used)
         """
         import sys
         from pathlib import Path
@@ -329,6 +333,9 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.device = device
         self.system = system
         
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        
         # Override steps if provided
         if num_likelihood_steps is not None:
             self.rf_model.num_likelihood_steps = num_likelihood_steps
@@ -346,7 +353,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         
         Args:
             x_prev: Previous state, shape (state_dim,)
-            y_curr: Observation (unused by RF, kept for interface compatibility)
+            y_curr: Observation
             dt: Time step (unused by RF, kept for interface compatibility)
             
         Returns:
@@ -355,6 +362,15 @@ class RectifiedFlowProposal(ProposalDistribution):
         # Ensure x_prev is on correct device
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
+            
+        # Handle observation
+        if y_curr is not None:
+            if y_curr.device != self.device:
+                y_curr = y_curr.to(self.device)
+            
+            # Preprocess observation if needed
+            if self.obs_mean is not None and self.obs_std is not None:
+                y_curr = (y_curr - self.obs_mean) / self.obs_std
 
         # Preprocess input (unscaled -> scaled)
         if self.system is not None:
@@ -383,7 +399,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         Args:
             x_curr: Current state, shape (state_dim,)
             x_prev: Previous state, shape (state_dim,)
-            y_curr: Observation (unused by RF, kept for interface compatibility)
+            y_curr: Observation
             dt: Time step (unused by RF, kept for interface compatibility)
             
         Returns:
@@ -394,6 +410,15 @@ class RectifiedFlowProposal(ProposalDistribution):
             x_curr = x_curr.to(self.device)
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
+            
+        # Handle observation
+        if y_curr is not None:
+            if y_curr.device != self.device:
+                y_curr = y_curr.to(self.device)
+            
+            # Preprocess observation if needed
+            if self.obs_mean is not None and self.obs_std is not None:
+                y_curr = (y_curr - self.obs_mean) / self.obs_std
         
         # Preprocess inputs (unscaled -> scaled)
         if self.system is not None:

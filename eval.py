@@ -27,6 +27,65 @@ from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.proposals import RectifiedFlowProposal, TransitionProposal
 
 
+def test_rf_log_probs(rf_proposal, system):
+    """Test if RF is returning meaningful log probabilities"""
+    print("\nTesting RF Proposal Log Probs...")
+    # Create dummy data
+    state_dim = system.state_dim
+    x_prev = torch.randn(1, state_dim, device=rf_proposal.device)
+    
+    # Check if model expects observations
+    obs_dim = getattr(rf_proposal.rf_model, "obs_dim", 0)
+    y_curr = None
+    if obs_dim > 0:
+        y_curr = torch.randn(1, obs_dim, device=rf_proposal.device)
+        print(f"Generated dummy observation (dim={obs_dim}) for testing.")
+    
+    # Sample multiple times
+    samples = [rf_proposal.sample(x_prev, y_curr, 0.01) for _ in range(100)]
+    samples_tensor = torch.stack(samples).squeeze(1) # (100, D)
+    
+    # Compute log probs
+    x_prev_expanded = x_prev.repeat(100, 1)
+    y_curr_expanded = y_curr.repeat(100, 1) if y_curr is not None else None
+    
+    log_probs = rf_proposal.log_prob(samples_tensor, x_prev_expanded, y_curr_expanded, 0.01)
+    
+    print(f"Log prob stats (across DIFFERENT samples):")
+    print(f"  Mean: {log_probs.mean():.4f}")
+    print(f"  Std: {log_probs.std():.4f}")
+    print(f"  Min: {log_probs.min():.4f}")
+    print(f"  Max: {log_probs.max():.4f}")
+    
+    # --- NEW TEST: Stochastic Variance Check ---
+    print("\nTesting Stochastic Variance (SAME sample, multiple calls)...")
+    # Pick the first sample and repeat it 20 times
+    single_sample = samples_tensor[0:1].repeat(20, 1)
+    single_prev = x_prev.repeat(20, 1)
+    single_obs = y_curr.repeat(20, 1) if y_curr is not None else None
+    
+    # Compute log prob multiple times for the SAME input
+    # Since Hutchinson trace estimator is stochastic, these might differ
+    log_probs_same = rf_proposal.log_prob(single_sample, single_prev, single_obs, 0.01)
+    
+    print(f"Log prob stats (across SAME sample):")
+    print(f"  Mean: {log_probs_same.mean():.4f}")
+    print(f"  Std: {log_probs_same.std():.4f}")
+    print(f"  Min: {log_probs_same.min():.4f}")
+    print(f"  Max: {log_probs_same.max():.4f}")
+    
+    if log_probs_same.std() > 0.1:
+        print("WARNING: High variance in log_prob for identical inputs! Hutchinson estimator is noisy.")
+    else:
+        print("Log prob is deterministic/stable for identical inputs.")
+    # -------------------------------------------
+
+    if log_probs.std() < 1e-6:
+        print("WARNING: All log probs are essentially identical!")
+    else:
+        print("Log probs vary across samples (Good).")
+
+
 def plot_trajectory_comparison(
     result: Dict[str, Any],
     config: DataAssimilationConfig,
@@ -704,13 +763,32 @@ def main():
                 "Rectified Flow proposal selected but checkpoint not found. "
                 "Provide --rf-checkpoint or a valid --rf-config-name."
             )
+            
+        # Attempt to load observation scalers if needed
+        obs_mean = None
+        obs_std = None
+        
+        # We need to check if data_scaled.h5 exists and load from it
+        import h5py
+        data_scaled_path = data_dir / "data_scaled.h5"
+        if data_scaled_path.exists():
+            with h5py.File(data_scaled_path, "r") as f:
+                if "obs_scaler_mean" in f:
+                    obs_mean = torch.from_numpy(f["obs_scaler_mean"][:]).float()
+                    obs_std = torch.from_numpy(f["obs_scaler_std"][:]).float()
+                    print(f"Loaded observation scalers from {data_scaled_path}")
+
         proposal = RectifiedFlowProposal(
             rf_checkpoint,
             device=args.device,
             num_likelihood_steps=args.rf_likelihood_steps,
             num_sampling_steps=args.rf_sampling_steps,
             system=system,
+            obs_mean=obs_mean,
+            obs_std=obs_std,
         )
+        
+        test_rf_log_probs(proposal, system)
     else:
         rf_checkpoint = None
         proposal = TransitionProposal(system, process_noise_std=args.process_noise_std)
@@ -740,6 +818,8 @@ def main():
         wandb.define_metric("mean_rmse_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_over_time", step_metric="time_step")
         wandb.define_metric("mean_cumulative_resamples", step_metric="time_step")
+        wandb.define_metric("mean_proposal_log_prob", step_metric="time_step")
+        wandb.define_metric("mean_obs_log_prob", step_metric="time_step")
 
     # Identify first 10 trajectories for visualization
     vis_indices = set(range(10))
@@ -788,6 +868,8 @@ def main():
                 rmse_vals = []
                 ess_vals = []
                 cumulative_resample_vals = []
+                prop_log_vals = []
+                obs_log_vals = []
 
                 for i, r in enumerate(trajectory_results):
                     if t < len(r["metrics"]):
@@ -797,13 +879,19 @@ def main():
                         if r["metrics"][t].get("resampled", False):
                             traj_cumulative_resamples[i] += 1
                         cumulative_resample_vals.append(traj_cumulative_resamples[i])
+                        if "proposal_log_prob_mean" in r["metrics"][t]:
+                            prop_log_vals.append(r["metrics"][t]["proposal_log_prob_mean"])
+                        if "obs_log_prob_mean" in r["metrics"][t]:
+                            obs_log_vals.append(r["metrics"][t]["obs_log_prob_mean"])
                 
                 if rmse_vals:
                     wandb.log({
                         "time_step": t,
                         "mean_rmse_over_time": np.mean(rmse_vals),
                         "mean_ess_over_time": np.mean(ess_vals) if ess_vals else 0.0,
-                        "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0
+                        "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0,
+                        "mean_proposal_log_prob": np.mean(prop_log_vals) if prop_log_vals else 0.0,
+                        "mean_obs_log_prob": np.mean(obs_log_vals) if obs_log_vals else 0.0,
                     })
 
         # 2. Log Aggregated Scalars
