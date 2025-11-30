@@ -354,6 +354,7 @@ class RFProposal(pl.LightningModule):
                 
                 if use_exact_trace:
                     # EXACT TRACE COMPUTATION
+                    # print("Computing exact trace...")
                     
                     # We need a function that takes x and returns v for jacobian computation
                     def v_func(x_in):

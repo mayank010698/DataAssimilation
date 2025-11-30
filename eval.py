@@ -756,6 +756,12 @@ def main():
     data_module.setup("test")
     print(f"Test dataset size: {len(data_module.test_dataset)}")
 
+    # Use the system instance from data_module which has updated normalization stats
+    system = data_module.system
+    print(f"System normalization stats loaded:")
+    print(f"  Mean: {system.init_mean}")
+    print(f"  Std:  {system.init_std}")
+
     if args.proposal_type == "rf":
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
@@ -789,6 +795,13 @@ def main():
         )
         
         test_rf_log_probs(proposal, system)
+
+        # CRITICAL: Disable preprocessing for the Particle Filter itself
+        # The RF proposal wrapper handles scaling internally. 
+        # The filter receives unscaled particles and should operate in unscaled space.
+        print("Disabling system.config.use_preprocessing for Particle Filter execution (RF handles scaling internally).")
+        system.config.use_preprocessing = False
+
     else:
         rf_checkpoint = None
         proposal = TransitionProposal(system, process_noise_std=args.process_noise_std)
