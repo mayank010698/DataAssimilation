@@ -9,7 +9,7 @@ Implements a learned proposal q(x_t | x_{t-1}) using Rectified Flow with:
 
 import torch
 import torch.nn as nn
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import numpy as np
 from typing import Optional, Tuple
 from torchdiffeq import odeint, odeint_adjoint

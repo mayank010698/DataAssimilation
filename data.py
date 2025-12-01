@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, Sampler
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, Callable, Union, Iterator, List
 import h5py

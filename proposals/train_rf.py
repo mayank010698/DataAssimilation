@@ -5,9 +5,9 @@ Trains a rectified flow model to learn p(x_t | x_{t-1}) from trajectory data.
 """
 
 import torch
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
-from pytorch_lightning.loggers import WandbLogger
+import lightning.pytorch as pl
+from lightning.pytorch.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from lightning.pytorch.loggers import WandbLogger
 import argparse
 import logging
 from pathlib import Path

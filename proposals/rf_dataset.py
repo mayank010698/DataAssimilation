@@ -7,7 +7,7 @@ Provides (x_{t-1}, x_t) pairs from trajectories for learning the transition dist
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import h5py
 from pathlib import Path
 from typing import Optional

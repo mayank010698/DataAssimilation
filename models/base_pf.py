@@ -1,5 +1,5 @@
 import torch
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 
