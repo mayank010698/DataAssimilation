@@ -8,3 +8,10 @@ __pycache__/
 
 # Common
 .env
+
+# other
+datasets/
+rf_runs/
+logs/
+wandb/
+scripts/
