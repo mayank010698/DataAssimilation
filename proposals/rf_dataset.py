@@ -92,7 +92,6 @@ class RFDataModule(pl.LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 4,
         window: int = 1,
-        use_preprocessing: bool = False,
         use_observations: bool = False,
     ):
         super().__init__()
@@ -100,7 +99,6 @@ class RFDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.window = window
-        self.use_preprocessing = use_preprocessing
         self.use_observations = use_observations
         
         self.train_dataset = None
@@ -109,14 +107,19 @@ class RFDataModule(pl.LightningDataModule):
     
     def setup(self, stage: Optional[str] = None):
         """Load data and create datasets"""
-        filename = "data_scaled.h5" if self.use_preprocessing else "data.h5"
+        # ALWAYS load scaled data for RF training
+        filename = "data_scaled.h5"
         data_file = self.data_dir / filename
         
         if not data_file.exists():
-            raise FileNotFoundError(
-                f"Data file not found: {data_file}. "
-                "Run data generation first using DataAssimilationDataModule."
-            )
+            # Fallback to data.h5 if scaled doesn't exist (but warn heavily)
+            data_file = self.data_dir / "data.h5"
+            if not data_file.exists():
+                 raise FileNotFoundError(
+                    f"Data file not found: {data_file}. "
+                    "Run data generation first using DataAssimilationDataModule."
+                )
+            logging.warning("data_scaled.h5 not found! Loading data.h5 (unscaled). This is likely NOT what you want for RF training.")
         
         with h5py.File(data_file, "r") as f:
             if stage == "fit" or stage is None:

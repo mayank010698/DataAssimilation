@@ -27,6 +27,54 @@ from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.proposals import RectifiedFlowProposal, TransitionProposal
 
 
+def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
+    """
+    Compute CRPS for an ensemble.
+    
+    Args:
+        ensemble: Shape (K, D) or (K,)
+        truth: Shape (D,) or scalar
+        
+    Returns:
+        Average CRPS over dimensions (or scalar CRPS)
+    """
+    # Ensure 2D (K, D)
+    if ensemble.ndim == 1:
+        ensemble = ensemble[:, None]
+    if truth.ndim == 0:
+        truth = truth[None]
+        
+    # Dimensions: K=ensemble_size, D=state_dim
+    K, D = ensemble.shape
+    
+    crps_sum = 0.0
+    
+    for d in range(D):
+        ens_d = np.sort(ensemble[:, d])
+        truth_d = truth[d]
+        
+        # Term 1: Mean absolute error vs truth
+        # E|X - y|
+        mae = np.mean(np.abs(ens_d - truth_d))
+        
+        # Term 2: Dispersion (mean absolute difference between members)
+        # 0.5 * E|X - X'|
+        # Efficient calculation using sorted array:
+        # sum_{i,j} |x_i - x_j| = 2 * sum_{i<j} (x_j - x_i)
+        # = 2 * sum_{i=0}^{K-1} x_i * (2i - K + 1)
+        
+        # We want (1 / (2 * K^2)) * sum_{i,j} |x_i - x_j|
+        # = (1 / K^2) * sum_{i<j} (x_j - x_i)
+        
+        # However, for small K, direct computation is fast enough and safer
+        diffs = np.abs(ens_d[:, None] - ens_d[None, :])
+        dispersion = np.sum(diffs) / (2 * K * K)
+        
+        crps_sum += (mae - dispersion)
+        
+    return crps_sum / D
+
+
 def test_rf_log_probs(rf_proposal, system):
     """Test if RF is returning meaningful log probabilities"""
     print("\nTesting RF Proposal Log Probs...")
@@ -102,19 +150,19 @@ def plot_trajectory_comparison(
     x_true = np.array([d["x_true"] for d in trajectory_data])
     x_est = np.array([d["x_est"] for d in trajectory_data])
     rmse_values = np.array([d["rmse"] for d in trajectory_data])
+    
+    # Check if CRPS is available
+    has_crps = "crps" in trajectory_data[0]
+    if has_crps:
+        crps_values = np.array([d["crps"] for d in trajectory_data])
 
     # Create mapping from time_idx to array position
     time_to_idx = {t: idx for idx, t in enumerate(time_steps)}
 
-    if config.use_preprocessing:
-        # system.postprocess handles both tensor and numpy array
-        x_true_orig = np.array([system.postprocess(xt) for xt in x_true])
-        x_est_orig = np.array([system.postprocess(xe) for xe in x_est])
-        space_label = " (Original Space)"
-    else:
-        x_true_orig = x_true
-        x_est_orig = x_est
-        space_label = ""
+    # Data is already in physical space
+    x_true_orig = x_true
+    x_est_orig = x_est
+    space_label = ""
 
     obs_times = []
     obs_values = []
@@ -170,6 +218,14 @@ def plot_trajectory_comparison(
     ax5.set_title("RMSE Over Time")
     ax5.set_xlabel("Time Step")
     ax5.set_ylabel("RMSE")
+    
+    # CRPS over time
+    if has_crps:
+        ax6 = fig.add_subplot(3, 2, 6)
+        ax6.plot(time_steps, crps_values, "green")
+        ax6.set_title("CRPS Over Time")
+        ax6.set_xlabel("Time Step")
+        ax6.set_ylabel("CRPS")
 
     plt.tight_layout()
     return fig
@@ -262,6 +318,9 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
     all_std_rmse = [r["std_rmse"] for r in trajectory_results]
     all_min_rmse = [r["min_rmse"] for r in trajectory_results]
     all_max_rmse = [r["max_rmse"] for r in trajectory_results]
+
+    # Aggregate CRPS metrics
+    all_mean_crps = [np.mean([m["crps"] for m in r["metrics"]]) for r in trajectory_results]
     
     # Aggregate log-likelihood metrics
     all_total_ll = [r["total_log_likelihood"] for r in trajectory_results]
@@ -293,6 +352,10 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
         "mean_std_rmse": np.mean(all_std_rmse),
         "mean_min_rmse": np.mean(all_min_rmse),
         "mean_max_rmse": np.mean(all_max_rmse),
+
+        # CRPS statistics
+        "mean_crps_across_trajectories": np.mean(all_mean_crps),
+        "std_crps_across_trajectories": np.std(all_mean_crps),
         
         # Overall RMSE distribution
         "overall_mean_rmse": np.mean(all_rmse_values) if all_rmse_values else 0.0,
@@ -414,7 +477,7 @@ def parse_args():
     parser.add_argument("--run-name", type=str, default=None)
     parser.add_argument("--experiment-label", type=str, default="custom_eval")
     parser.add_argument("--wandb-project", type=str, default="data-assimilation-bpf")
-    parser.add_argument("--wandb-entity", type=str, default=None)
+    parser.add_argument("--wandb-entity", type=str, default="ml-climate")
     parser.add_argument("--wandb-tags", type=str, default="")
     parser.add_argument("--disable-wandb", action="store_true", default=False)
 
@@ -491,7 +554,14 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             if tid not in trajectory_results_map:
                  # Should generally be handled by is_start, but safety check could go here
                  continue
-                 
+            
+            # Compute CRPS
+            # Resample based on weights to get equally weighted ensemble
+            indices = torch.multinomial(pf.weights[i], pf.n_particles, replacement=True)
+            ens_i = pf.particles[i, indices].detach().cpu().numpy()
+            truth_i = x_curr[i].detach().cpu().numpy()
+            metrics["crps"] = compute_crps_ensemble(ens_i, truth_i)
+
             trajectory_results_map[tid]["metrics"].append(metrics)
             
             if tid in vis_indices:
@@ -505,6 +575,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
                     "observation": y_curr_i.cpu().numpy() if (has_obs and y_curr_i is not None) else None,
                     "has_observation": has_obs,
                     "rmse": metrics["rmse"],
+                    "crps": metrics["crps"],
                 })
 
         total_processed_steps += batch_size_curr
@@ -632,6 +703,13 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         
         # Process current batch
         metrics = pf.test_step(batch, 0)
+        
+        # Compute CRPS
+        indices = torch.multinomial(pf.weights, pf.n_particles, replacement=True)
+        ens = pf.particles[indices].detach().cpu().numpy()
+        truth = batch["x_curr"].squeeze(0).detach().cpu().numpy()
+        metrics["crps"] = compute_crps_ensemble(ens, truth)
+
         current_traj_metrics.append(metrics)
         
         # Collect visualization data if needed
@@ -648,6 +726,7 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
                     "observation": y_curr.cpu().numpy() if y_curr is not None else None,
                     "has_observation": batch["has_observation"].item(),
                     "rmse": metrics["rmse"],
+                    "crps": metrics["crps"],
                 }
             )
             
@@ -796,12 +875,9 @@ def main():
         
         test_rf_log_probs(proposal, system)
 
-        # CRITICAL: Disable preprocessing for the Particle Filter itself
-        # The RF proposal wrapper handles scaling internally. 
-        # The filter receives unscaled particles and should operate in unscaled space.
-        print("Disabling system.config.use_preprocessing for Particle Filter execution (RF handles scaling internally).")
-        system.config.use_preprocessing = False
-
+        # RF Proposal wrapper handles scaling internally. 
+        # The filter receives unscaled particles and operates in unscaled space.
+        
     else:
         rf_checkpoint = None
         proposal = TransitionProposal(system, process_noise_std=args.process_noise_std)
@@ -833,6 +909,7 @@ def main():
         wandb.define_metric("mean_cumulative_resamples", step_metric="time_step")
         wandb.define_metric("mean_proposal_log_prob", step_metric="time_step")
         wandb.define_metric("mean_obs_log_prob", step_metric="time_step")
+        wandb.define_metric("mean_obs_log_prob_std", step_metric="time_step")
 
     # Identify first 10 trajectories for visualization
     vis_indices = set(range(10))
@@ -853,6 +930,10 @@ def main():
     print(
         f"  Mean RMSE across trajectories: {aggregated['mean_rmse_across_trajectories']:.4f} "
         f"± {aggregated['std_rmse_across_trajectories']:.4f}"
+    )
+    print(
+        f"  Mean CRPS across trajectories: {aggregated['mean_crps_across_trajectories']:.4f} "
+        f"± {aggregated['std_crps_across_trajectories']:.4f}"
     )
     print(
         f"  Overall mean RMSE: {aggregated['overall_mean_rmse']:.4f} "
@@ -879,14 +960,18 @@ def main():
             
             for t in range(max_steps):
                 rmse_vals = []
+                crps_vals = []
                 ess_vals = []
                 cumulative_resample_vals = []
                 prop_log_vals = []
                 obs_log_vals = []
+                obs_log_std_vals = []
 
                 for i, r in enumerate(trajectory_results):
                     if t < len(r["metrics"]):
                         rmse_vals.append(r["metrics"][t]["rmse"])
+                        if "crps" in r["metrics"][t]:
+                            crps_vals.append(r["metrics"][t]["crps"])
                         if "ess" in r["metrics"][t]:
                             ess_vals.append(r["metrics"][t]["ess"])
                         if r["metrics"][t].get("resampled", False):
@@ -896,15 +981,19 @@ def main():
                             prop_log_vals.append(r["metrics"][t]["proposal_log_prob_mean"])
                         if "obs_log_prob_mean" in r["metrics"][t]:
                             obs_log_vals.append(r["metrics"][t]["obs_log_prob_mean"])
+                        if "obs_log_prob_std" in r["metrics"][t]:
+                            obs_log_std_vals.append(r["metrics"][t]["obs_log_prob_std"])
                 
                 if rmse_vals:
                     wandb.log({
                         "time_step": t,
                         "mean_rmse_over_time": np.mean(rmse_vals),
+                        "mean_crps_over_time": np.mean(crps_vals) if crps_vals else 0.0,
                         "mean_ess_over_time": np.mean(ess_vals) if ess_vals else 0.0,
                         "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0,
                         "mean_proposal_log_prob": np.mean(prop_log_vals) if prop_log_vals else 0.0,
                         "mean_obs_log_prob": np.mean(obs_log_vals) if obs_log_vals else 0.0,
+                        "mean_obs_log_prob_std": np.mean(obs_log_std_vals) if obs_log_std_vals else 0.0,
                     })
 
         # 2. Log Aggregated Scalars
@@ -912,6 +1001,8 @@ def main():
             {
                 "mean_rmse": aggregated["mean_rmse_across_trajectories"],
                 "std_rmse": aggregated["std_rmse_across_trajectories"],
+                "mean_crps": aggregated["mean_crps_across_trajectories"],
+                "std_crps": aggregated["std_crps_across_trajectories"],
                 "mean_log_likelihood": aggregated["mean_total_log_likelihood"],
                 "mean_ess": aggregated["mean_ess"],
                 "step_time": aggregated["mean_step_time"],

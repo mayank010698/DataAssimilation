@@ -25,6 +25,54 @@ from data import (
 )
 from proposals.rectified_flow import RFProposal
 
+def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
+    """
+    Compute CRPS for an ensemble.
+    
+    Args:
+        ensemble: Shape (K, D) or (K,)
+        truth: Shape (D,) or scalar
+        
+    Returns:
+        Average CRPS over dimensions (or scalar CRPS)
+    """
+    # Ensure 2D (K, D)
+    if ensemble.ndim == 1:
+        ensemble = ensemble[:, None]
+    if truth.ndim == 0:
+        truth = truth[None]
+        
+    # Dimensions: K=ensemble_size, D=state_dim
+    K, D = ensemble.shape
+    
+    crps_sum = 0.0
+    
+    for d in range(D):
+        ens_d = np.sort(ensemble[:, d])
+        truth_d = truth[d]
+        
+        # Term 1: Mean absolute error vs truth
+        # E|X - y|
+        mae = np.mean(np.abs(ens_d - truth_d))
+        
+        # Term 2: Dispersion (mean absolute difference between members)
+        # 0.5 * E|X - X'|
+        # Efficient calculation using sorted array:
+        # sum_{i,j} |x_i - x_j| = 2 * sum_{i<j} (x_j - x_i)
+        # = 2 * sum_{i=0}^{K-1} x_i * (2i - K + 1)
+        
+        # We want (1 / (2 * K^2)) * sum_{i,j} |x_i - x_j|
+        # = (1 / K^2) * sum_{i<j} (x_j - x_i)
+        
+        # However, for small K, direct computation is fast enough and safer
+        diffs = np.abs(ens_d[:, None] - ens_d[None, :])
+        dispersion = np.sum(diffs) / (2 * K * K)
+        
+        crps_sum += (mae - dispersion)
+        
+    return crps_sum / D
+
+
 def plot_trajectory_comparison(
     result: Dict[str, Any],
     config: DataAssimilationConfig,
@@ -45,15 +93,10 @@ def plot_trajectory_comparison(
     # Create mapping from time_idx to array position
     time_to_idx = {t: idx for idx, t in enumerate(time_steps)}
 
-    if config.use_preprocessing:
-        # x_est and x_true are ALREADY in original space from run_proposal_eval
-        x_true_orig = x_true
-        x_est_orig = x_est
-        space_label = " (Original Space)"
-    else:
-        x_true_orig = x_true
-        x_est_orig = x_est
-        space_label = ""
+    # Trajectories are already stored in physical space.
+    x_true_orig = x_true
+    x_est_orig = x_est
+    space_label = " (Physical Space)"
 
     obs_times = []
     obs_values = []
@@ -112,12 +155,25 @@ def plot_trajectory_comparison(
     return fig
 
 
+def _derive_eval_run_name(checkpoint_path: str) -> str:
+    """Build wandb run name like eval-<training_run> for clarity."""
+    ckpt_path = Path(checkpoint_path)
+    try:
+        # Expect .../<run_name>/checkpoints/<file>.ckpt
+        run_dir = ckpt_path.parents[1]
+        base_name = run_dir.name
+    except IndexError:
+        base_name = ckpt_path.stem
+    return f"eval-{base_name}"
+
+
 def run_proposal_eval(
     checkpoint_path: str,
     data_dir: str,
     n_trajectories: Optional[int] = None,  # None means all
     n_vis_trajectories: int = 10,
     batch_size: int = 32,
+    n_samples_per_traj: int = 1,
     device: str = "cuda",
     wandb_run = None,
 ):
@@ -130,12 +186,14 @@ def run_proposal_eval(
         n_trajectories: Number of trajectories to evaluate (None for all)
         n_vis_trajectories: Number of trajectories to visualize
         batch_size: Batch size for evaluation
+        n_samples_per_traj: Number of independent samples per trajectory (for CRPS)
         device: Device to run on
         wandb_run: Active wandb run (optional)
     """
     logger = logging.getLogger(__name__)
     logger.info(f"Running Proposal Evaluation (Autoregressive)")
     logger.info(f"Checkpoint: {checkpoint_path}")
+    logger.info(f"Samples per trajectory: {n_samples_per_traj}")
     
     # Load Config
     data_path = Path(data_dir)
@@ -190,27 +248,32 @@ def run_proposal_eval(
     system = data_module.system
     
     # Tracking state
-    # Maps trajectory_idx -> current_state (tensor)
+    # Maps trajectory_idx -> current_state (tensor of shape (K, state_dim))
     current_states = {} 
     
     # Store results
-    trajectory_results = {i: {"trajectory_data": [], "rmse_sum": 0.0, "count": 0} for i in range(n_trajectories)}
+    trajectory_results = {
+        i: {
+            "trajectory_data": [], 
+            "rmse_sum": 0.0, 
+            "crps_sum": 0.0,
+            "count": 0
+        } for i in range(n_trajectories)
+    }
     
     pbar = tqdm(test_loader, desc="Generating")
     
     for batch in pbar:
-        # Move to device and handle preprocessing
-        if config.use_preprocessing:
-            x_prev_gt = batch["x_prev_scaled"].to(device)
-            x_curr_gt = batch["x_curr_scaled"].to(device)
-            if batch["has_observation"].any():
-                y_curr = batch["y_curr_scaled"].to(device)
-            else:
-                y_curr = None
+        # Always use SCALED inputs for the model (it was trained on scaled data)
+        # And keep UNSCALED ground truth for evaluation
+        
+        x_prev_input = batch["x_prev_scaled"].to(device)
+        x_curr_gt = batch["x_curr"].to(device) # Physical space ground truth
+        
+        if batch["has_observation"].any():
+            y_curr_input = batch["y_curr_scaled"].to(device)
         else:
-            x_prev_gt = batch["x_prev"].to(device)
-            x_curr_gt = batch["x_curr"].to(device)
-            y_curr = batch["y_curr"].to(device) if batch["has_observation"].any() else None
+            y_curr_input = None
         
         traj_idxs = batch["trajectory_idx"].squeeze(-1).tolist()
         time_idxs = batch["time_idx"].squeeze(-1).tolist()
@@ -225,12 +288,17 @@ def run_proposal_eval(
             
             # Initialize if start of trajectory (t=1 means step 1, predicting from x0)
             if t == 1:
-                current_states[tid] = x_prev_gt[i]
+                # Start with x0 replicated K times
+                # x_prev_input[i] is (D,)
+                current_states[tid] = x_prev_input[i].unsqueeze(0).repeat(n_samples_per_traj, 1)
                 
             if tid in current_states:
-                batch_x_prev.append(current_states[tid])
-                if y_curr is not None:
-                    batch_y_curr.append(y_curr[i])
+                batch_x_prev.append(current_states[tid]) # (K, D)
+                if y_curr_input is not None:
+                    # Repeat y for each sample in ensemble
+                    # y_curr_input[i] is (D_obs,)
+                    y_expanded = y_curr_input[i].unsqueeze(0).repeat(n_samples_per_traj, 1)
+                    batch_y_curr.append(y_expanded)
                 valid_mask.append(i)
             else:
                 pass
@@ -239,86 +307,104 @@ def run_proposal_eval(
             continue
             
         # Stack for batch inference
-        x_prev_input = torch.stack(batch_x_prev)
-        y_curr_input = torch.stack(batch_y_curr) if batch_y_curr else None
+        # List of B tensors of shape (K, D) -> Stack (B, K, D) -> Reshape (B*K, D)
+        x_prev_stack = torch.stack(batch_x_prev) # (B_eff, K, D)
+        B_eff, K, D = x_prev_stack.shape
+        x_prev_flat = x_prev_stack.reshape(B_eff * K, D)
         
-        # Debug: Check for NaNs in input
-        if torch.isnan(x_prev_input).any():
-            logger.error(f"NaN detected in input x_prev! Stats: mean={x_prev_input.mean():.4f}, std={x_prev_input.std():.4f}, min={x_prev_input.min():.4f}, max={x_prev_input.max():.4f}")
-        if y_curr_input is not None and torch.isnan(y_curr_input).any():
-            logger.error(f"NaN detected in input y_curr! Stats: mean={y_curr_input.mean():.4f}, std={y_curr_input.std():.4f}")
-
+        y_curr_flat = None
+        if batch_y_curr:
+            y_curr_stack = torch.stack(batch_y_curr) # (B_eff, K, D_obs)
+            D_obs = y_curr_stack.shape[-1]
+            y_curr_flat = y_curr_stack.reshape(B_eff * K, D_obs)
+        
         # Sample next states
         # x_next ~ p(x_t | x_{t-1}, y_t)
         with torch.no_grad():
-            x_next = model.sample(x_prev_input, y_curr_input)
+            # Model outputs (B*K, D)
+            x_next_flat = model.sample(x_prev_flat, y_curr_flat)
             
-        # Debug: Check for NaNs in output
-        if torch.isnan(x_next).any():
-             logger.error(f"NaN produced by model! Input stats: x_mean={x_prev_input.mean():.4f}")
-
+        # Reshape back to (B, K, D)
+        x_next_stack = x_next_flat.reshape(B_eff, K, D)
             
-        # Calculate RMSE and Update
+        # Calculate Metrics and Update
         batch_rmse = []
+        batch_crps = []
         
         for k, idx in enumerate(valid_mask):
             tid = traj_idxs[idx]
             t = time_idxs[idx]
             
-            # Generated state
-            x_gen = x_next[k]
+            # Generated ensemble (Scaled)
+            x_gen_k = x_next_stack[k] # (K, D)
             
-            # Ground truth
-            x_true = x_curr_gt[idx]
+            # Ground truth (Unscaled / Physical)
+            x_true = x_curr_gt[idx] # (D,)
             
-            # Update current state for autoregressive generation (always use scaled/model space)
-            current_states[tid] = x_gen
+            # Update current state for autoregressive generation
+            current_states[tid] = x_gen_k
             
             # Metric calculation (in original space)
-            if config.use_preprocessing:
-                # Detach and unscale for metric computation
-                x_gen_orig = system.postprocess(x_gen)
-                x_true_orig = system.postprocess(x_true)
-                
-                error = x_gen_orig - x_true_orig
-            else:
-                error = x_gen - x_true
-                x_gen_orig = x_gen
-                x_true_orig = x_true
-                
+            # Detach and unscale for metric computation
+            # process whole ensemble at once
+            x_gen_orig_k = system.postprocess(x_gen_k) # (K, D)
+            x_true_orig = x_true # Already physical
+            
+            # RMSE of the Mean
+            x_mean_orig = torch.mean(x_gen_orig_k, dim=0) # (D,)
+            error = x_mean_orig - x_true_orig
             rmse = torch.sqrt(torch.mean(error**2)).item()
             batch_rmse.append(rmse)
             
+            # CRPS
+            crps = compute_crps_ensemble(x_gen_orig_k.cpu().numpy(), x_true_orig.cpu().numpy())
+            batch_crps.append(crps)
+            
             # Store
             has_obs = batch["has_observation"][idx].item()
-            obs = y_curr[idx].cpu().numpy() if (has_obs and y_curr is not None) else None
+            obs = batch["y_curr"][idx].cpu().numpy() if (has_obs and "y_curr" in batch) else None
             
-            # Use original space values for storage/plotting
+            # For plotting/storage, we store the mean estimate or full ensemble?
+            # Storing full ensemble might be heavy if K is large.
+            # For now, let's store mean for plotting compatibility, 
+            # but maybe we should update plotter to show spread if K > 1.
+            # For backward compatibility, x_est is mean.
+            
             trajectory_results[tid]["trajectory_data"].append({
                 "time_idx": t,
                 "x_true": x_true_orig.cpu().numpy(),
-                "x_est": x_gen_orig.cpu().numpy(), # "x_est" used by plotter
+                "x_est": x_mean_orig.cpu().numpy(), # Mean estimate
+                "x_std": torch.std(x_gen_orig_k, dim=0).cpu().numpy(), # Std dev for uncertainty
                 "observation": obs,
                 "has_observation": has_obs,
-                "rmse": rmse
+                "rmse": rmse,
+                "crps": crps
             })
             
             trajectory_results[tid]["rmse_sum"] += rmse
+            trajectory_results[tid]["crps_sum"] += crps
             trajectory_results[tid]["count"] += 1
             
         # Update pbar
         avg_rmse = sum(batch_rmse) / len(batch_rmse) if batch_rmse else 0.0
-        pbar.set_postfix({"rmse": f"{avg_rmse:.4f}"})
+        avg_crps = sum(batch_crps) / len(batch_crps) if batch_crps else 0.0
+        pbar.set_postfix({"rmse": f"{avg_rmse:.4f}", "crps": f"{avg_crps:.4f}"})
 
     # Aggregate and Log
     total_rmse = 0.0
+    total_crps = 0.0
     total_steps = 0
     
     for tid, res in trajectory_results.items():
         if res["count"] > 0:
             mean_traj_rmse = res["rmse_sum"] / res["count"]
+            mean_traj_crps = res["crps_sum"] / res["count"]
+            
             res["mean_rmse"] = mean_traj_rmse
+            res["mean_crps"] = mean_traj_crps
+            
             total_rmse += res["rmse_sum"]
+            total_crps += res["crps_sum"]
             total_steps += res["count"]
             
             # Sort data by time
@@ -336,13 +422,18 @@ def run_proposal_eval(
                     plt.close(fig)
 
     global_mean_rmse = total_rmse / total_steps if total_steps > 0 else 0.0
+    global_mean_crps = total_crps / total_steps if total_steps > 0 else 0.0
+    
     logger.info(f"Global Mean RMSE (Autoregressive): {global_mean_rmse:.4f}")
+    logger.info(f"Global Mean CRPS (Autoregressive): {global_mean_crps:.4f}")
     
     if wandb_run:
-        wandb_run.log({"eval/global_mean_rmse": global_mean_rmse})
+        wandb_run.log({
+            "eval/global_mean_rmse": global_mean_rmse,
+            "eval/global_mean_crps": global_mean_crps
+        })
         
-        # Log RMSE over time (averaged across trajectories)
-        # Find max time
+        # Log metrics over time
         max_t = 0
         for res in trajectory_results.values():
             if res["trajectory_data"]:
@@ -350,16 +441,22 @@ def run_proposal_eval(
         
         for t in range(1, max_t + 1):
             rmses_at_t = []
+            crps_at_t = []
             for res in trajectory_results.values():
-                # Find data at t (inefficient but fine for eval)
                 for d in res["trajectory_data"]:
                     if d["time_idx"] == t:
                         rmses_at_t.append(d["rmse"])
+                        crps_at_t.append(d["crps"])
                         break
             
             if rmses_at_t:
-                mean_t = sum(rmses_at_t) / len(rmses_at_t)
-                wandb_run.log({"eval/mean_rmse_over_time": mean_t, "time_step": t})
+                mean_rmse_t = sum(rmses_at_t) / len(rmses_at_t)
+                mean_crps_t = sum(crps_at_t) / len(crps_at_t)
+                wandb_run.log({
+                    "eval/mean_rmse_over_time": mean_rmse_t, 
+                    "eval/mean_crps_over_time": mean_crps_t,
+                    "time_step": t
+                })
 
     return global_mean_rmse
 
@@ -371,6 +468,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-trajectories", type=int, default=None, help="Number of trajectories to evaluate (default: all)")
     parser.add_argument("--n-vis-trajectories", type=int, default=10, help="Number of trajectories to visualize")
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--n-samples-per-traj", type=int, default=1, help="Number of samples per trajectory (for CRPS)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wandb", action="store_true")
     
@@ -380,7 +478,8 @@ if __name__ == "__main__":
     
     run = None
     if args.wandb:
-        run = wandb.init(project="rf-proposal-eval", name="standalone-eval")
+        run_name = _derive_eval_run_name(args.checkpoint)
+        run = wandb.init(project="rf-proposal-eval", name=run_name, entity="ml-climate")
         
     run_proposal_eval(
         checkpoint_path=args.checkpoint,
@@ -388,6 +487,7 @@ if __name__ == "__main__":
         n_trajectories=args.n_trajectories,
         n_vis_trajectories=args.n_vis_trajectories,
         batch_size=args.batch_size,
+        n_samples_per_traj=args.n_samples_per_traj,
         device=args.device,
         wandb_run=run
     )

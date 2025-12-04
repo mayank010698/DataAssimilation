@@ -54,7 +54,6 @@ def train_rectified_flow(
     learning_rate: float = 1e-3,
     max_epochs: int = 500,
     num_workers: int = 4,
-    use_preprocessing: bool = True,
     use_observations: bool = False,
     gpus: int = 1,
 ):
@@ -72,12 +71,14 @@ def train_rectified_flow(
         learning_rate: Learning rate
         max_epochs: Maximum number of epochs
         num_workers: Number of dataloader workers
-        use_preprocessing: Whether data is preprocessed/normalized
         use_observations: Whether to condition on observations
         gpus: Number of GPUs to use
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    
+    if not use_observations:
+        obs_dim = 0
     
     logger_obj = setup_logging(output_dir)
     logger_obj.info("="*80)
@@ -93,7 +94,6 @@ def train_rectified_flow(
     logger_obj.info(f"Batch size: {batch_size}")
     logger_obj.info(f"Learning rate: {learning_rate}")
     logger_obj.info(f"Max epochs: {max_epochs}")
-    logger_obj.info(f"Use preprocessing: {use_preprocessing}")
     logger_obj.info(f"GPUs: {gpus}")
     
     # Create data module
@@ -102,7 +102,6 @@ def train_rectified_flow(
         batch_size=batch_size,
         num_workers=num_workers,
         window=1,
-        use_preprocessing=use_preprocessing,
         use_observations=use_observations,
     )
     
@@ -115,7 +114,7 @@ def train_rectified_flow(
         learning_rate=learning_rate,
         num_sampling_steps=50,
         num_likelihood_steps=50,
-        use_preprocessing=use_preprocessing,
+        use_preprocessing=True, # ALWAYS True for RF training
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -143,7 +142,8 @@ def train_rectified_flow(
     
     # Setup logger
     wandb_logger = WandbLogger(
-        project="rectified-flow-proposal",
+        entity="ml-climate",
+        project="flow-proposal",
         name=output_dir.name,
         save_dir=str(output_dir),
     )
@@ -158,7 +158,7 @@ def train_rectified_flow(
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "max_epochs": max_epochs,
-        "use_preprocessing": use_preprocessing,
+        "use_preprocessing": True,
         "data_dir": str(data_dir),
     })
     
@@ -223,8 +223,6 @@ def main():
                         help='Number of GPUs to use')
     
     # Other arguments
-    parser.add_argument('--use_preprocessing', action='store_true',
-                        help='Whether data is preprocessed/normalized')
     parser.add_argument('--use_observations', action='store_true',
                         help='Use observation conditioning')
     parser.add_argument('--evaluate', action='store_true',
@@ -253,7 +251,6 @@ def main():
             learning_rate=args.learning_rate,
             max_epochs=args.max_epochs,
             num_workers=args.num_workers,
-            use_preprocessing=args.use_preprocessing,
             use_observations=args.use_observations,
             gpus=args.gpus,
         )

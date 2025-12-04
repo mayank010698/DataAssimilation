@@ -20,7 +20,6 @@ class DataAssimilationConfig:
     len_trajectory: int = 1024
     warmup_steps: int = 1024
     dt: float = 0.01
-    use_preprocessing: bool = True
 
     # Observation parameters
     obs_noise_std: float = 0.1
