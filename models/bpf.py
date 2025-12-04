@@ -30,7 +30,6 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
-        self.use_preprocessing = system.config.use_preprocessing
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -42,6 +41,10 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         self.weights = None
         self.log_weights = None
 
+        # Debug stats
+        self.last_proposal_log_probs = None
+        self.last_obs_log_likelihoods = None
+
         self.step_count = 0
         self.resampling_history = []
 
@@ -49,7 +52,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         logging.info(
             f"n_particles={n_particles}, proposal={type(self.proposal).__name__}, "
             f"process_noise_std={process_noise_std}, obs_noise_std={system.config.obs_noise_std}, "
-            f"obs_dim={obs_dim}, use_preprocessing={self.use_preprocessing}"
+            f"obs_dim={obs_dim}"
         )
 
     def initialize_filter(self, x0: torch.Tensor) -> None:
@@ -77,8 +80,6 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
             f"Filter initialized with {self.n_particles} particles; initial spread std="
             f"{torch.std(self.particles, dim=0).cpu().numpy()}"
         )
-        if self.use_preprocessing:
-            logging.info("Operating in normalized space due to preprocessing")
 
     def predict_step(self, dt: float, y_curr: Optional[torch.Tensor] = None) -> None:
         """
@@ -133,28 +134,10 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         """
         Compute log p(x_t | x_{t-1}) for the transition dynamics
         """
-        # Fully vectorized implementation using PyTorch system
-        
-        if self.use_preprocessing:
-            # Convert to original space, integrate, convert back
-            # x_prev is (N, D)
-            x_prev_orig = self.system.postprocess(x_prev)
-            
-            # Integrate forward. integrate(x, n_steps=2, dt) returns (N, 2, D). 
-            # We want the state at t=dt (index 1).
-            # Note: integrate now expects tensor input and returns tensor.
-            integration_result = self.system.integrate(x_prev_orig, 2, dt)
-            x_expected_orig = integration_result[:, 1, :]
-            
-            x_expected = self.system.preprocess(x_expected_orig)
-            
-            # Convert noise std to tensor on device
-            init_std = self.system.init_std.to(self.device)
-            noise_std = self.process_noise_std / init_std
-        else:
-            integration_result = self.system.integrate(x_prev, 2, dt)
-            x_expected = integration_result[:, 1, :]
-            noise_std = torch.tensor(self.process_noise_std, device=self.device)
+        # Fully vectorized implementation using PyTorch system in physical space
+        integration_result = self.system.integrate(x_prev, 2, dt)
+        x_expected = integration_result[:, 1, :]
+        noise_std = torch.tensor(self.process_noise_std, device=self.device)
 
         # Compute Gaussian log-likelihood of the transition
         # x_curr: (N, D), x_expected: (N, D)
@@ -237,6 +220,19 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         importance_weights = (
             obs_log_likelihoods + transition_log_probs - proposal_log_probs
         )
+        
+        # --- DEBUGGING ---
+        print(f"Step {self.step_count}:")
+        print(f"  proposal_log_probs (first 5): {proposal_log_probs[:5].detach().cpu().numpy()}")
+        print(f"  obs_log_probs (first 5): {obs_log_likelihoods[:5].detach().cpu().numpy()}")
+        print(f"  transition_log_probs (first 5): {transition_log_probs[:5].detach().cpu().numpy()}")
+        print(f"  log_weights before norm (first 5): {self.log_weights[:5].detach().cpu().numpy()}")
+        print(f"  log_weights stats: min={self.log_weights.min().item():.4f}, max={self.log_weights.max().item():.4f}, std={self.log_weights.std().item():.4f}")
+        # -----------------
+        
+        self.last_proposal_log_probs = proposal_log_probs
+        self.last_obs_log_likelihoods = obs_log_likelihoods
+
         self.log_weights += importance_weights
 
         max_ll = torch.max(obs_log_likelihoods).item()
@@ -368,6 +364,12 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         self.step_count += 1
         metrics = super().step(x_prev, x_curr, y_curr, dt, trajectory_idx, time_idx)
         resampled = self.resample()
+        
+        if self.last_proposal_log_probs is not None:
+             metrics["proposal_log_prob_mean"] = self.last_proposal_log_probs.mean().item()
+        if self.last_obs_log_likelihoods is not None:
+             metrics["obs_log_prob_mean"] = self.last_obs_log_likelihoods.mean().item()
+             metrics["obs_log_prob_std"] = self.last_obs_log_likelihoods.std().item()
 
         metrics["resampled"] = resampled
         metrics["ess"] = (1.0 / torch.sum(self.weights**2)).item()
@@ -420,7 +422,6 @@ class BootstrapParticleFilter(FilteringMethod):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
-        self.use_preprocessing = system.config.use_preprocessing
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -431,6 +432,10 @@ class BootstrapParticleFilter(FilteringMethod):
         self.particles_prev = None
         self.weights = None
         self.log_weights = None
+
+        # Debug stats
+        self.last_proposal_log_probs = None
+        self.last_obs_log_likelihoods = None
 
         # Per-batch metrics
         self.step_count = 0
@@ -509,18 +514,9 @@ class BootstrapParticleFilter(FilteringMethod):
         x_curr_flat = x_curr.reshape(-1, self.state_dim)
         x_prev_flat = x_prev.reshape(-1, self.state_dim)
         
-        if self.use_preprocessing:
-            x_prev_orig = self.system.postprocess(x_prev_flat)
-            integration_result = self.system.integrate(x_prev_orig, 2, dt)
-            x_expected_orig = integration_result[:, 1, :]
-            x_expected_flat = self.system.preprocess(x_expected_orig)
-            
-            init_std = self.system.init_std.to(self.device)
-            noise_std = self.process_noise_std / init_std
-        else:
-            integration_result = self.system.integrate(x_prev_flat, 2, dt)
-            x_expected_flat = integration_result[:, 1, :]
-            noise_std = torch.tensor(self.process_noise_std, device=self.device)
+        integration_result = self.system.integrate(x_prev_flat, 2, dt)
+        x_expected_flat = integration_result[:, 1, :]
+        noise_std = torch.tensor(self.process_noise_std, device=self.device)
 
         # Compute Gaussian log-likelihood
         diff = x_curr_flat - x_expected_flat
@@ -592,6 +588,18 @@ class BootstrapParticleFilter(FilteringMethod):
         importance_weights = (
             obs_log_likelihoods + transition_log_probs - proposal_log_probs
         )
+        
+        # --- DEBUGGING ---
+        print(f"Step {self.step_count} (Batch 0):")
+        print(f"  proposal_log_probs (first 5): {proposal_log_probs[0, :5].detach().cpu().numpy()}")
+        print(f"  obs_log_probs (first 5): {obs_log_likelihoods[0, :5].detach().cpu().numpy()}")
+        print(f"  transition_log_probs (first 5): {transition_log_probs[0, :5].detach().cpu().numpy()}")
+        print(f"  log_weights before norm (first 5): {self.log_weights[0, :5].detach().cpu().numpy()}")
+        # -----------------
+        
+        self.last_proposal_log_probs = proposal_log_probs
+        self.last_obs_log_likelihoods = obs_log_likelihoods
+
         self.log_weights += importance_weights
 
     def resample(self) -> List[bool]:
@@ -775,10 +783,18 @@ class BootstrapParticleFilter(FilteringMethod):
         elapsed_time = (time.perf_counter() - start_time) / x_curr.shape[0] # Average time per item
         
         results = []
+        
+        # Ensure x_curr is on correct device
+        x_curr = x_curr.to(self.device)
+        
         error = x_est - x_curr
         rmse = torch.sqrt(torch.mean(error**2, dim=1)) # (Batch,)
         
         ess = 1.0 / torch.sum(self.weights**2, dim=1)
+        
+        prop_means = self.last_proposal_log_probs.mean(dim=1) if self.last_proposal_log_probs is not None else torch.zeros(x_curr.shape[0], device=self.device)
+        obs_means = self.last_obs_log_likelihoods.mean(dim=1) if self.last_obs_log_likelihoods is not None else torch.zeros(x_curr.shape[0], device=self.device)
+        obs_stds = self.last_obs_log_likelihoods.std(dim=1) if self.last_obs_log_likelihoods is not None else torch.zeros(x_curr.shape[0], device=self.device)
         
         for i in range(x_curr.shape[0]):
             metrics = {
@@ -791,7 +807,10 @@ class BootstrapParticleFilter(FilteringMethod):
                 "time_idx": time_idxs[i].item(),
                 "resampled": resampled_flags[i],
                 "ess": ess[i].item(),
-                "step_time": elapsed_time
+                "step_time": elapsed_time,
+                "proposal_log_prob_mean": prop_means[i].item(),
+                "obs_log_prob_mean": obs_means[i].item(),
+                "obs_log_prob_std": obs_stds[i].item(),
             }
             results.append(metrics)
             

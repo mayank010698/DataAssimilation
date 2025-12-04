@@ -1,5 +1,5 @@
 import torch
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional
 
@@ -19,6 +19,11 @@ class FilteringMethod(pl.LightningModule, ABC):
         self.system = system
         self.state_dim = state_dim
         self.obs_dim = obs_dim
+        
+        # Register a dummy buffer to ensure self.device property works correctly
+        # and allows moving the module to the correct device
+        self.register_buffer("dummy_device_tracker", torch.zeros(1))
+        self.to(device)
 
         # For tracking performance
         self.current_trajectory_idx = None
@@ -93,6 +98,9 @@ class FilteringMethod(pl.LightningModule, ABC):
         P_est = self.get_state_covariance()
 
         # Compute metrics
+        # Ensure x_curr is on correct device
+        x_curr = x_curr.to(self.device)
+        
         error = x_est - x_curr
         rmse = torch.sqrt(torch.mean(error**2)).item()
 

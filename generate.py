@@ -121,7 +121,6 @@ def main():
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
-        use_preprocessing=False,  # Not used anymore, scaling is done during generation
     )
 
     # Generate directory name

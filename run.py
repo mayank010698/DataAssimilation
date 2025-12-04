@@ -189,17 +189,10 @@ def plot_trajectory_comparison(
     # This is needed because the dataset starts from time_idx=1 (not 0) for inference mode
     time_to_idx = {t: idx for idx, t in enumerate(time_steps)}
 
-    if config.use_preprocessing:
-        print(
-            "Converting normalized trajectories back to original space for plotting..."
-        )
-        x_true_orig = np.array([system.postprocess(xt) for xt in x_true])
-        x_est_orig = np.array([system.postprocess(xe) for xe in x_est])
-        space_label = " (Original Space)"
-    else:
-        x_true_orig = x_true
-        x_est_orig = x_est
-        space_label = ""
+    # Trajectories are recorded in physical space.
+    x_true_orig = x_true
+    x_est_orig = x_est
+    space_label = " (Physical Space)"
 
     obs_times = []
     obs_values = []
@@ -320,12 +313,7 @@ def plot_trajectory_comparison(
                         marker="x",
                         label="Observed values",
                     )
-                    obs_label = (
-                        "Observed (normalized)"
-                        if config.use_preprocessing
-                        else "Observed values"
-                    )
-                    ax2.set_ylabel(obs_label, color="purple")
+                    ax2.set_ylabel("Observed values", color="purple")
                     ax2.tick_params(axis="y", labelcolor="purple")
 
         ax.set_ylabel(name)
@@ -360,10 +348,7 @@ def plot_trajectory_comparison(
         ax6.hist(errors[:, i], bins=30, alpha=0.6, color=color, label=f"{name} error")
     ax6.set_xlabel("Estimation Error")
     ax6.set_ylabel("Frequency")
-    title = "Error Distribution by State Component"
-    if config.use_preprocessing:
-        title += " (Normalized Space)"
-    ax6.set_title(title)
+    ax6.set_title("Error Distribution by State Component (Physical Space)")
     ax6.legend()
     ax6.grid(True, alpha=0.3)
 
@@ -392,7 +377,6 @@ def main():
             "name": "Linear Projection (Preprocessing ON) - TransitionProposal",
             "obs_components": [0, 2],
             "observation_operator": create_projection_matrix(3, [0, 2]),
-            "use_preprocessing": True,
             "obs_dim": 2,
             "proposal_type": "transition",
         },
@@ -400,7 +384,6 @@ def main():
             "name": "Linear Projection (Preprocessing ON) - RectifiedFlowProposal",
             "obs_components": [0, 2],
             "observation_operator": create_projection_matrix(3, [0, 2]),
-            "use_preprocessing": True,
             "obs_dim": 2,
             "proposal_type": "rf",
         },
@@ -408,7 +391,6 @@ def main():
             "name": "Linear Projection (Preprocessing OFF) - TransitionProposal",
             "obs_components": [0, 2],
             "observation_operator": create_projection_matrix(3, [0, 2]),
-            "use_preprocessing": False,
             "obs_dim": 2,
             "proposal_type": "transition",
         },
@@ -416,7 +398,6 @@ def main():
             "name": "Linear Projection (Preprocessing OFF) - RectifiedFlowProposal",
             "obs_components": [0, 2],
             "observation_operator": create_projection_matrix(3, [0, 2]),
-            "use_preprocessing": False,
             "obs_dim": 2,
             "proposal_type": "rf",
         },
@@ -424,7 +405,6 @@ def main():
             "name": "Arctan Nonlinear (Preprocessing OFF) - TransitionProposal",
             "obs_components": [0],
             "observation_operator": np.arctan,
-            "use_preprocessing": False,
             "obs_dim": 1,
             "proposal_type": "transition",
         },
@@ -432,7 +412,6 @@ def main():
             "name": "Arctan Nonlinear (Preprocessing OFF) - RectifiedFlowProposal",
             "obs_components": [0],
             "observation_operator": np.arctan,
-            "use_preprocessing": False,
             "obs_dim": 1,
             "proposal_type": "rf",
         },
@@ -440,7 +419,6 @@ def main():
             "name": "Arctan Nonlinear (Preprocessing ON) - TransitionProposal",
             "obs_components": [0],
             "observation_operator": np.arctan,
-            "use_preprocessing": True,
             "obs_dim": 1,
             "proposal_type": "transition",
         },
@@ -448,7 +426,6 @@ def main():
             "name": "Arctan Nonlinear (Preprocessing ON) - RectifiedFlowProposal",
             "obs_components": [0],
             "observation_operator": np.arctan,
-            "use_preprocessing": True,
             "obs_dim": 1,
             "proposal_type": "rf",
         },
@@ -472,7 +449,6 @@ def main():
             obs_components=config_dict["obs_components"],
             observation_operator=config_dict["observation_operator"],
             system_params={"sigma": 10.0, "rho": 28.0, "beta": 8.0 / 3.0},
-            use_preprocessing=config_dict["use_preprocessing"],
         )
 
         print("Configuration:")
@@ -480,7 +456,6 @@ def main():
         print(f"  obs_noise_std: {config.obs_noise_std}")
         print(f"  obs_frequency: {config.obs_frequency}")
         print(f"  obs_components: {config.obs_components}")
-        print(f"  use_preprocessing: {config.use_preprocessing}")
         print(f"  Proposal type: {config_dict['proposal_type']}")
 
         system = Lorenz63(config)

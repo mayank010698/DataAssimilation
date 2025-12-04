@@ -7,7 +7,7 @@ Provides (x_{t-1}, x_t) pairs from trajectories for learning the transition dist
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import h5py
 from pathlib import Path
 from typing import Optional
@@ -21,19 +21,30 @@ class RFTransitionDataset(Dataset):
     Extracts consecutive state pairs from trajectories.
     """
     
-    def __init__(self, trajectories: np.ndarray, window: int = 1):
+    def __init__(
+        self, 
+        trajectories: np.ndarray, 
+        observations: Optional[np.ndarray] = None,
+        window: int = 1
+    ):
         """
         Args:
             trajectories: Shape (n_trajectories, n_steps, state_dim)
+            observations: Shape (n_trajectories, n_steps, obs_dim) or None
             window: Window size for conditioning (for future extension, currently must be 1)
         """
         self.trajectories = trajectories
+        self.observations = observations
         self.window = window
         
         if window != 1:
             raise NotImplementedError("Window size > 1 not yet implemented")
         
         self.n_trajectories, self.n_steps, self.state_dim = trajectories.shape
+        
+        if observations is not None:
+            assert observations.shape[:2] == trajectories.shape[:2], \
+                f"Observations shape {observations.shape} doesn't match trajectories {trajectories.shape}"
         
         # Create list of all valid (trajectory_idx, time_idx) pairs
         # We need at least window+1 steps to get a pair
@@ -52,12 +63,19 @@ class RFTransitionDataset(Dataset):
         x_prev = self.trajectories[traj_idx, t - 1]
         x_curr = self.trajectories[traj_idx, t]
         
-        return {
+        result = {
             'x_prev': torch.FloatTensor(x_prev),
             'x_curr': torch.FloatTensor(x_curr),
             'trajectory_idx': traj_idx,
             'time_idx': t,
         }
+        
+        # Add observations if available
+        if self.observations is not None:
+            y_curr = self.observations[traj_idx, t]
+            result['y_curr'] = torch.FloatTensor(y_curr)
+        
+        return result
 
 
 class RFDataModule(pl.LightningDataModule):
@@ -74,14 +92,14 @@ class RFDataModule(pl.LightningDataModule):
         batch_size: int = 64,
         num_workers: int = 4,
         window: int = 1,
-        use_preprocessing: bool = False,
+        use_observations: bool = False,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.window = window
-        self.use_preprocessing = use_preprocessing
+        self.use_observations = use_observations
         
         self.train_dataset = None
         self.val_dataset = None
@@ -89,29 +107,57 @@ class RFDataModule(pl.LightningDataModule):
     
     def setup(self, stage: Optional[str] = None):
         """Load data and create datasets"""
-        filename = "data_scaled.h5" if self.use_preprocessing else "data.h5"
+        # ALWAYS load scaled data for RF training
+        filename = "data_scaled.h5"
         data_file = self.data_dir / filename
         
         if not data_file.exists():
-            raise FileNotFoundError(
-                f"Data file not found: {data_file}. "
-                "Run data generation first using DataAssimilationDataModule."
-            )
+            # Fallback to data.h5 if scaled doesn't exist (but warn heavily)
+            data_file = self.data_dir / "data.h5"
+            if not data_file.exists():
+                 raise FileNotFoundError(
+                    f"Data file not found: {data_file}. "
+                    "Run data generation first using DataAssimilationDataModule."
+                )
+            logging.warning("data_scaled.h5 not found! Loading data.h5 (unscaled). This is likely NOT what you want for RF training.")
         
         with h5py.File(data_file, "r") as f:
             if stage == "fit" or stage is None:
                 train_traj = f["train/trajectories"][:]
                 val_traj = f["val/trajectories"][:]
                 
-                self.train_dataset = RFTransitionDataset(train_traj, window=self.window)
-                self.val_dataset = RFTransitionDataset(val_traj, window=self.window)
+                train_obs = None
+                val_obs = None
+                if self.use_observations:
+                    train_obs = f["train/observations"][:]
+                    val_obs = f["val/observations"][:]
+                
+                self.train_dataset = RFTransitionDataset(
+                    train_traj, 
+                    observations=train_obs,
+                    window=self.window
+                )
+                self.val_dataset = RFTransitionDataset(
+                    val_traj,
+                    observations=val_obs,
+                    window=self.window
+                )
                 
                 logging.info(f"Loaded RF training data: {len(self.train_dataset)} pairs")
                 logging.info(f"Loaded RF validation data: {len(self.val_dataset)} pairs")
             
             if stage == "test" or stage is None:
                 test_traj = f["test/trajectories"][:]
-                self.test_dataset = RFTransitionDataset(test_traj, window=self.window)
+                
+                test_obs = None
+                if self.use_observations:
+                    test_obs = f["test/observations"][:]
+                
+                self.test_dataset = RFTransitionDataset(
+                    test_traj,
+                    observations=test_obs,
+                    window=self.window
+                )
                 logging.info(f"Loaded RF test data: {len(self.test_dataset)} pairs")
     
     def train_dataloader(self):

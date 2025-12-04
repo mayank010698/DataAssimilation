@@ -45,52 +45,23 @@ class TransitionProposal(ProposalDistribution):
         self.system = system
         self.process_noise_std = process_noise_std
         self.state_dim = system.state_dim
-        self.use_preprocessing = getattr(system.config, "use_preprocessing", False)
-
-        # Get normalization scaling factors if available
-        if self.use_preprocessing and hasattr(system, "init_std"):
-            self.init_std = system.init_std
-        else:
-            self.init_std = None
+        # TransitionProposal ALWAYS operates in physical space
 
     def sample(
         self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
     ) -> torch.Tensor:
-        """Sample from transition dynamics with process noise - CORRECTED for preprocessing"""
+        """Sample from transition dynamics with process noise"""
         # Supports both single particle (D,) and batch (N, D)
         is_batch = x_prev.ndim > 1
         
-        if self.use_preprocessing:
-            # x_prev is in normalized space, need to convert to original space
-            x_prev_orig = self.system.postprocess(x_prev)
-            
-            # Integrate in original space. Returns (T, D) or (batch, T, D)
-            integration = self.system.integrate(x_prev_orig, 2, dt)
-            
-            if is_batch:
-                x_next_orig = integration[:, 1, :]
-            else:
-                x_next_orig = integration[1, :]
-                
-            # Convert back to normalized space
-            # preprocess expects (..., D). It handles batching.
-            x_next = self.system.preprocess(x_next_orig)
-            
-            # Scale noise by normalization factor
-            noise_std = (
-                self.process_noise_std / self.init_std.to(x_prev.device)
-                if self.init_std is not None
-                else self.process_noise_std
-            )
+        # No preprocessing, operate directly in original space
+        integration = self.system.integrate(x_prev, 2, dt)
+        if is_batch:
+            x_next = integration[:, 1, :]
         else:
-            # No preprocessing, operate directly in original space
-            integration = self.system.integrate(x_prev, 2, dt)
-            if is_batch:
-                x_next = integration[:, 1, :]
-            else:
-                x_next = integration[1, :]
-                
-            noise_std = self.process_noise_std
+            x_next = integration[1, :]
+            
+        noise_std = self.process_noise_std
 
         # Convert noise_std to tensor if it's not already
         if not torch.is_tensor(noise_std):
@@ -107,38 +78,19 @@ class TransitionProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
     ) -> torch.Tensor:
-        """Compute log probability under transition dynamics - CORRECTED for preprocessing"""
+        """Compute log probability under transition dynamics"""
         # For bootstrap proposal, this is the process noise likelihood
         # Supports batch (N, D)
         is_batch = x_prev.ndim > 1
         
-        if self.use_preprocessing:
-            # Convert to original space, integrate, convert back
-            x_prev_orig = self.system.postprocess(x_prev)
-            
-            integration = self.system.integrate(x_prev_orig, 2, dt)
-            if is_batch:
-                x_expected_orig = integration[:, 1, :]
-            else:
-                x_expected_orig = integration[1, :]
-                
-            x_expected = self.system.preprocess(x_expected_orig)
-            
-            # Scale noise by normalization factor
-            noise_std = (
-                self.process_noise_std / self.init_std.to(x_prev.device)
-                if self.init_std is not None
-                else self.process_noise_std
-            )
+        # No preprocessing, operate in original space
+        integration = self.system.integrate(x_prev, 2, dt)
+        if is_batch:
+            x_expected = integration[:, 1, :]
         else:
-            # No preprocessing, operate in original space
-            integration = self.system.integrate(x_prev, 2, dt)
-            if is_batch:
-                x_expected = integration[:, 1, :]
-            else:
-                x_expected = integration[1, :]
-                
-            noise_std = self.process_noise_std
+            x_expected = integration[1, :]
+            
+        noise_std = self.process_noise_std
 
         # Convert noise_std to tensor
         if not torch.is_tensor(noise_std):
@@ -156,11 +108,6 @@ class TransitionProposal(ProposalDistribution):
              
         log_prob = -0.5 * torch.sum(diff**2 / noise_var, dim=reduce_dim)
         log_prob -= 0.5 * torch.sum(torch.log(2 * np.pi * noise_var)) # Note: this sum might need adjustment for dimensions
-
-        # Correction for log term: 
-        # For D dimensions, we have D independent Gaussians.
-        # log(prod (1/sqrt(2pi*sigma^2))) = sum -0.5 log(2pi*sigma^2)
-        # If noise_var is (D,), then sum(log(...)) is correct.
         
         return log_prob
 
@@ -303,6 +250,8 @@ class RectifiedFlowProposal(ProposalDistribution):
         num_likelihood_steps: Optional[int] = None,
         num_sampling_steps: Optional[int] = None,
         system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
     ):
         """
         Args:
@@ -311,6 +260,8 @@ class RectifiedFlowProposal(ProposalDistribution):
             num_likelihood_steps: Override number of steps for likelihood computation
             num_sampling_steps: Override number of steps for sampling
             system: DynamicalSystem instance (required for pre/post processing)
+            obs_mean: Mean of observations for scaling (if preprocessing used)
+            obs_std: Std of observations for scaling (if preprocessing used)
         """
         import sys
         from pathlib import Path
@@ -329,6 +280,9 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.device = device
         self.system = system
         
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        
         # Override steps if provided
         if num_likelihood_steps is not None:
             self.rf_model.num_likelihood_steps = num_likelihood_steps
@@ -346,7 +300,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         
         Args:
             x_prev: Previous state, shape (state_dim,)
-            y_curr: Observation (unused by RF, kept for interface compatibility)
+            y_curr: Observation
             dt: Time step (unused by RF, kept for interface compatibility)
             
         Returns:
@@ -355,6 +309,15 @@ class RectifiedFlowProposal(ProposalDistribution):
         # Ensure x_prev is on correct device
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
+            
+        # Handle observation
+        if y_curr is not None:
+            if y_curr.device != self.device:
+                y_curr = y_curr.to(self.device)
+            
+            # Preprocess observation if needed
+            if self.obs_mean is not None and self.obs_std is not None:
+                y_curr = (y_curr - self.obs_mean) / self.obs_std
 
         # Preprocess input (unscaled -> scaled)
         if self.system is not None:
@@ -383,7 +346,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         Args:
             x_curr: Current state, shape (state_dim,)
             x_prev: Previous state, shape (state_dim,)
-            y_curr: Observation (unused by RF, kept for interface compatibility)
+            y_curr: Observation
             dt: Time step (unused by RF, kept for interface compatibility)
             
         Returns:
@@ -394,6 +357,15 @@ class RectifiedFlowProposal(ProposalDistribution):
             x_curr = x_curr.to(self.device)
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
+            
+        # Handle observation
+        if y_curr is not None:
+            if y_curr.device != self.device:
+                y_curr = y_curr.to(self.device)
+            
+            # Preprocess observation if needed
+            if self.obs_mean is not None and self.obs_std is not None:
+                y_curr = (y_curr - self.obs_mean) / self.obs_std
         
         # Preprocess inputs (unscaled -> scaled)
         if self.system is not None:

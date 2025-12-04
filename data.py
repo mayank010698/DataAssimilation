@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 from torch.utils.data import Dataset, DataLoader, Sampler
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 from abc import ABC, abstractmethod
 from typing import Dict, Any, Optional, Tuple, Callable, Union, Iterator, List
 import h5py
@@ -20,7 +20,6 @@ class DataAssimilationConfig:
     len_trajectory: int = 1024
     warmup_steps: int = 1024
     dt: float = 0.01
-    use_preprocessing: bool = True
 
     # Observation parameters
     obs_noise_std: float = 0.1
