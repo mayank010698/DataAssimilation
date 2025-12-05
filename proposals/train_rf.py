@@ -55,6 +55,9 @@ def train_rectified_flow(
     max_epochs: int = 500,
     num_workers: int = 4,
     use_observations: bool = False,
+    conditioning_method: str = 'concat',
+    cond_embed_dim: int = 128,
+    num_attn_heads: int = 4,
     gpus: int = 1,
 ):
     """
@@ -72,6 +75,9 @@ def train_rectified_flow(
         max_epochs: Maximum number of epochs
         num_workers: Number of dataloader workers
         use_observations: Whether to condition on observations
+        conditioning_method: Method for observation conditioning ['concat', 'film', 'adaln', 'cross_attn']
+        cond_embed_dim: Embedding dimension for conditioning
+        num_attn_heads: Number of attention heads (for cross_attn)
         gpus: Number of GPUs to use
     """
     output_dir = Path(output_dir)
@@ -89,6 +95,11 @@ def train_rectified_flow(
     logger_obj.info(f"State dimension: {state_dim}")
     logger_obj.info(f"Observation dimension: {obs_dim}")
     logger_obj.info(f"Use observations: {use_observations}")
+    logger_obj.info(f"Conditioning method: {conditioning_method}")
+    if conditioning_method in ['film', 'adaln', 'cross_attn']:
+        logger_obj.info(f"Conditioning embed dim: {cond_embed_dim}")
+    if conditioning_method == 'cross_attn':
+        logger_obj.info(f"Number of attention heads: {num_attn_heads}")
     logger_obj.info(f"Hidden dimension: {hidden_dim}")
     logger_obj.info(f"Network depth: {depth}")
     logger_obj.info(f"Batch size: {batch_size}")
@@ -115,6 +126,9 @@ def train_rectified_flow(
         num_sampling_steps=50,
         num_likelihood_steps=50,
         use_preprocessing=True, # ALWAYS True for RF training
+        conditioning_method=conditioning_method,
+        cond_embed_dim=cond_embed_dim,
+        num_attn_heads=num_attn_heads,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -153,6 +167,9 @@ def train_rectified_flow(
         "state_dim": state_dim,
         "obs_dim": obs_dim,
         "use_observations": use_observations,
+        "conditioning_method": conditioning_method,
+        "cond_embed_dim": cond_embed_dim,
+        "num_attn_heads": num_attn_heads,
         "hidden_dim": hidden_dim,
         "depth": depth,
         "batch_size": batch_size,
@@ -209,6 +226,13 @@ def main():
                         help='Hidden dimension')
     parser.add_argument('--depth', type=int, default=4,
                         help='Network depth')
+    parser.add_argument('--conditioning_method', type=str, default='concat',
+                        choices=['concat', 'film', 'adaln', 'cross_attn'],
+                        help='Conditioning method')
+    parser.add_argument('--cond_embed_dim', type=int, default=128,
+                        help='Conditioning embedding dimension (for film/adaln/cross_attn)')
+    parser.add_argument('--num_attn_heads', type=int, default=4,
+                        help='Number of attention heads (for cross_attn)')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=64,
@@ -252,6 +276,9 @@ def main():
             max_epochs=args.max_epochs,
             num_workers=args.num_workers,
             use_observations=args.use_observations,
+            conditioning_method=args.conditioning_method,
+            cond_embed_dim=args.cond_embed_dim,
+            num_attn_heads=args.num_attn_heads,
             gpus=args.gpus,
         )
         checkpoint_to_eval = best_checkpoint
