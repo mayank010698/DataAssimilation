@@ -253,7 +253,11 @@ class Lorenz96(DynamicalSystem):
     """Lorenz 96 system implementation"""
 
     def __init__(self, config: DataAssimilationConfig):
-        default_params = {"F":8,"dim":40}
+        # Default parameters for Lorenz 96
+        # F=8 is standard for chaotic behavior
+        # dim=40 is standard, but can be scaled up to 1M+ (see arXiv:2309.00983)
+        # dt=0.01 is used here, though 0.05 (6 hours) is also common in literature
+        default_params = {"F": 8, "dim": 40}
         if config.system_params is None:
             config.system_params = default_params
         else:
@@ -265,12 +269,12 @@ class Lorenz96(DynamicalSystem):
         self.forcing = config.system_params["F"]
         self.dim = config.system_params["dim"]
         
-        
         self.init_mean = torch.zeros(self.dim)
         self.init_std = 1.0
         self.init_cov = (self.init_std ** 2) * torch.eye(self.dim)
+
     def get_state_dim(self) -> int:
-        return 40
+        return self.config.system_params["dim"]
 
     def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
         """Lorenz 96 dynamics"""
@@ -945,5 +949,26 @@ if __name__ == "__main__":
     traj = system.integrate(x0, 10)
     print(f"Trajectory shape: {traj.shape}")
     print(f"Last state: {traj[-1]}")
+
+    print("\n4. Testing Lorenz 96 (High-dim + Nonlinear Obs)")
+    config_l96 = DataAssimilationConfig(
+        obs_components=[0, 1, 2],
+        observation_operator=torch.arctan,
+        system_params={"dim": 100, "F": 8}
+    )
+    system_l96 = Lorenz96(config_l96)
+    print(f"State dim: {system_l96.state_dim} (Expected: 100)")
+    
+    x0_l96 = system_l96.sample_initial_state(1).squeeze(0)
+    print(f"Initial state shape: {x0_l96.shape}")
+    
+    # Test dynamics
+    traj_l96 = system_l96.integrate(x0_l96, 10)
+    print(f"Trajectory shape: {traj_l96.shape}")
+    
+    # Test observation
+    obs_l96 = system_l96.observe(x0_l96)
+    print(f"Observation shape: {obs_l96.shape} (Expected: 3)")
+    print(f"Observation values: {obs_l96}")
 
     print("\nAll tests passed!")
