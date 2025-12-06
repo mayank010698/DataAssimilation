@@ -36,8 +36,7 @@ class DataAssimilationConfig:
     system_params: Dict[str, Any] = None
 
     def __post_init__(self):
-        if self.obs_components is None:
-            self.obs_components = [0]
+        # Note: obs_components default is set by each DynamicalSystem subclass
         if self.system_params is None:
             self.system_params = {}
         if self.observation_operator is None:
@@ -177,6 +176,10 @@ class Lorenz63(DynamicalSystem):
                 if key not in config.system_params:
                     config.system_params[key] = val
 
+        # Default to observing only first component for Lorenz63
+        if config.obs_components is None:
+            config.obs_components = [0]
+
         super().__init__(config)
         self.sigma = config.system_params["sigma"]
         self.rho = config.system_params["rho"]
@@ -264,6 +267,11 @@ class Lorenz96(DynamicalSystem):
             for key, val in default_params.items():
                 if key not in config.system_params:
                     config.system_params[key] = val
+
+        # Default to observing all components for Lorenz96
+        if config.obs_components is None:
+            dim = config.system_params["dim"]
+            config.obs_components = list(range(dim))
 
         super().__init__(config)
         self.forcing = config.system_params["F"]
@@ -811,6 +819,11 @@ def dict_to_config(config_dict: Dict[str, Any]) -> DataAssimilationConfig:
     """Reconstruct DataAssimilationConfig from dictionary"""
     # Make a copy to avoid modifying the original
     config_dict = config_dict.copy()
+    
+    # Ensure obs_components has a default for backward compatibility with old configs
+    # (New configs will have obs_components saved; this handles edge cases)
+    if config_dict.get("obs_components") is None:
+        config_dict["obs_components"] = [0]
     
     # Reconstruct observation_operator
     obs_op_type = config_dict.pop("observation_operator_type", "arctan")
