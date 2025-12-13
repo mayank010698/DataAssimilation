@@ -276,7 +276,7 @@ def main():
     parser.add_argument('--obs_dim', type=int, default=1,
                         help='Observation dimension')  # state and obs dim should come from dataset / config at some point
     parser.add_argument('--architecture', type=str, default='mlp',
-                        choices=['mlp', 'resnet1d', 'resnet1d_fixed'],
+                        choices=['mlp', 'mlp_fixed', 'resnet1d', 'resnet1d_fixed'],
                         help='Velocity network architecture')
     # MLP-specific arguments
     parser.add_argument('--hidden_dim', type=int, default=128,
@@ -344,6 +344,9 @@ def main():
         except ValueError:
             raise ValueError(f"Invalid format for --obs-indices: {args.obs_indices}. Expected comma-separated integers.")
 
+    parser.add_argument('--obs_indices', type=str, default=None,
+                        help='Comma-separated indices of observed variables (e.g. "0,2,4")')
+    
     # Train model
     wandb_logger = None
     if args.checkpoint is None:

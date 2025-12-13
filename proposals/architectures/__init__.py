@@ -8,6 +8,7 @@ Available architectures:
 
 from .base import BaseVelocityNetwork
 from .mlp import MLPVelocityNetwork
+from .mlp_fixed import MLPFixed
 from .resnet1d import ResNet1DVelocityNetwork
 from .resnet1d_deterministic import ResNet1DDeterministic
 from .resnet1d_fixed import ResNet1DFixed
@@ -76,6 +77,16 @@ def create_velocity_network(
             cond_embed_dim=kwargs.get('cond_embed_dim', 128),
             num_attn_heads=kwargs.get('num_attn_heads', 4),
         )
+    elif architecture == 'mlp_fixed':
+        return MLPFixed(
+            state_dim=state_dim,
+            obs_dim=obs_dim,
+            obs_indices=kwargs.get('obs_indices', None),
+            hidden_dim=kwargs.get('hidden_dim', 128),
+            depth=kwargs.get('depth', 4),
+            time_embed_dim=kwargs.get('time_embed_dim', 64),
+            dropout=kwargs.get('dropout', 0.0),
+        )
     elif architecture == 'resnet1d':
         return ResNet1DVelocityNetwork(
             state_dim=state_dim,
@@ -102,7 +113,7 @@ def create_velocity_network(
     else:
         raise ValueError(
             f"Unknown architecture: {architecture}. "
-            f"Available: 'mlp', 'resnet1d', 'resnet1d_fixed'"
+            f"Available: 'mlp', 'mlp_fixed', 'resnet1d', 'resnet1d_fixed'"
         )
 
 
@@ -112,6 +123,7 @@ __all__ = [
     'BaseConditioning',
     # Velocity networks
     'MLPVelocityNetwork',
+    'MLPFixed',
     'ResNet1DVelocityNetwork',
     'ResNet1DFixed',
     # Deterministic networks
