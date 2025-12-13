@@ -105,6 +105,14 @@ def parse_args():
         help="Overwrite existing dataset without prompting",
     )
 
+    # Random seed
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Random seed for reproducibility (default: None)",
+    )
+
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
 
