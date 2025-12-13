@@ -15,414 +15,11 @@ from typing import Optional, Tuple
 from torchdiffeq import odeint, odeint_adjoint
 import logging
 
-
-
-class BaseConditioning(nn.Module):
-    """
-    Base class for conditioning mechanisms.
-    All conditioning methods must implement this interface.
-    """
-    
-    def __init__(self, hidden_dim: int, cond_dim: int):
-        """
-        Args:
-            hidden_dim: Dimension of hidden activations
-            cond_dim: Dimension of conditioning (state_dim + obs_dim for x_prev + y)
-        """
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.cond_dim = cond_dim
-    
-    def get_input_dim_adjustment(self) -> int:
-        """
-        Returns how much to adjust the input dimension.
-        
-        For concat: return cond_dim (we add conditioning to input)
-        For FiLM/AdaLN/Attention: return 0 (conditioning applied separately)
-        """
-        raise NotImplementedError
-    
-    def forward(self, h: torch.Tensor, cond: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        """
-        Apply conditioning to hidden activations.
-        
-        Args:
-            h: Hidden activations, shape (batch, hidden_dim)
-            cond: Conditioning input [x_prev, y], shape (batch, cond_dim)
-            layer_idx: Which layer this is being applied to (0-indexed)
-            
-        Returns:
-            Conditioned hidden activations, shape (batch, hidden_dim)
-        """
-        raise NotImplementedError
-
-
-class ConcatConditioning(BaseConditioning):
-    """
-    Concatenation-based conditioning (current method).
-    Concatenates conditioning to the input before the first layer.
-    """
-    
-    def __init__(self, hidden_dim: int, cond_dim: int):
-        super().__init__(hidden_dim, cond_dim)
-        # No additional parameters needed
-    
-    def get_input_dim_adjustment(self) -> int:
-        return self.cond_dim
-    
-    def forward(self, h: torch.Tensor, cond: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        # Concatenation happens at input, so this is a no-op for hidden layers
-        return h
-
-
-class FiLMConditioning(BaseConditioning):
-    """
-    Feature-wise Linear Modulation (FiLM).
-    
-    Applies affine transformation: h_out = scale * h + shift
-    where scale and shift are predicted from the conditioning.
-    """
-    
-    def __init__(
-        self, 
-        hidden_dim: int, 
-        cond_dim: int, 
-        num_layers: int,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(hidden_dim, cond_dim)
-        
-        # Encode conditioning into a shared embedding
-        self.cond_encoder = nn.Sequential(
-            nn.Linear(cond_dim, cond_embed_dim),
-            nn.SiLU(),
-            nn.Linear(cond_embed_dim, cond_embed_dim),
-        )
-        
-        # Create separate FiLM generators for each layer
-        # Each outputs scale and shift parameters
-        self.film_layers = nn.ModuleList([
-            nn.Linear(cond_embed_dim, 2 * hidden_dim)
-            for _ in range(num_layers)
-        ])
-    
-    def get_input_dim_adjustment(self) -> int:
-        return 0  # Conditioning applied separately
-    
-    def forward(self, h: torch.Tensor, cond: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        # Encode conditioning once (will be the same across calls in same forward pass)
-        # Note: In practice, we'll cache this in the main network or recompute
-        # For simplicity here we recompute, but it's cheap
-        cond_embed = self.cond_encoder(cond)
-        
-        # Get scale and shift for this specific layer
-        film_params = self.film_layers[layer_idx](cond_embed)
-        scale, shift = torch.chunk(film_params, 2, dim=-1)
-        
-        # Apply affine transformation
-        return scale * h + shift
-
-
-class AdaLNConditioning(BaseConditioning):
-    """
-    Adaptive Layer Normalization (AdaLN).
-    
-    Applies layer normalization followed by FiLM-style modulation:
-    h_out = scale * LayerNorm(h) + shift
-    """
-    
-    def __init__(
-        self, 
-        hidden_dim: int, 
-        cond_dim: int, 
-        num_layers: int,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(hidden_dim, cond_dim)
-        
-        # Encode conditioning
-        self.cond_encoder = nn.Sequential(
-            nn.Linear(cond_dim, cond_embed_dim),
-            nn.SiLU(),
-            nn.Linear(cond_embed_dim, cond_embed_dim),
-        )
-        
-        # Layer normalization for each layer
-        self.layer_norms = nn.ModuleList([
-            nn.LayerNorm(hidden_dim)
-            for _ in range(num_layers)
-        ])
-        
-        # AdaLN parameters (scale and shift) for each layer
-        self.adaLN_layers = nn.ModuleList([
-            nn.Linear(cond_embed_dim, 2 * hidden_dim)
-            for _ in range(num_layers)
-        ])
-    
-    def get_input_dim_adjustment(self) -> int:
-        return 0  # Conditioning applied separately
-    
-    def forward(self, h: torch.Tensor, cond: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        # Encode conditioning
-        cond_embed = self.cond_encoder(cond)
-        
-        # Apply layer normalization
-        h_norm = self.layer_norms[layer_idx](h)
-        
-        # Get scale and shift
-        adaLN_params = self.adaLN_layers[layer_idx](cond_embed)
-        scale, shift = torch.chunk(adaLN_params, 2, dim=-1)
-        
-        # Apply modulation
-        return scale * h_norm + shift
-
-
-class CrossAttentionConditioning(BaseConditioning):
-    """
-    Cross-attention based conditioning.
-    
-    Uses multi-head attention where:
-    - Query: current hidden state h
-    - Key/Value: conditioning (x_prev, y)
-    """
-    
-    def __init__(
-        self, 
-        hidden_dim: int, 
-        cond_dim: int, 
-        num_layers: int,
-        num_heads: int = 4,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(hidden_dim, cond_dim)
-        
-        # Ensure cond_embed_dim is divisible by num_heads
-        if cond_embed_dim % num_heads != 0:
-            # Adjust cond_embed_dim to be divisible
-            new_dim = ((cond_embed_dim + num_heads - 1) // num_heads) * num_heads
-            if new_dim != cond_embed_dim:
-                # Ideally we'd warn, but for now just use the adjusted value
-                cond_embed_dim = new_dim
-        
-        self.num_heads = num_heads
-        self.head_dim = cond_embed_dim // num_heads
-        self.cond_embed_dim = cond_embed_dim
-        
-        # Project conditioning to key/value space (shared across layers)
-        self.cond_to_kv = nn.Linear(cond_dim, 2 * cond_embed_dim)
-        
-        # Query projection for each layer
-        self.query_projections = nn.ModuleList([
-            nn.Linear(hidden_dim, cond_embed_dim)
-            for _ in range(num_layers)
-        ])
-        
-        # Output projection for each layer
-        self.output_projections = nn.ModuleList([
-            nn.Linear(cond_embed_dim, hidden_dim)
-            for _ in range(num_layers)
-        ])
-        
-        # Scale factor for attention
-        self.scale = self.head_dim ** -0.5
-    
-    def get_input_dim_adjustment(self) -> int:
-        return 0  # Conditioning applied separately
-    
-    def forward(self, h: torch.Tensor, cond: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        batch_size = h.shape[0]
-        
-        # Project conditioning to key and value
-        kv = self.cond_to_kv(cond)  # (batch, 2 * cond_embed_dim)
-        k, v = torch.chunk(kv, 2, dim=-1)  # Each is (batch, cond_embed_dim)
-        
-        # Reshape for multi-head attention: (batch, num_heads, 1, head_dim)
-        # We have 1 "token" for the conditioning
-        k = k.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Project h to query
-        q = self.query_projections[layer_idx](h)  # (batch, cond_embed_dim)
-        q = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        # q: (batch, num_heads, 1, head_dim)
-        
-        # Compute attention scores
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        # attn_scores: (batch, num_heads, 1, 1)
-        
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, v)
-        # attn_output: (batch, num_heads, 1, head_dim)
-        
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, self.cond_embed_dim)
-        
-        # Output projection
-        output = self.output_projections[layer_idx](attn_output)
-        
-        # Add to original hidden state (residual connection)
-        return h + output
-
-
-class VelocityNetwork(nn.Module):
-    """
-    Neural network for velocity field v_θ(x, s | x_prev, y)
-    
-    Supports multiple conditioning methods:
-    - 'concat': Concatenate [x, time_embed, x_prev, y] (original method)
-    - 'film': Feature-wise Linear Modulation
-    - 'adaln': Adaptive Layer Normalization  
-    - 'cross_attn': Cross-attention
-    
-    Args:
-        state_dim: Dimension of state space
-        hidden_dim: Hidden layer dimension
-        depth: Number of hidden layers
-        time_embed_dim: Dimension of time embedding
-        obs_dim: Dimension of observations
-        conditioning_method: One of ['concat', 'film', 'adaln', 'cross_attn']
-        cond_embed_dim: Embedding dimension for conditioning (for film/adaln/cross_attn)
-        num_attn_heads: Number of attention heads (for cross_attn only)
-    """
-    
-    def __init__(
-        self,
-        state_dim: int,
-        hidden_dim: int = 128,
-        depth: int = 4,
-        time_embed_dim: int = 64,
-        obs_dim: int = 0,
-        conditioning_method: str = 'concat',
-        cond_embed_dim: int = 128,
-        num_attn_heads: int = 4,
-    ):
-        super().__init__()
-        self.state_dim = state_dim
-        self.time_embed_dim = time_embed_dim
-        self.obs_dim = obs_dim
-        self.conditioning_method = conditioning_method
-        self.depth = depth
-        
-        # Validate conditioning method
-        valid_methods = ['concat', 'film', 'adaln', 'cross_attn']
-        if conditioning_method not in valid_methods:
-            raise ValueError(f"conditioning_method must be one of {valid_methods}, got {conditioning_method}")
-        
-        # Time embedding: map s ∈ [0,1] to higher dimensional space
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, time_embed_dim),
-            nn.SiLU(),
-            nn.Linear(time_embed_dim, time_embed_dim),
-        )
-        
-        # Create conditioning module
-        cond_dim = state_dim + obs_dim  # [x_prev, y]
-        
-        if conditioning_method == 'concat':
-            self.conditioning = ConcatConditioning(hidden_dim, cond_dim)
-        elif conditioning_method == 'film':
-            self.conditioning = FiLMConditioning(
-                hidden_dim, cond_dim, num_layers=depth, cond_embed_dim=cond_embed_dim
-            )
-        elif conditioning_method == 'adaln':
-            self.conditioning = AdaLNConditioning(
-                hidden_dim, cond_dim, num_layers=depth, cond_embed_dim=cond_embed_dim
-            )
-        elif conditioning_method == 'cross_attn':
-            self.conditioning = CrossAttentionConditioning(
-                hidden_dim, cond_dim, num_layers=depth, 
-                num_heads=num_attn_heads, cond_embed_dim=cond_embed_dim
-            )
-        
-        # Input dimension: [x, time_embed] + optional conditioning (for concat only)
-        input_dim = state_dim + time_embed_dim + self.conditioning.get_input_dim_adjustment()
-        
-        # Input layer
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-        self.input_activation = nn.SiLU()
-        
-        # Hidden layers
-        self.hidden_layers = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim)
-            for _ in range(depth - 1)
-        ])
-        
-        self.hidden_activations = nn.ModuleList([
-            nn.SiLU()
-            for _ in range(depth - 1)
-        ])
-        
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dim, state_dim)
-        
-    def forward(
-        self, 
-        x: torch.Tensor, 
-        s: torch.Tensor, 
-        x_prev: torch.Tensor,
-        y: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Compute velocity v_θ(x, s | x_prev, y)
-        
-        Args:
-            x: Current position in flow, shape (batch, state_dim)
-            s: Flow time ∈ [0,1], shape (batch, 1) or (batch,)
-            x_prev: Conditioning (previous state), shape (batch, state_dim)
-            y: Observation conditioning, shape (batch, obs_dim) or None
-            
-        Returns:
-            Velocity vector, shape (batch, state_dim)
-        """
-        if s.dim() == 1:
-            s = s.unsqueeze(1)
-        
-        # Time embedding
-        s_embed = self.time_embed(s)
-        
-        # Prepare conditioning: [x_prev, y] or just x_prev if y is None
-        if self.obs_dim > 0 and y is not None:
-            cond = torch.cat([x_prev, y], dim=-1)
-        else:
-            # If no observations, pad with zeros or just use x_prev
-            if self.obs_dim > 0:
-                # Expected observations but got None - pad with zeros
-                y_dummy = torch.zeros(x_prev.shape[0], self.obs_dim, 
-                                     device=x_prev.device, dtype=x_prev.dtype)
-                cond = torch.cat([x_prev, y_dummy], dim=-1)
-            else:
-                cond = x_prev
-        
-        # Build input based on conditioning method
-        if self.conditioning_method == 'concat':
-            # Concatenate everything at input
-            net_input = torch.cat([x, s_embed, cond], dim=-1)
-        else:
-            # For other methods, just concatenate x and time embedding
-            net_input = torch.cat([x, s_embed], dim=-1)
-        
-        # Input layer
-        h = self.input_layer(net_input)
-        h = self.input_activation(h)
-        
-        # Apply conditioning at input layer if not concat
-        if self.conditioning_method != 'concat':
-            h = self.conditioning(h, cond, layer_idx=0)
-        
-        # Hidden layers with conditioning
-        for i, (layer, activation) in enumerate(zip(self.hidden_layers, self.hidden_activations)):
-            h = layer(h)
-            h = activation(h)
-            
-            # Apply conditioning at each hidden layer if not concat
-            if self.conditioning_method != 'concat':
-                h = self.conditioning(h, cond, layer_idx=i+1)
-        
-        # Output layer
-        return self.output_layer(h)
+# Handle both package import and direct script execution
+try:
+    from .architectures import create_velocity_network, BaseVelocityNetwork
+except ImportError:
+    from architectures import create_velocity_network, BaseVelocityNetwork
 
 
 class RFProposal(pl.LightningModule):
@@ -431,42 +28,84 @@ class RFProposal(pl.LightningModule):
     
     Learns p(x_t | x_{t-1}) using rectified flow from N(0,I) to the data distribution.
     Can be used as a proposal distribution in particle filters.
+    
+    Args:
+        state_dim: Dimension of state space
+        architecture: Velocity network architecture ('mlp' or 'resnet1d')
+        hidden_dim: Hidden dimension (for MLP)
+        depth: Number of layers (for MLP)
+        channels: Number of channels (for ResNet1D)
+        num_blocks: Number of residual blocks (for ResNet1D)
+        learning_rate: Learning rate for optimizer
+        num_sampling_steps: Number of Euler steps for sampling
+        num_likelihood_steps: Number of Euler steps for likelihood computation
+        use_preprocessing: Whether to use preprocessing (unused, for compatibility)
+        obs_dim: Dimension of observations
+        conditioning_method: One of 'concat', 'film', 'adaln', 'cross_attn'
+        cond_embed_dim: Embedding dimension for conditioning
+        num_attn_heads: Number of attention heads (for cross_attn)
+        predict_delta: If True, learn increment (x_curr - x_prev) instead of absolute x_curr.
+                       This provides a residual structure that can improve learning.
+        time_embed_dim: Dimension of time embedding (default: 64 for MLP, typically 32 for ResNet1D)
     """
     
     def __init__(
         self,
         state_dim: int,
+        architecture: str = 'mlp',
         hidden_dim: int = 128,
         depth: int = 4,
+        channels: int = 64,
+        num_blocks: int = 6,
+        kernel_size: int = 3,
         learning_rate: float = 1e-3,
-        num_sampling_steps: int = 10,  # small for testing
-        num_likelihood_steps: int = 10,  # small for testing
+        num_sampling_steps: int = 10,
+        num_likelihood_steps: int = 10,
         use_preprocessing: bool = False,
         obs_dim: int = 0,
-        conditioning_method: str = 'concat',
+        train_cond_method: str = 'concat',
         cond_embed_dim: int = 128,
         num_attn_heads: int = 4,
+        predict_delta: bool = False,
+        time_embed_dim: int = 64,
+        mc_guidance: bool = False,
+        guidance_scale: float = 1.0,
+        obs_indices: Optional[list] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
         
         self.state_dim = state_dim
         self.obs_dim = obs_dim
+        self.architecture = architecture
         self.learning_rate = learning_rate
         self.num_sampling_steps = num_sampling_steps
         self.num_likelihood_steps = num_likelihood_steps
         self.use_preprocessing = use_preprocessing
-        self.conditioning_method = conditioning_method
+        self.train_cond_method = train_cond_method
+        self.predict_delta = predict_delta
+        self.mc_guidance = mc_guidance
+        self.guidance_scale = guidance_scale
+        self.obs_indices = obs_indices
         
-        # Velocity network
-        self.velocity_net = VelocityNetwork(
+        # Create velocity network using factory
+        self.velocity_net = create_velocity_network(
+            architecture=architecture,
             state_dim=state_dim,
+            obs_dim=obs_dim,
+            conditioning_method=train_cond_method,
+            # MLP-specific
             hidden_dim=hidden_dim,
             depth=depth,
-            obs_dim=obs_dim,
-            conditioning_method=conditioning_method,
+            # ResNet1D-specific
+            channels=channels,
+            num_blocks=num_blocks,
+            kernel_size=kernel_size,
+            # Shared
             cond_embed_dim=cond_embed_dim,
             num_attn_heads=num_attn_heads,
+            time_embed_dim=time_embed_dim,
+            obs_indices=obs_indices,
         )
         
         # For tracking training progress
@@ -492,8 +131,11 @@ class RFProposal(pl.LightningModule):
         """
         Compute Rectified Flow training loss
         
-        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev, y) - (x_curr - z)||^2
-        where x(t) = (1-t)*z + t*x_curr is the straight-line interpolation
+        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev, y) - (target - z)||^2
+        where x(t) = (1-t)*z + t*target is the straight-line interpolation
+        
+        If predict_delta=False (default): target = x_curr
+        If predict_delta=True: target = x_curr - x_prev (learn increment)
         
         Args:
             x_prev: Previous states, shape (batch, state_dim)
@@ -512,11 +154,19 @@ class RFProposal(pl.LightningModule):
         # Sample noise z ~ N(0, I)
         z = torch.randn_like(x_curr)
         
-        # Linear interpolation: x(s) = (1-s)*z + s*x_curr
-        x_s = (1 - s) * z + s * x_curr
+        # Determine target based on mode
+        if self.predict_delta:
+            # Learn the increment (residual structure)
+            target = x_curr - x_prev
+        else:
+            # Learn absolute target (original behavior)
+            target = x_curr
+        
+        # Linear interpolation: x(s) = (1-s)*z + s*target
+        x_s = (1 - s) * z + s * target
         
         # Target velocity (constant along straight line)
-        target_velocity = x_curr - z
+        target_velocity = target - z
         
         # Predicted velocity
         pred_velocity = self.velocity_net(x_s, s, x_prev, y_curr)
@@ -594,7 +244,6 @@ class RFProposal(pl.LightningModule):
             mode='min',
             factor=0.5,
             patience=20,
-            # verbose=True,
         )
         
         return {
@@ -605,12 +254,65 @@ class RFProposal(pl.LightningModule):
             }
         }
     
+    @torch.enable_grad()
+    def compute_guidance_grad(
+        self,
+        x_s: torch.Tensor,
+        s: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+        observation_fn: callable,
+        create_graph: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute guidance gradient for Monte Carlo guidance
+        
+        Args:
+            x_s: Current state at time s
+            s: Current time
+            x_prev: Previous state (conditioning)
+            y_curr: Current observation
+            observation_fn: Function mapping state to observation space
+            create_graph: Whether to create graph for higher-order derivatives
+            
+        Returns:
+            Gradient of loss with respect to x_s
+        """
+        # Enable gradient computation for x_s if needed
+        if not x_s.requires_grad:
+            x_s = x_s.detach().requires_grad_(True)
+        
+        # 1. Lookahead Prediction: Predict final state \hat{x}_1
+        # \hat{x}_1^{delta} = x_s + (1-s) * v_\theta(x_s, s)
+        v = self.velocity_net(x_s, s, x_prev, y_curr)
+        x_1_delta = x_s + (1.0 - s) * v
+        
+        # If predict_delta is True, convert to absolute state
+        if self.predict_delta:
+            x_1 = x_prev + x_1_delta
+        else:
+            x_1 = x_1_delta
+            
+        # 2. Observation: Apply observation_fn
+        y_hat = observation_fn(x_1)
+        
+        # 3. Loss: Compute MSE loss
+        # Handle batch dimensions correctly
+        diff = y_hat - y_curr
+        loss = torch.sum(diff ** 2, dim=-1).sum()  # Sum over batch for gradient
+        
+        # 4. Gradient: Compute \nabla_{x_s} J
+        grad = torch.autograd.grad(loss, x_s, create_graph=create_graph)[0]
+        
+        return grad
+
     @torch.no_grad()
     def sample(
         self,
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
+        observation_fn: Optional[callable] = None,
     ) -> torch.Tensor:
         """
         Sample x_t ~ q(x_t | x_{t-1}, y_t) using Euler method
@@ -619,6 +321,7 @@ class RFProposal(pl.LightningModule):
             x_prev: Previous state, shape (state_dim,) or (batch, state_dim)
             y_curr: Current observation, shape (obs_dim,) or (batch, obs_dim) or None
             dt: Time step (unused, for interface compatibility)
+            observation_fn: Optional observation function for guidance
             
         Returns:
             Sampled next state, shape same as x_prev
@@ -641,12 +344,145 @@ class RFProposal(pl.LightningModule):
             s = i * ds
             s_tensor = torch.full((batch_size, 1), s, device=self.device)
             v = self.velocity_net(x, s_tensor, x_prev, y_curr)
+            
+            # Apply Monte Carlo Guidance if enabled
+            if self.mc_guidance and observation_fn is not None and y_curr is not None:
+                # We need to compute gradient, so we temporarily enable grads
+                grad = self.compute_guidance_grad(x, s_tensor, x_prev, y_curr, observation_fn)
+                v = v - self.guidance_scale * grad
+                
             x = x + v * ds  # Euler step
+        
+        # If predict_delta mode, x is the delta - convert to absolute state
+        if self.predict_delta:
+            x = x_prev + x  # x_curr = x_prev + delta
         
         if was_1d:
             x = x.squeeze(0)
         
         return x
+
+    @torch.no_grad()
+    def sample_and_log_prob(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor] = None,
+        observation_fn: Optional[callable] = None,
+        use_exact_trace: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample x_t and compute its log probability, optionally with guidance.
+        
+        Args:
+            x_prev: Previous state
+            y_curr: Current observation
+            observation_fn: Observation function (required for guidance)
+            use_exact_trace: Whether to use exact trace or Hutchinson estimator
+            
+        Returns:
+            Tuple of (sampled_state, log_prob)
+        """
+        was_1d = x_prev.dim() == 1
+        if was_1d:
+            x_prev = x_prev.unsqueeze(0)
+            if y_curr is not None:
+                y_curr = y_curr.unsqueeze(0)
+        
+        batch_size = x_prev.shape[0]
+        
+        # Start from noise z ~ N(0, I)
+        x = torch.randn(batch_size, self.state_dim, device=self.device)
+        
+        # Initial log prob is Gaussian density of x(0)
+        log_prob = -0.5 * torch.sum(x ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)
+        
+        # Euler steps from s=0 to s=1
+        ds = 1.0 / self.num_sampling_steps
+        
+        for i in range(self.num_sampling_steps):
+            s = i * ds
+            s_tensor = torch.full((batch_size, 1), s, device=self.device)
+            
+            # Use enable_grad for divergence computation
+            with torch.enable_grad():
+                x_for_grad = x.detach().requires_grad_(True)
+                
+                # 1. Compute Network Velocity & Divergence
+                if use_exact_trace:
+                    # EXACT TRACE
+                    def v_func(x_in):
+                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr)
+                        
+                    v = v_func(x_for_grad)
+                    
+                    divergence = torch.zeros(batch_size, device=self.device)
+                    for k in range(self.state_dim):
+                        grad_k = torch.autograd.grad(
+                            v[:, k], x_for_grad, 
+                            grad_outputs=torch.ones_like(v[:, k]),
+                            create_graph=False, retain_graph=True
+                        )[0]
+                        divergence += grad_k[:, k]
+                else:
+                    # HUTCHINSON TRACE
+                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
+                    eps = torch.randn_like(x)
+                    vjp = torch.autograd.grad(
+                        v, x_for_grad, grad_outputs=eps, create_graph=False
+                    )[0]
+                    divergence = torch.sum(vjp * eps, dim=-1)
+                
+                # 2. Compute Guidance & Divergence (if enabled)
+                if self.mc_guidance and observation_fn is not None and y_curr is not None:
+                    # Compute guidance gradient
+                    # IMPORTANT: create_graph=True for second derivative
+                    grad = self.compute_guidance_grad(
+                        x_for_grad, s_tensor, x_prev, y_curr, observation_fn, create_graph=True
+                    )
+                    
+                    # Compute divergence of guidance (Laplacian of Loss)
+                    if use_exact_trace:
+                        grad_div = torch.zeros(batch_size, device=self.device)
+                        for k in range(self.state_dim):
+                             g_k_grad = torch.autograd.grad(
+                                grad[:, k], x_for_grad,
+                                grad_outputs=torch.ones_like(grad[:, k]),
+                                create_graph=False, retain_graph=True
+                            )[0]
+                             grad_div += g_k_grad[:, k]
+                    else:
+                        # Hutchinson
+                        # Reuse eps if available (consistent estimator)
+                        # otherwise sample new eps
+                        if 'eps' not in locals():
+                             eps = torch.randn_like(x)
+                        
+                        grad_jvp = torch.autograd.grad(
+                            grad, x_for_grad,
+                            grad_outputs=eps,
+                            create_graph=False
+                        )[0]
+                        grad_div = torch.sum(grad_jvp * eps, dim=-1)
+                        
+                    # Update velocity and divergence
+                    v = v - self.guidance_scale * grad
+                    divergence = divergence - self.guidance_scale * grad_div
+
+            # Update state
+            x = x + v.detach() * ds
+            
+            # Update log_prob
+            log_prob = log_prob - divergence.detach() * ds
+
+        # If predict_delta mode, x is the delta - convert to absolute state
+        if self.predict_delta:
+            x = x_prev + x
+            
+        if was_1d:
+            x = x.squeeze(0)
+            log_prob = log_prob.squeeze(0)
+            
+        return x, log_prob
 
     @torch.no_grad()
     def log_prob(
@@ -661,8 +497,15 @@ class RFProposal(pl.LightningModule):
         Compute log prob using Euler method.
         
         Args:
+            x_curr: Current state, shape (state_dim,) or (batch, state_dim)
+            x_prev: Previous state (conditioning), shape same as x_curr
+            y_curr: Observation conditioning, shape (obs_dim,) or (batch, obs_dim) or None
+            dt: Time step (unused, for interface compatibility)
             use_exact_trace: If True, computes exact Jacobian trace (deterministic, O(D^2)).
                              If False, uses Hutchinson trace estimator (stochastic, O(D)).
+        
+        Returns:
+            Log probability, shape () or (batch,)
         """
         was_1d = x_curr.dim() == 1
         if was_1d:
@@ -673,8 +516,12 @@ class RFProposal(pl.LightningModule):
         
         batch_size = x_curr.shape[0]
         
-        # Start from x_curr, integrate backward to s=0
-        x = x_curr.clone()
+        # Start from target at s=1, integrate backward to s=0
+        # If predict_delta mode, we start from the delta, not x_curr
+        if self.predict_delta:
+            x = (x_curr - x_prev).clone()  # Start from delta
+        else:
+            x = x_curr.clone()  # Original: start from x_curr
         log_prob_correction = torch.zeros(batch_size, device=self.device)
         
         ds = 1.0 / self.num_likelihood_steps
@@ -690,9 +537,6 @@ class RFProposal(pl.LightningModule):
                 
                 if use_exact_trace:
                     # EXACT TRACE COMPUTATION
-                    # print("Computing exact trace...")
-                    
-                    # We need a function that takes x and returns v for jacobian computation
                     def v_func(x_in):
                         return self.velocity_net(x_in, s_tensor, x_prev, y_curr)
 
@@ -704,8 +548,6 @@ class RFProposal(pl.LightningModule):
                     
                     # Iterate over state dimensions to compute diagonal of Jacobian
                     for k in range(self.state_dim):
-                        # Create basis vector e_k
-                        # We want d(v_k)/d(x_k)
                         grad_k = torch.autograd.grad(
                             v[:, k], 
                             x_for_grad, 
@@ -714,8 +556,6 @@ class RFProposal(pl.LightningModule):
                             retain_graph=True
                         )[0]
                         
-                        # grad_k is [d(v_k)/dx_1, d(v_k)/dx_2, ...]
-                        # We only want the k-th component: d(v_k)/dx_k
                         divergence += grad_k[:, k]
                         
                 else:
@@ -742,163 +582,6 @@ class RFProposal(pl.LightningModule):
             log_prob = log_prob.squeeze(0)
         
         return log_prob
-    
-    # @torch.no_grad()
-    # def sample(
-    #     self,
-    #     x_prev: torch.Tensor,
-    #     y_curr: Optional[torch.Tensor] = None,
-    #     dt: Optional[float] = None,
-    # ) -> torch.Tensor:
-    #     """
-    #     Sample from the proposal distribution q(x_t | x_{t-1})
-        
-    #     Integrates the ODE: dx/ds = v_θ(x, s | x_prev) from s=0 to s=1
-    #     Starting from z ~ N(0, I)
-        
-    #     Args:
-    #         x_prev: Previous state, shape (state_dim,) or (batch, state_dim)
-    #         y_curr: Current observation (unused in base RF, for interface compatibility)
-    #         dt: Time step (unused, for interface compatibility)
-            
-    #     Returns:
-    #         Sampled next state, shape same as x_prev
-    #     """
-    #     was_1d = x_prev.dim() == 1
-    #     if was_1d:
-    #         x_prev = x_prev.unsqueeze(0)
-        
-    #     batch_size = x_prev.shape[0]
-        
-    #     # Sample from source distribution z ~ N(0, I)
-    #     z = torch.randn(batch_size, self.state_dim, device=self.device)
-        
-    #     # Define ODE function
-    #     def ode_func(s, x):
-    #         # s is scalar, x is (batch, state_dim)
-    #         s_tensor = torch.full((batch_size, 1), s, device=self.device)
-    #         return self.velocity_net(x, s_tensor, x_prev)
-        
-    #     # Integrate from s=0 to s=1
-    #     # Use regular odeint (not adjoint) since we're in no_grad context
-    #     s_span = torch.linspace(0, 1, self.num_sampling_steps, device=self.device)
-    #     trajectory = odeint(
-    #         ode_func,
-    #         z,
-    #         s_span,
-    #         method='dopri5',
-    #         rtol=1e-5,
-    #         atol=1e-5,
-    #     )
-        
-    #     # Return final state x(1)
-    #     x_final = trajectory[-1]
-        
-    #     if was_1d:
-    #         x_final = x_final.squeeze(0)
-        
-    #     return x_final
-    
-    # @torch.no_grad()
-    # def log_prob(
-    #     self,
-    #     x_curr: torch.Tensor,
-    #     x_prev: torch.Tensor,
-    #     y_curr: Optional[torch.Tensor] = None,
-    #     dt: Optional[float] = None,
-    # ) -> torch.Tensor:
-    #     """
-    #     Compute log probability log q(x_curr | x_prev)
-        
-    #     Uses instantaneous change of variables formula for continuous normalizing flows:
-    #     log p_1(x) = log p_0(z) - ∫_0^1 Tr(∂v/∂x) ds
-        
-    #     We integrate backward from x_curr to z, tracking the trace of Jacobian
-    #     using Hutchinson's trace estimator.
-        
-    #     Args:
-    #         x_curr: Current state, shape (state_dim,) or (batch, state_dim)
-    #         x_prev: Previous state (conditioning), shape same as x_curr
-    #         y_curr: Observation (unused, for interface compatibility)
-    #         dt: Time step (unused, for interface compatibility)
-            
-    #     Returns:
-    #         Log probability, shape () or (batch,)
-    #     """
-    #     was_1d = x_curr.dim() == 1
-    #     if was_1d:
-    #         x_curr = x_curr.unsqueeze(0)
-    #         x_prev = x_prev.unsqueeze(0)
-        
-    #     batch_size = x_curr.shape[0]
-        
-    #     # Augmented state: [x, log_prob]
-    #     # We'll track the log probability as we integrate backward
-        
-    #     def augmented_dynamics(s, state):
-    #         """
-    #         Augmented ODE system for computing likelihood
-    #         state = [x, log_prob]
-    #         """
-    #         x = state[:, :self.state_dim]
-            
-    #         # Compute velocity
-    #         s_tensor = torch.full((batch_size, 1), s, device=self.device)
-    #         with torch.enable_grad():
-    #             x_for_grad = x.detach().requires_grad_(True)
-    #             v = self.velocity_net(x_for_grad, s_tensor, x_prev)
-                
-    #             # Hutchinson trace estimator with single random vector
-    #             eps = torch.randn_like(x)
-    #             vjp = torch.autograd.grad(
-    #                 v, x_for_grad,
-    #                 grad_outputs=eps,
-    #                 create_graph=False,
-    #                 retain_graph=False,
-    #             )[0]
-    #             trace_estimate = torch.sum(vjp * eps, dim=-1, keepdim=True)
-            
-    #         # dx/ds = -v(x, 1-s | x_prev)  [backward integration]
-    #         # d(log_prob)/ds = Tr(∂v/∂x)
-    #         dx_ds = -v.detach()
-    #         dlogp_ds = trace_estimate.detach()
-            
-    #         return torch.cat([dx_ds, dlogp_ds], dim=-1)
-        
-    #     # Initial state: [x_curr, 0]
-    #     initial_state = torch.cat([
-    #         x_curr,
-    #         torch.zeros(batch_size, 1, device=self.device)
-    #     ], dim=-1)
-        
-    #     # Integrate backward from s=1 to s=0
-    #     # Use regular odeint (not adjoint) since we compute gradients manually
-    #     s_span = torch.linspace(1, 0, self.num_likelihood_steps, device=self.device)
-        
-    #     trajectory = odeint(
-    #         augmented_dynamics,
-    #         initial_state,
-    #         s_span,
-    #         method='dopri5',
-    #         rtol=1e-5,
-    #         atol=1e-5,
-    #     )
-        
-    #     final_state = trajectory[-1]
-    #     z = final_state[:, :self.state_dim]
-    #     log_prob_correction = final_state[:, self.state_dim]
-        
-    #     # Base distribution log probability: log N(z; 0, I)
-    #     log_prob_base = -0.5 * torch.sum(z ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)
-        
-    #     # Total log probability
-    #     log_prob = log_prob_base - log_prob_correction
-        
-    #     if was_1d:
-    #         log_prob = log_prob.squeeze(0)
-        
-    #     return log_prob
-        
     
     @torch.no_grad()
     def generate_trajectory(
@@ -933,17 +616,18 @@ class RFProposal(pl.LightningModule):
             return trajectory[-1]
 
 
-# Utility function for testing
 def test_rectified_flow():
-    """Test the rectified flow implementation"""
+    """Test the rectified flow implementation with both architectures"""
     print("Testing Rectified Flow Proposal...")
     
+    # Test MLP architecture (for Lorenz63-like systems)
+    print("\n=== Testing MLP Architecture ===")
     state_dim = 3
     batch_size = 16
     
-    # Create model
-    rf = RFProposal(
+    rf_mlp = RFProposal(
         state_dim=state_dim,
+        architecture='mlp',
         hidden_dim=64,
         depth=3,
         num_sampling_steps=20,
@@ -955,41 +639,196 @@ def test_rectified_flow():
     s = torch.rand(batch_size, 1)
     x_prev = torch.randn(batch_size, state_dim)
     
-    v = rf(x, s, x_prev)
-    print(f"✓ Forward pass: {v.shape}")
+    v = rf_mlp(x, s, x_prev)
+    print(f"✓ MLP Forward pass: {v.shape}")
     assert v.shape == (batch_size, state_dim)
     
     # Test loss computation
     x_curr = torch.randn(batch_size, state_dim)
-    loss, metrics = rf.compute_rf_loss(x_prev, x_curr)
-    print(f"✓ Loss computation: {loss.item():.6f}")
+    loss, metrics = rf_mlp.compute_rf_loss(x_prev, x_curr)
+    print(f"✓ MLP Loss computation: {loss.item():.6f}")
     
-    # Test sampling (single)
+    # Test sampling
     x_prev_single = torch.randn(state_dim)
-    x_sample = rf.sample(x_prev_single)
-    print(f"✓ Sampling (single): {x_sample.shape}")
+    x_sample = rf_mlp.sample(x_prev_single)
+    print(f"✓ MLP Sampling (single): {x_sample.shape}")
     assert x_sample.shape == (state_dim,)
     
-    # Test sampling (batch)
-    x_prev_batch = torch.randn(batch_size, state_dim)
-    x_sample_batch = rf.sample(x_prev_batch)
-    print(f"✓ Sampling (batch): {x_sample_batch.shape}")
-    assert x_sample_batch.shape == (batch_size, state_dim)
+    # Test ResNet1D architecture (for Lorenz96-like systems)
+    print("\n=== Testing ResNet1D Architecture ===")
+    state_dim_l96 = 40  # Lorenz96 dimension
     
-    # Test log probability (this is slow, so use small batch)
+    rf_resnet = RFProposal(
+        state_dim=state_dim_l96,
+        architecture='resnet1d',
+        channels=32,
+        num_blocks=4,
+        kernel_size=3,
+        conditioning_method='adaln',
+        num_sampling_steps=20,
+        num_likelihood_steps=20,
+    )
+    
+    # Test forward pass
+    x = torch.randn(batch_size, state_dim_l96)
+    s = torch.rand(batch_size, 1)
+    x_prev = torch.randn(batch_size, state_dim_l96)
+    
+    v = rf_resnet(x, s, x_prev)
+    print(f"✓ ResNet1D Forward pass: {v.shape}")
+    assert v.shape == (batch_size, state_dim_l96)
+    
+    # Test loss computation
+    x_curr = torch.randn(batch_size, state_dim_l96)
+    loss, metrics = rf_resnet.compute_rf_loss(x_prev, x_curr)
+    print(f"✓ ResNet1D Loss computation: {loss.item():.6f}")
+    
+    # Test sampling
+    x_prev_single = torch.randn(state_dim_l96)
+    x_sample = rf_resnet.sample(x_prev_single)
+    print(f"✓ ResNet1D Sampling (single): {x_sample.shape}")
+    assert x_sample.shape == (state_dim_l96,)
+    
+    # Test batch sampling
+    x_prev_batch = torch.randn(batch_size, state_dim_l96)
+    x_sample_batch = rf_resnet.sample(x_prev_batch)
+    print(f"✓ ResNet1D Sampling (batch): {x_sample_batch.shape}")
+    assert x_sample_batch.shape == (batch_size, state_dim_l96)
+    
+    # Test log probability (small batch, as it's slow)
+    print("\n=== Testing Log Probability ===")
     x_prev_small = torch.randn(2, state_dim)
     x_curr_small = torch.randn(2, state_dim)
-    log_prob = rf.log_prob(x_curr_small, x_prev_small)
-    print(f"✓ Log probability: {log_prob.shape}, values: {log_prob}")
+    log_prob = rf_mlp.log_prob(x_curr_small, x_prev_small)
+    print(f"✓ MLP Log probability: {log_prob.shape}, values: {log_prob}")
     assert log_prob.shape == (2,)
     
     # Test trajectory generation
     x_init = torch.randn(state_dim)
-    trajectory = rf.generate_trajectory(x_init, n_steps=10, return_all=True)
+    trajectory = rf_mlp.generate_trajectory(x_init, n_steps=10, return_all=True)
     print(f"✓ Trajectory generation: {trajectory.shape}")
     assert trajectory.shape == (11, state_dim)
     
-    print("\nAll tests passed! ✓")
+    # Test all conditioning methods with ResNet1D
+    print("\n=== Testing Conditioning Methods (ResNet1D) ===")
+    for method in ['concat', 'film', 'adaln', 'cross_attn']:
+        rf_test = RFProposal(
+            state_dim=state_dim_l96,
+            architecture='resnet1d',
+            channels=32,
+            num_blocks=4,
+            conditioning_method=method,
+            num_sampling_steps=5,
+        )
+        x = torch.randn(4, state_dim_l96)
+        s = torch.rand(4, 1)
+        x_prev = torch.randn(4, state_dim_l96)
+        v = rf_test(x, s, x_prev)
+        print(f"✓ ResNet1D with {method}: {v.shape}")
+        assert v.shape == (4, state_dim_l96)
+    
+    # Test predict_delta mode (residual learning)
+    print("\n=== Testing predict_delta Mode (Residual Learning) ===")
+    
+    # Test with MLP
+    rf_delta_mlp = RFProposal(
+        state_dim=state_dim,
+        architecture='mlp',
+        hidden_dim=64,
+        depth=3,
+        num_sampling_steps=20,
+        num_likelihood_steps=20,
+        predict_delta=True,
+    )
+    
+    x_prev = torch.randn(batch_size, state_dim)
+    x_curr = torch.randn(batch_size, state_dim)
+    
+    # Test loss computation in delta mode
+    loss_delta, metrics_delta = rf_delta_mlp.compute_rf_loss(x_prev, x_curr)
+    print(f"✓ MLP (predict_delta) Loss computation: {loss_delta.item():.6f}")
+    
+    # Test sampling in delta mode
+    x_prev_single = torch.randn(state_dim)
+    x_sample_delta = rf_delta_mlp.sample(x_prev_single)
+    print(f"✓ MLP (predict_delta) Sampling: {x_sample_delta.shape}")
+    assert x_sample_delta.shape == (state_dim,)
+    
+    # Test batch sampling in delta mode
+    x_sample_batch_delta = rf_delta_mlp.sample(x_prev)
+    print(f"✓ MLP (predict_delta) Batch sampling: {x_sample_batch_delta.shape}")
+    assert x_sample_batch_delta.shape == (batch_size, state_dim)
+    
+    # Test log probability in delta mode
+    x_prev_small = torch.randn(2, state_dim)
+    x_curr_small = torch.randn(2, state_dim)
+    log_prob_delta = rf_delta_mlp.log_prob(x_curr_small, x_prev_small)
+    print(f"✓ MLP (predict_delta) Log probability: {log_prob_delta.shape}, values: {log_prob_delta}")
+    assert log_prob_delta.shape == (2,)
+    
+    # Test with ResNet1D in delta mode
+    rf_delta_resnet = RFProposal(
+        state_dim=state_dim_l96,
+        architecture='resnet1d',
+        channels=32,
+        num_blocks=4,
+        conditioning_method='adaln',
+        num_sampling_steps=10,
+        predict_delta=True,
+    )
+    
+    x_prev_l96 = torch.randn(batch_size, state_dim_l96)
+    x_curr_l96 = torch.randn(batch_size, state_dim_l96)
+    
+    loss_delta_resnet, _ = rf_delta_resnet.compute_rf_loss(x_prev_l96, x_curr_l96)
+    print(f"✓ ResNet1D (predict_delta) Loss: {loss_delta_resnet.item():.6f}")
+    
+    x_sample_resnet_delta = rf_delta_resnet.sample(x_prev_l96)
+    print(f"✓ ResNet1D (predict_delta) Sampling: {x_sample_resnet_delta.shape}")
+    assert x_sample_resnet_delta.shape == (batch_size, state_dim_l96)
+    
+    # Verify that predict_delta flag is saved in hyperparameters
+    assert rf_delta_mlp.predict_delta == True
+    assert rf_mlp.predict_delta == False
+    print("✓ predict_delta flag correctly stored")
+
+    # Test Monte Carlo Guidance
+    print("\n=== Testing Monte Carlo Guidance ===")
+    
+    # Define a simple observation function (e.g., observe first dimension)
+    def observation_fn(x):
+        return x[..., :1]
+    
+    obs_dim = 1
+    
+    rf_guidance = RFProposal(
+        state_dim=state_dim,
+        architecture='mlp',
+        hidden_dim=64,
+        depth=3,
+        num_sampling_steps=10,
+        mc_guidance=True,
+        guidance_scale=0.5,
+    )
+    
+    x_prev = torch.randn(batch_size, state_dim)
+    # Create fake observations
+    y_curr = torch.randn(batch_size, obs_dim)
+    
+    # Test sample with guidance
+    x_sample_guided = rf_guidance.sample(x_prev, y_curr=y_curr, observation_fn=observation_fn)
+    print(f"✓ Guided Sampling: {x_sample_guided.shape}")
+    assert x_sample_guided.shape == (batch_size, state_dim)
+    
+    # Test sample_and_log_prob with guidance
+    x_sample_guided_lp, log_prob_guided = rf_guidance.sample_and_log_prob(
+        x_prev, y_curr=y_curr, observation_fn=observation_fn
+    )
+    print(f"✓ Guided Sampling with LogProb: {x_sample_guided_lp.shape}, {log_prob_guided.shape}")
+    assert x_sample_guided_lp.shape == (batch_size, state_dim)
+    assert log_prob_guided.shape == (batch_size,)
+    
+    print("\n✓ All tests passed!")
 
 
 if __name__ == "__main__":

@@ -48,17 +48,26 @@ def train_rectified_flow(
     output_dir: str,
     state_dim: int = 3,
     obs_dim: int = 0,
+    architecture: str = 'mlp',
     hidden_dim: int = 128,
     depth: int = 4,
+    channels: int = 64,
+    num_blocks: int = 6,
+    kernel_size: int = 3,
     batch_size: int = 64,
     learning_rate: float = 1e-3,
     max_epochs: int = 500,
     num_workers: int = 4,
     use_observations: bool = False,
-    conditioning_method: str = 'concat',
+    train_cond_method: str = 'concat',
     cond_embed_dim: int = 128,
     num_attn_heads: int = 4,
     gpus: int = 1,
+    predict_delta: bool = False,
+    time_embed_dim: int = 64,
+    mc_guidance: bool = False,
+    guidance_scale: float = 1.0,
+    obs_indices: list = None,
 ):
     """
     Train a rectified flow proposal distribution
@@ -68,23 +77,36 @@ def train_rectified_flow(
         output_dir: Directory to save checkpoints and logs
         state_dim: Dimension of state space
         obs_dim: Dimension of observation space
-        hidden_dim: Hidden dimension of velocity network
-        depth: Depth of velocity network
+        architecture: Velocity network architecture ('mlp' or 'resnet1d')
+        hidden_dim: Hidden dimension (for MLP architecture)
+        depth: Network depth (for MLP architecture)
+        channels: Number of channels (for ResNet1D architecture)
+        num_blocks: Number of residual blocks (for ResNet1D architecture)
+        kernel_size: Kernel size (for ResNet1D architecture)
         batch_size: Training batch size
         learning_rate: Learning rate
         max_epochs: Maximum number of epochs
         num_workers: Number of dataloader workers
         use_observations: Whether to condition on observations
-        conditioning_method: Method for observation conditioning ['concat', 'film', 'adaln', 'cross_attn']
+        train_cond_method: Method for observation conditioning ['concat', 'film', 'adaln', 'cross_attn']
         cond_embed_dim: Embedding dimension for conditioning
         num_attn_heads: Number of attention heads (for cross_attn)
         gpus: Number of GPUs to use
+        predict_delta: If True, learn increment (x_curr - x_prev) instead of absolute target
+        time_embed_dim: Dimension of time embedding (default: 64 for MLP, typically 32 for ResNet1D)
+        mc_guidance: Whether to use Monte Carlo guidance during inference (saved to model config)
+        guidance_scale: Scale for Monte Carlo guidance (saved to model config)
+        obs_indices: List of indices where observations occur (for sparse observations)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if not use_observations:
+        if obs_dim > 0:
+            logging.warning(f"use_observations=False but obs_dim={obs_dim}. Setting obs_dim to 0.")
         obs_dim = 0
+        if train_cond_method != 'concat': # 'concat' is default, so only warn if explicitly set to something else likely
+             pass 
     
     logger_obj = setup_logging(output_dir)
     logger_obj.info("="*80)
@@ -95,17 +117,27 @@ def train_rectified_flow(
     logger_obj.info(f"State dimension: {state_dim}")
     logger_obj.info(f"Observation dimension: {obs_dim}")
     logger_obj.info(f"Use observations: {use_observations}")
-    logger_obj.info(f"Conditioning method: {conditioning_method}")
-    if conditioning_method in ['film', 'adaln', 'cross_attn']:
-        logger_obj.info(f"Conditioning embed dim: {cond_embed_dim}")
-    if conditioning_method == 'cross_attn':
-        logger_obj.info(f"Number of attention heads: {num_attn_heads}")
-    logger_obj.info(f"Hidden dimension: {hidden_dim}")
-    logger_obj.info(f"Network depth: {depth}")
+    logger_obj.info(f"Architecture: {architecture}")
+    if architecture == 'mlp':
+        logger_obj.info(f"  Hidden dimension: {hidden_dim}")
+        logger_obj.info(f"  Network depth: {depth}")
+    elif architecture == 'resnet1d':
+        logger_obj.info(f"  Channels: {channels}")
+        logger_obj.info(f"  Num blocks: {num_blocks}")
+        logger_obj.info(f"  Kernel size: {kernel_size}")
+    logger_obj.info(f"Training conditioning method: {train_cond_method}")
+    if train_cond_method in ['film', 'adaln', 'cross_attn']:
+        logger_obj.info(f"  Conditioning embed dim: {cond_embed_dim}")
+    if train_cond_method == 'cross_attn':
+        logger_obj.info(f"  Number of attention heads: {num_attn_heads}")
+    logger_obj.info(f"Time embedding dimension: {time_embed_dim}")
     logger_obj.info(f"Batch size: {batch_size}")
     logger_obj.info(f"Learning rate: {learning_rate}")
     logger_obj.info(f"Max epochs: {max_epochs}")
     logger_obj.info(f"GPUs: {gpus}")
+    logger_obj.info(f"Predict delta (residual mode): {predict_delta}")
+    logger_obj.info(f"MC Guidance (Inference default): {mc_guidance}")
+    logger_obj.info(f"Guidance Scale (Inference default): {guidance_scale}")
     
     # Create data module
     data_module = RFDataModule(
@@ -120,15 +152,27 @@ def train_rectified_flow(
     model = RFProposal(
         state_dim=state_dim,
         obs_dim=obs_dim,
+        architecture=architecture,
+        # MLP-specific
         hidden_dim=hidden_dim,
         depth=depth,
+        # ResNet1D-specific
+        channels=channels,
+        num_blocks=num_blocks,
+        kernel_size=kernel_size,
+        # Shared
         learning_rate=learning_rate,
         num_sampling_steps=50,
         num_likelihood_steps=50,
-        use_preprocessing=True, # ALWAYS True for RF training
-        conditioning_method=conditioning_method,
+        use_preprocessing=True,  # ALWAYS True for RF training
+        train_cond_method=train_cond_method,
         cond_embed_dim=cond_embed_dim,
         num_attn_heads=num_attn_heads,
+        predict_delta=predict_delta,
+        time_embed_dim=time_embed_dim,
+        mc_guidance=mc_guidance,
+        guidance_scale=guidance_scale,
+        obs_indices=obs_indices,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -167,16 +211,25 @@ def train_rectified_flow(
         "state_dim": state_dim,
         "obs_dim": obs_dim,
         "use_observations": use_observations,
-        "conditioning_method": conditioning_method,
-        "cond_embed_dim": cond_embed_dim,
-        "num_attn_heads": num_attn_heads,
+        "architecture": architecture,
         "hidden_dim": hidden_dim,
         "depth": depth,
+        "channels": channels,
+        "num_blocks": num_blocks,
+        "kernel_size": kernel_size,
+        "train_cond_method": train_cond_method,
+        "cond_embed_dim": cond_embed_dim,
+        "num_attn_heads": num_attn_heads,
+        "time_embed_dim": time_embed_dim,
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "max_epochs": max_epochs,
         "use_preprocessing": True,
+        "predict_delta": predict_delta,
         "data_dir": str(data_dir),
+        "mc_guidance": mc_guidance,
+        "guidance_scale": guidance_scale,
+        "obs_indices": obs_indices,
     })
     
     # Setup trainer
@@ -222,17 +275,33 @@ def main():
                         help='State dimension')
     parser.add_argument('--obs_dim', type=int, default=1,
                         help='Observation dimension')  # state and obs dim should come from dataset / config at some point
+    parser.add_argument('--architecture', type=str, default='mlp',
+                        choices=['mlp', 'resnet1d', 'resnet1d_fixed'],
+                        help='Velocity network architecture')
+    # MLP-specific arguments
     parser.add_argument('--hidden_dim', type=int, default=128,
-                        help='Hidden dimension')
+                        help='Hidden dimension (for MLP)')
     parser.add_argument('--depth', type=int, default=4,
-                        help='Network depth')
-    parser.add_argument('--conditioning_method', type=str, default='concat',
+                        help='Network depth (for MLP)')
+    # ResNet1D-specific arguments
+    parser.add_argument('--channels', type=int, default=64,
+                        help='Number of channels (for ResNet1D)')
+    parser.add_argument('--num_blocks', type=int, default=6,
+                        help='Number of residual blocks (for ResNet1D)')
+    parser.add_argument('--kernel_size', type=int, default=3,
+                        help='Kernel size (for ResNet1D)')
+    # Conditioning arguments
+    parser.add_argument('--train-cond-method', type=str, default='concat',
                         choices=['concat', 'film', 'adaln', 'cross_attn'],
-                        help='Conditioning method')
+                        help='Conditioning method used during training')
     parser.add_argument('--cond_embed_dim', type=int, default=128,
                         help='Conditioning embedding dimension (for film/adaln/cross_attn)')
     parser.add_argument('--num_attn_heads', type=int, default=4,
                         help='Number of attention heads (for cross_attn)')
+    parser.add_argument('--time_embed_dim', type=int, default=64,
+                        help='Dimension of time embedding (default: 64 for MLP, typically 32 for ResNet1D)')
+    parser.add_argument('--predict_delta', action='store_true',
+                        help='Learn increment (x_curr - x_prev) instead of absolute target (residual mode)')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=64,
@@ -254,6 +323,12 @@ def main():
     parser.add_argument('--checkpoint', type=str, default=None,
                         help='Checkpoint to evaluate (if --evaluate is set)')
     
+    # Inference arguments
+    parser.add_argument('--mc-guidance', action='store_true',
+                        help='Enable Monte Carlo guidance by default during inference')
+    parser.add_argument('--guidance-scale', type=float, default=1.0,
+                        help='Default scale for Monte Carlo guidance')
+    
     args = parser.parse_args()
     
     # Set default output directory
@@ -261,6 +336,14 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"./rf_runs/run_{timestamp}"
     
+    # Parse obs_indices
+    obs_indices = None
+    if args.obs_indices is not None:
+        try:
+            obs_indices = [int(i) for i in args.obs_indices.split(',') if i.strip()]
+        except ValueError:
+            raise ValueError(f"Invalid format for --obs-indices: {args.obs_indices}. Expected comma-separated integers.")
+
     # Train model
     wandb_logger = None
     if args.checkpoint is None:
@@ -269,17 +352,26 @@ def main():
             output_dir=args.output_dir,
             state_dim=args.state_dim,
             obs_dim=args.obs_dim,
+            architecture=args.architecture,
             hidden_dim=args.hidden_dim,
             depth=args.depth,
+            channels=args.channels,
+            num_blocks=args.num_blocks,
+            kernel_size=args.kernel_size,
             batch_size=args.batch_size,
             learning_rate=args.learning_rate,
             max_epochs=args.max_epochs,
             num_workers=args.num_workers,
             use_observations=args.use_observations,
-            conditioning_method=args.conditioning_method,
+            train_cond_method=args.train_cond_method,
             cond_embed_dim=args.cond_embed_dim,
             num_attn_heads=args.num_attn_heads,
             gpus=args.gpus,
+            predict_delta=args.predict_delta,
+            time_embed_dim=args.time_embed_dim,
+            mc_guidance=args.mc_guidance,
+            guidance_scale=args.guidance_scale,
+            obs_indices=obs_indices,
         )
         checkpoint_to_eval = best_checkpoint
     else:
