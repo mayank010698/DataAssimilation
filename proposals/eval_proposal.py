@@ -176,6 +176,10 @@ def run_proposal_eval(
     n_samples_per_traj: int = 1,
     device: str = "cuda",
     wandb_run = None,
+    num_sampling_steps: Optional[int] = None,
+    num_likelihood_steps: Optional[int] = None,
+    mc_guidance: bool = False,
+    guidance_scale: float = 1.0,
 ):
     """
     Evaluate RF Proposal using batched autoregressive generation.
@@ -189,6 +193,10 @@ def run_proposal_eval(
         n_samples_per_traj: Number of independent samples per trajectory (for CRPS)
         device: Device to run on
         wandb_run: Active wandb run (optional)
+        num_sampling_steps: Override number of Euler steps for sampling (None = use checkpoint value)
+        num_likelihood_steps: Override number of Euler steps for likelihood computation (None = use checkpoint value)
+        mc_guidance: Override Monte Carlo guidance flag
+        guidance_scale: Override guidance scale
     """
     logger = logging.getLogger(__name__)
     logger.info(f"Running Proposal Evaluation (Autoregressive)")
@@ -202,6 +210,38 @@ def run_proposal_eval(
     
     # Load Model
     model = RFProposal.load_from_checkpoint(checkpoint_path)
+    
+    # Override guidance settings
+    if mc_guidance:
+        logger.info(f"Overriding MC Guidance: {model.mc_guidance} -> {mc_guidance}")
+        model.mc_guidance = mc_guidance
+    if guidance_scale != 1.0:
+        logger.info(f"Overriding Guidance Scale: {model.guidance_scale} -> {guidance_scale}")
+        model.guidance_scale = guidance_scale
+        
+    # Construct observation_fn for guidance
+    # This selects the observed components from the state vector
+    if model.mc_guidance:
+        obs_components = config.obs_components
+        logger.info(f"Constructing observation_fn with components: {obs_components}")
+        
+        def observation_fn(x):
+            # x is shape (..., state_dim)
+            return x[..., obs_components]
+    else:
+        observation_fn = None
+    
+    # Override sampling/likelihood steps if provided
+    if num_sampling_steps is not None:
+        logger.info(f"Overriding num_sampling_steps: {model.num_sampling_steps} -> {num_sampling_steps}")
+        model.num_sampling_steps = num_sampling_steps
+    if num_likelihood_steps is not None:
+        logger.info(f"Overriding num_likelihood_steps: {model.num_likelihood_steps} -> {num_likelihood_steps}")
+        model.num_likelihood_steps = num_likelihood_steps
+    
+    logger.info(f"Using num_sampling_steps: {model.num_sampling_steps}")
+    logger.info(f"Using num_likelihood_steps: {model.num_likelihood_steps}")
+    
     model.to(device)
     model.eval()
     
@@ -322,7 +362,15 @@ def run_proposal_eval(
         # x_next ~ p(x_t | x_{t-1}, y_t)
         with torch.no_grad():
             # Model outputs (B*K, D)
-            x_next_flat = model.sample(x_prev_flat, y_curr_flat)
+            # Pass observation_fn if guidance is enabled
+            if model.mc_guidance and observation_fn is not None:
+                # IMPORTANT: sample() needs observation_fn for guidance
+                # But our wrapper/model.sample signature might not accept it directly in PyTorch Lightning module
+                # Let's check RFProposal.sample signature
+                # It accepts: x_prev, y_curr=None, dt=None, observation_fn=None
+                x_next_flat = model.sample(x_prev_flat, y_curr_flat, observation_fn=observation_fn)
+            else:
+                x_next_flat = model.sample(x_prev_flat, y_curr_flat)
             
         # Reshape back to (B, K, D)
         x_next_stack = x_next_flat.reshape(B_eff, K, D)
@@ -471,6 +519,10 @@ if __name__ == "__main__":
     parser.add_argument("--n-samples-per-traj", type=int, default=1, help="Number of samples per trajectory (for CRPS)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--num-sampling-steps", type=int, default=None, help="Override number of Euler steps for sampling (default: use checkpoint value)")
+    parser.add_argument("--num-likelihood-steps", type=int, default=None, help="Override number of Euler steps for likelihood computation (default: use checkpoint value)")
+    parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     
     args = parser.parse_args()
     
@@ -489,5 +541,9 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         n_samples_per_traj=args.n_samples_per_traj,
         device=args.device,
-        wandb_run=run
+        wandb_run=run,
+        num_sampling_steps=args.num_sampling_steps,
+        num_likelihood_steps=args.num_likelihood_steps,
+        mc_guidance=args.mc_guidance,
+        guidance_scale=args.guidance_scale,
     )

@@ -1,0 +1,76 @@
+2025-12-10 18:35:40,906 - __main__ - INFO - ================================================================================
+2025-12-10 18:35:40,906 - __main__ - INFO - Training Deterministic Next-Step Prediction Model
+2025-12-10 18:35:40,906 - __main__ - INFO - ================================================================================
+2025-12-10 18:35:40,906 - __main__ - INFO - Data directory: datasets/lorenz96_n4096_len100_dt0p0100_obs0p100_freq1_comp10of10_arctan
+2025-12-10 18:35:40,906 - __main__ - INFO - Output directory: deterministic_runs/lorenz96_10dim_resnet1d_bs512_resid
+2025-12-10 18:35:40,906 - __main__ - INFO - State dimension: 10
+2025-12-10 18:35:40,906 - __main__ - INFO - Observation dimension: 10
+2025-12-10 18:35:40,906 - __main__ - INFO - Use observations: True
+2025-12-10 18:35:40,906 - __main__ - INFO - Architecture: ResNet1D (Deterministic)
+2025-12-10 18:35:40,906 - __main__ - INFO -   Channels: 64
+2025-12-10 18:35:40,906 - __main__ - INFO -   Num blocks: 10
+2025-12-10 18:35:40,906 - __main__ - INFO -   Kernel size: 5
+2025-12-10 18:35:40,906 - __main__ - INFO - Conditioning method: concat
+2025-12-10 18:35:40,906 - __main__ - INFO - Batch size: 256
+2025-12-10 18:35:40,906 - __main__ - INFO - Learning rate: 0.001
+2025-12-10 18:35:40,906 - __main__ - INFO - Max epochs: 500
+2025-12-10 18:35:40,906 - __main__ - INFO - GPUs: 1
+2025-12-10 18:35:40,919 - __main__ - INFO - 
+Model architecture:
+2025-12-10 18:35:40,919 - __main__ - INFO -   Total parameters: 411,713
+2025-12-10 18:35:40,919 - __main__ - INFO -   Trainable parameters: 411,713
+2025-12-10 18:35:51,448 - __main__ - INFO - 
+Starting training...
+2025-12-10 18:35:51,827 - root - INFO - Loaded RF training data: 324324 pairs
+2025-12-10 18:35:51,827 - root - INFO - Loaded RF validation data: 40491 pairs
+2025-12-10 18:35:52,276 - root - INFO - Epoch 0: Val Loss = 0.022458, RMSE = 0.149716
+2025-12-10 18:36:35,337 - root - INFO - Epoch 0: Val Loss = 0.000002, RMSE = 0.001216
+2025-12-10 18:36:35,340 - root - INFO - Epoch 0: Train Loss = 0.000138, RMSE = 0.005110
+2025-12-10 18:37:19,272 - root - INFO - Epoch 1: Val Loss = 0.000011, RMSE = 0.003331
+2025-12-10 18:37:19,276 - root - INFO - Epoch 1: Train Loss = 0.000003, RMSE = 0.001491
+2025-12-10 18:38:03,541 - root - INFO - Epoch 2: Val Loss = 0.000001, RMSE = 0.001210
+2025-12-10 18:38:03,544 - root - INFO - Epoch 2: Train Loss = 0.000002, RMSE = 0.001348
+2025-12-10 18:38:46,910 - root - INFO - Epoch 3: Val Loss = 0.000001, RMSE = 0.000894
+2025-12-10 18:38:46,913 - root - INFO - Epoch 3: Train Loss = 0.000002, RMSE = 0.001253
+2025-12-10 18:39:30,504 - root - INFO - Epoch 4: Val Loss = 0.000002, RMSE = 0.001426
+2025-12-10 18:39:30,508 - root - INFO - Epoch 4: Train Loss = 0.000002, RMSE = 0.001141
+2025-12-10 18:40:14,157 - root - INFO - Epoch 5: Val Loss = 0.000000, RMSE = 0.000681
+2025-12-10 18:40:14,160 - root - INFO - Epoch 5: Train Loss = 0.000001, RMSE = 0.001084
+2025-12-10 18:40:58,522 - root - INFO - Epoch 6: Val Loss = 0.000002, RMSE = 0.001573
+2025-12-10 18:40:58,526 - root - INFO - Epoch 6: Train Loss = 0.000001, RMSE = 0.001025
+2025-12-10 18:41:41,739 - root - INFO - Epoch 7: Val Loss = 0.000000, RMSE = 0.000527
+2025-12-10 18:41:41,742 - root - INFO - Epoch 7: Train Loss = 0.000001, RMSE = 0.001007
+2025-12-10 18:42:25,984 - root - INFO - Epoch 8: Val Loss = 0.000000, RMSE = 0.000632
+2025-12-10 18:42:25,988 - root - INFO - Epoch 8: Train Loss = 0.000001, RMSE = 0.000869
+2025-12-10 18:43:10,575 - root - INFO - Epoch 9: Val Loss = 0.000000, RMSE = 0.000488
+2025-12-10 18:43:10,578 - root - INFO - Epoch 9: Train Loss = 0.000001, RMSE = 0.000997
+2025-12-10 18:43:53,868 - root - INFO - Epoch 10: Val Loss = 0.000000, RMSE = 0.000561
+2025-12-10 18:43:53,872 - root - INFO - Epoch 10: Train Loss = 0.000001, RMSE = 0.000676
+2025-12-10 18:44:37,635 - root - INFO - Epoch 11: Val Loss = 0.000001, RMSE = 0.001171
+2025-12-10 18:44:37,639 - root - INFO - Epoch 11: Train Loss = 0.000001, RMSE = 0.000817
+2025-12-10 18:45:21,156 - root - INFO - Epoch 12: Val Loss = 0.000001, RMSE = 0.000846
+2025-12-10 18:45:21,160 - root - INFO - Epoch 12: Train Loss = 0.000001, RMSE = 0.000817
+2025-12-10 18:46:03,845 - root - INFO - Epoch 13: Val Loss = 0.002524, RMSE = 0.049867
+2025-12-10 18:46:03,849 - root - INFO - Epoch 13: Train Loss = 30.303082, RMSE = 0.187334
+2025-12-10 18:46:45,255 - root - INFO - Epoch 14: Val Loss = 0.000016, RMSE = 0.003878
+2025-12-10 18:46:45,259 - root - INFO - Epoch 14: Train Loss = 0.000335, RMSE = 0.014617
+2025-12-10 18:47:29,655 - root - INFO - Epoch 15: Val Loss = 0.000005, RMSE = 0.002235
+2025-12-10 18:47:29,659 - root - INFO - Epoch 15: Train Loss = 0.000014, RMSE = 0.003444
+2025-12-10 18:48:13,733 - root - INFO - Epoch 16: Val Loss = 0.000003, RMSE = 0.001587
+2025-12-10 18:48:13,737 - root - INFO - Epoch 16: Train Loss = 0.000007, RMSE = 0.002486
+2025-12-10 18:48:57,175 - root - INFO - Epoch 17: Val Loss = 0.000002, RMSE = 0.001392
+2025-12-10 18:48:57,179 - root - INFO - Epoch 17: Train Loss = 0.000005, RMSE = 0.002078
+2025-12-10 18:49:40,635 - root - INFO - Epoch 18: Val Loss = 0.000002, RMSE = 0.001243
+2025-12-10 18:49:40,638 - root - INFO - Epoch 18: Train Loss = 0.000004, RMSE = 0.001885
+2025-12-10 18:50:25,788 - root - INFO - Epoch 19: Val Loss = 0.000004, RMSE = 0.001874
+2025-12-10 18:50:25,792 - root - INFO - Epoch 19: Train Loss = 0.000003, RMSE = 0.001729
+2025-12-10 18:50:25,986 - __main__ - INFO - 
+Training completed!
+2025-12-10 18:50:25,986 - __main__ - INFO - Best model checkpoint: /home/cnagda/DataAssimilation/deterministic_runs/lorenz96_10dim_resnet1d_bs512_resid/checkpoints/det-epoch=009-val_loss=0.000000.ckpt
+2025-12-10 18:50:25,987 - __main__ - INFO - Best validation loss: 0.000000
+2025-12-10 18:50:26,018 - __main__ - INFO - Final model saved to: deterministic_runs/lorenz96_10dim_resnet1d_bs512_resid/final_model.ckpt
+2025-12-10 18:50:26,024 - eval_deterministic - INFO - Running Deterministic Model Evaluation (Autoregressive)
+2025-12-10 18:50:26,024 - eval_deterministic - INFO - Checkpoint: /home/cnagda/DataAssimilation/deterministic_runs/lorenz96_10dim_resnet1d_bs512_resid/checkpoints/det-epoch=009-val_loss=0.000000.ckpt
+2025-12-10 18:50:26,087 - root - INFO - Updated system normalization stats from data.h5
+2025-12-10 18:50:26,093 - eval_deterministic - INFO - Evaluating on 411 trajectories, length 99
+2025-12-10 18:50:41,295 - eval_deterministic - INFO - Global Mean RMSE (Autoregressive): 3.4246

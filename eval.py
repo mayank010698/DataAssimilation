@@ -18,6 +18,7 @@ from data import (
     DataAssimilationConfig,
     DataAssimilationDataModule,
     Lorenz63,
+    Lorenz96,
     TimeAlignedBatchSampler,
     create_projection_matrix,
     load_config_yaml,
@@ -137,7 +138,7 @@ def test_rf_log_probs(rf_proposal, system):
 def plot_trajectory_comparison(
     result: Dict[str, Any],
     config: DataAssimilationConfig,
-    system: Lorenz63,
+    system: Any,
 ) -> plt.Figure:
     """Plot trajectory comparison (adapted from run.py for logging)"""
     trajectory_data = result["trajectory_data"]
@@ -185,32 +186,92 @@ def plot_trajectory_comparison(
 
     fig = plt.figure(figsize=(16, 12))
 
-    # 3D Plot
-    ax1 = fig.add_subplot(3, 2, 1, projection="3d")
-    ax1.plot(x_true_orig[:, 0], x_true_orig[:, 1], x_true_orig[:, 2], "b-", alpha=0.8, label="True")
-    ax1.plot(x_est_orig[:, 0], x_est_orig[:, 1], x_est_orig[:, 2], "r--", alpha=0.8, label="PF")
-    ax1.set_title(f"3D Trajectory{space_label} (ID: {traj_idx})")
-    ax1.legend()
+    # Determine if high dimensional (e.g. > 3)
+    is_high_dim = x_true.shape[1] > 3
 
-    # State Components
-    state_names = ["X", "Y", "Z"]
-    colors = ["blue", "green", "orange"]
-    for i, (name, color) in enumerate(zip(state_names, colors)):
-        ax = fig.add_subplot(3, 2, i + 2)
-        ax.plot(time_steps, x_true_orig[:, i], color=color, label=f"{name} (true)")
-        ax.plot(time_steps, x_est_orig[:, i], color="red", linestyle="--", label=f"{name} (est)")
+    if is_high_dim:
+        # High-dim plotting (Heatmaps + Projections)
         
-        # Plot observations if available for this component
-        if i in config.obs_components and len(obs_times) > 0:
-            valid_mask = obs_indices < len(x_true_orig)
-            if np.any(valid_mask):
-                ax.scatter(
-                    obs_times[valid_mask], 
-                    x_true_orig[obs_indices[valid_mask], i], 
-                    color="red", marker="x", s=40, label="Obs"
-                )
-        ax.set_ylabel(name)
-        ax.legend()
+        # 1. Heatmap True
+        ax1 = fig.add_subplot(3, 2, 1)
+        im1 = ax1.imshow(x_true_orig.T, aspect='auto', interpolation='nearest', cmap='viridis', origin='lower')
+        ax1.set_title(f"True State Heatmap (ID: {traj_idx})")
+        ax1.set_ylabel("State Component")
+        plt.colorbar(im1, ax=ax1)
+
+        # 2. Heatmap Est
+        ax2 = fig.add_subplot(3, 2, 2)
+        im2 = ax2.imshow(x_est_orig.T, aspect='auto', interpolation='nearest', cmap='viridis', origin='lower')
+        ax2.set_title(f"Estimated State Heatmap (PF)")
+        ax2.set_ylabel("State Component")
+        plt.colorbar(im2, ax=ax2)
+
+        # 3. 3D Projection (0, 1, 2)
+        ax3 = fig.add_subplot(3, 2, 3, projection="3d")
+        ax3.plot(x_true_orig[:, 0], x_true_orig[:, 1], x_true_orig[:, 2], "b-", alpha=0.8, label="True")
+        ax3.plot(x_est_orig[:, 0], x_est_orig[:, 1], x_est_orig[:, 2], "r--", alpha=0.8, label="PF")
+        ax3.set_title("3D Projection (Dim 0,1,2)")
+        ax3.legend()
+
+        # 4. Time Series of Component 0
+        ax4 = fig.add_subplot(3, 2, 4)
+        ax4.plot(time_steps, x_true_orig[:, 0], "b-", label="True (Dim 0)")
+        ax4.plot(time_steps, x_est_orig[:, 0], "r--", label="Est (Dim 0)")
+        
+        # Add observations for component 0 if present
+        if 0 in config.obs_components and len(obs_times) > 0:
+             valid_mask = obs_indices < len(x_true_orig)
+             # Filter for obs that are actually measuring dim 0
+             # obs_values is (N_obs, Obs_dim). We need to know which col of obs corresponds to state dim 0.
+             # obs_components list maps obs_dim_idx -> state_dim_idx
+             try:
+                 obs_col_idx = config.obs_components.index(0)
+                 if np.any(valid_mask):
+                     # Extract specific column
+                     ax4.scatter(
+                        obs_times[valid_mask], 
+                        obs_values[valid_mask, obs_col_idx] if obs_values.ndim > 1 else obs_values[valid_mask],
+                        color="red", marker="x", s=40, label="Obs"
+                     )
+             except ValueError:
+                 pass # Dim 0 not observed
+
+        ax4.set_title("Component 0 Time Series")
+        ax4.legend()
+
+    else:
+        # 3D Plot
+        ax1 = fig.add_subplot(3, 2, 1, projection="3d")
+        ax1.plot(x_true_orig[:, 0], x_true_orig[:, 1], x_true_orig[:, 2], "b-", alpha=0.8, label="True")
+        ax1.plot(x_est_orig[:, 0], x_est_orig[:, 1], x_est_orig[:, 2], "r--", alpha=0.8, label="PF")
+        ax1.set_title(f"3D Trajectory{space_label} (ID: {traj_idx})")
+        ax1.legend()
+
+        # State Components
+        state_names = ["X", "Y", "Z"]
+        colors = ["blue", "green", "orange"]
+        for i, (name, color) in enumerate(zip(state_names, colors)):
+            if i >= x_true.shape[1]: break
+            ax = fig.add_subplot(3, 2, i + 2)
+            ax.plot(time_steps, x_true_orig[:, i], color=color, label=f"{name} (true)")
+            ax.plot(time_steps, x_est_orig[:, i], color="red", linestyle="--", label=f"{name} (est)")
+            
+            # Plot observations if available for this component
+            if i in config.obs_components and len(obs_times) > 0:
+                valid_mask = obs_indices < len(x_true_orig)
+                if np.any(valid_mask):
+                    try:
+                        obs_col_idx = config.obs_components.index(i)
+                        val = obs_values[valid_mask, obs_col_idx] if obs_values.ndim > 1 else obs_values[valid_mask]
+                        ax.scatter(
+                            obs_times[valid_mask], 
+                            val, 
+                            color="red", marker="x", s=40, label="Obs"
+                        )
+                    except ValueError:
+                        pass
+            ax.set_ylabel(name)
+            ax.legend()
 
     # RMSE over time
     ax5 = fig.add_subplot(3, 2, 5)
@@ -303,6 +364,8 @@ def run_particle_filter_on_trajectory(
         "total_time": np.sum(step_times) if step_times else 0.0,
         "metrics": trajectory_metrics,
         "trajectory_data": trajectory_data if collect_trajectory_data else None,
+        "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in trajectory_metrics]),
+        "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in trajectory_metrics]),
     }
 
     return result
@@ -329,6 +392,13 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
     # Aggregate ESS metrics
     all_mean_ess = [r["mean_ess"] for r in trajectory_results if r["mean_ess"] > 0]
     all_min_ess = [r["min_ess"] for r in trajectory_results if r["min_ess"] > 0]
+    
+    # Aggregate ESS Pre-Resample metrics (if available)
+    all_mean_ess_pre = []
+    all_min_ess_pre = []
+    if trajectory_results and "mean_ess_pre" in trajectory_results[0]:
+        all_mean_ess_pre = [r["mean_ess_pre"] for r in trajectory_results]
+        all_min_ess_pre = [r["min_ess_pre"] for r in trajectory_results]
     
     # Aggregate timing metrics
     all_total_times = [r["total_time"] for r in trajectory_results if r["total_time"] > 0]
@@ -373,6 +443,9 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
         "mean_ess": np.mean(all_mean_ess) if all_mean_ess else 0.0,
         "std_ess": np.std(all_mean_ess) if all_mean_ess else 0.0,
         "min_ess": np.min(all_min_ess) if all_min_ess else 0.0,
+        
+        "mean_ess_pre": np.mean(all_mean_ess_pre) if all_mean_ess_pre else 0.0,
+        "min_ess_pre": np.min(all_min_ess_pre) if all_min_ess_pre else 0.0,
         
         # Timing statistics
         "mean_total_time": np.mean(all_total_times) if all_total_times else 0.0,
@@ -471,6 +544,10 @@ def parse_args():
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
     parser.add_argument("--rf-sampling-steps", type=int, default=None)
     parser.add_argument("--device", type=str, default="cpu")
+    
+    # Guidance configuration
+    parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance during inference")
+    parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -613,7 +690,9 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             "mean_step_time": np.mean(step_times),
             "total_time": np.sum(step_times),
             "metrics": metrics_list,
-            "trajectory_data": data["trajectory_data"]
+            "trajectory_data": data["trajectory_data"],
+            "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in metrics_list]),
+            "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in metrics_list]),
         }
         final_results.append(res_dict)
         
@@ -687,6 +766,8 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
                 "total_time": np.sum(step_times) if step_times else 0.0,
                 "metrics": current_traj_metrics,
                 "trajectory_data": current_traj_data if do_vis else None,
+                "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
+                "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
             }
             trajectory_results.append(result)
             
@@ -764,6 +845,8 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             "total_time": np.sum(step_times) if step_times else 0.0,
             "metrics": current_traj_metrics,
             "trajectory_data": current_traj_data if do_vis else None,
+            "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
+            "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
         }
         trajectory_results.append(result)
         
@@ -814,19 +897,25 @@ def main():
     print(f"  observation_operator: {obs_op_type}")
 
     # Determine observation dimension
-    if isinstance(config.observation_operator, (np.ndarray, torch.Tensor)):
-        inferred_obs_dim = len(config.obs_components)
-    else:
-        inferred_obs_dim = 1
+    # obs_dim = number of observed components, regardless of operator type
+    # (arctan is applied element-wise, linear projection selects components)
+    inferred_obs_dim = len(config.obs_components)
     obs_dim = args.obs_dim if args.obs_dim is not None else inferred_obs_dim
 
     # Create system
-    system = Lorenz63(config)
+    if "dim" in config.system_params or "F" in config.system_params:
+        system_class = Lorenz96
+        logging.info("Detected Lorenz96 system config")
+    else:
+        system_class = Lorenz63
+        logging.info("Detected Lorenz63 system config")
+        
+    system = system_class(config)
 
     # Load data module
     data_module = DataAssimilationDataModule(
         config=config,
-        system_class=Lorenz63,
+        system_class=system_class,
         data_dir=str(data_dir),
         batch_size=args.batch_size,
     )
@@ -871,6 +960,9 @@ def main():
             system=system,
             obs_mean=obs_mean,
             obs_std=obs_std,
+            mc_guidance=args.mc_guidance,
+            guidance_scale=args.guidance_scale,
+            obs_components=config.obs_components, # Needed to construct observation_fn
         )
         
         test_rf_log_probs(proposal, system)
@@ -906,6 +998,7 @@ def main():
         wandb.define_metric("time_step")
         wandb.define_metric("mean_rmse_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_over_time", step_metric="time_step")
+        wandb.define_metric("mean_ess_pre_resample_over_time", step_metric="time_step")
         wandb.define_metric("mean_cumulative_resamples", step_metric="time_step")
         wandb.define_metric("mean_proposal_log_prob", step_metric="time_step")
         wandb.define_metric("mean_obs_log_prob", step_metric="time_step")
@@ -962,6 +1055,7 @@ def main():
                 rmse_vals = []
                 crps_vals = []
                 ess_vals = []
+                ess_pre_vals = []
                 cumulative_resample_vals = []
                 prop_log_vals = []
                 obs_log_vals = []
@@ -974,6 +1068,8 @@ def main():
                             crps_vals.append(r["metrics"][t]["crps"])
                         if "ess" in r["metrics"][t]:
                             ess_vals.append(r["metrics"][t]["ess"])
+                        if "ess_pre_resample" in r["metrics"][t]:
+                            ess_pre_vals.append(r["metrics"][t]["ess_pre_resample"])
                         if r["metrics"][t].get("resampled", False):
                             traj_cumulative_resamples[i] += 1
                         cumulative_resample_vals.append(traj_cumulative_resamples[i])
@@ -990,6 +1086,7 @@ def main():
                         "mean_rmse_over_time": np.mean(rmse_vals),
                         "mean_crps_over_time": np.mean(crps_vals) if crps_vals else 0.0,
                         "mean_ess_over_time": np.mean(ess_vals) if ess_vals else 0.0,
+                        "mean_ess_pre_resample_over_time": np.mean(ess_pre_vals) if ess_pre_vals else 0.0,
                         "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0,
                         "mean_proposal_log_prob": np.mean(prop_log_vals) if prop_log_vals else 0.0,
                         "mean_obs_log_prob": np.mean(obs_log_vals) if obs_log_vals else 0.0,
