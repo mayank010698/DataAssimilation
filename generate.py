@@ -2,6 +2,8 @@ import argparse
 import logging
 import os
 import sys
+import random
+import torch
 from pathlib import Path
 
 import numpy as np
@@ -111,6 +113,16 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Set random seeds if provided
+    if args.seed is not None:
+        print(f"Setting random seed to {args.seed}")
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
         format="%(asctime)s - %(levelname)s - %(message)s",
