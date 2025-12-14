@@ -276,7 +276,7 @@ def main():
     parser.add_argument('--obs_dim', type=int, default=1,
                         help='Observation dimension')  # state and obs dim should come from dataset / config at some point
     parser.add_argument('--architecture', type=str, default='mlp',
-                        choices=['mlp', 'mlp_fixed', 'resnet1d', 'resnet1d_fixed'],
+                        choices=['mlp', 'resnet1d'],
                         help='Velocity network architecture')
     # MLP-specific arguments
     parser.add_argument('--hidden_dim', type=int, default=128,
@@ -328,6 +328,9 @@ def main():
                         help='Enable Monte Carlo guidance by default during inference')
     parser.add_argument('--guidance-scale', type=float, default=1.0,
                         help='Default scale for Monte Carlo guidance')
+
+    parser.add_argument('--obs_indices', type=str, default=None,
+                        help='Comma-separated indices of observed variables (e.g. "0,2,4")')
     
     args = parser.parse_args()
     
@@ -343,9 +346,6 @@ def main():
             obs_indices = [int(i) for i in args.obs_indices.split(',') if i.strip()]
         except ValueError:
             raise ValueError(f"Invalid format for --obs-indices: {args.obs_indices}. Expected comma-separated integers.")
-
-    parser.add_argument('--obs_indices', type=str, default=None,
-                        help='Comma-separated indices of observed variables (e.g. "0,2,4")')
     
     # Train model
     wandb_logger = None

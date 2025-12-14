@@ -8,10 +8,8 @@ Available architectures:
 
 from .base import BaseVelocityNetwork
 from .mlp import MLPVelocityNetwork
-from .mlp_fixed import MLPFixed
 from .resnet1d import ResNet1DVelocityNetwork
 from .resnet1d_deterministic import ResNet1DDeterministic
-from .resnet1d_fixed import ResNet1DFixed
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -33,10 +31,10 @@ def create_velocity_network(
     Factory function to create velocity network.
     
     Args:
-        architecture: One of 'mlp', 'resnet1d', 'resnet1d_fixed'
+        architecture: One of 'mlp', 'resnet1d'
         state_dim: Dimension of state space
         obs_dim: Dimension of observations (0 for unconditional)
-        conditioning_method: One of 'concat', 'film', 'adaln', 'cross_attn' (renamed to train_cond_method in caller)
+        conditioning_method: Ignored for current fixed architectures (they use specific methods internally)
         **kwargs: Additional architecture-specific arguments
         
     Returns:
@@ -47,18 +45,10 @@ def create_velocity_network(
             hidden_dim: int = 128
             depth: int = 4
             time_embed_dim: int = 64
-            cond_embed_dim: int = 128
-            num_attn_heads: int = 4
+            obs_indices: Optional[List[int]] = None
+            dropout: float = 0.0
             
         ResNet1D:
-            channels: int = 64
-            num_blocks: int = 6
-            kernel_size: int = 3
-            time_embed_dim: int = 64
-            cond_embed_dim: int = 128
-            num_attn_heads: int = 4
-            
-        ResNet1DFixed:
             channels: int = 64
             num_blocks: int = 6
             kernel_size: int = 5
@@ -68,17 +58,6 @@ def create_velocity_network(
     """
     if architecture == 'mlp':
         return MLPVelocityNetwork(
-            state_dim=state_dim,
-            obs_dim=obs_dim,
-            conditioning_method=conditioning_method,
-            hidden_dim=kwargs.get('hidden_dim', 128),
-            depth=kwargs.get('depth', 4),
-            time_embed_dim=kwargs.get('time_embed_dim', 64),
-            cond_embed_dim=kwargs.get('cond_embed_dim', 128),
-            num_attn_heads=kwargs.get('num_attn_heads', 4),
-        )
-    elif architecture == 'mlp_fixed':
-        return MLPFixed(
             state_dim=state_dim,
             obs_dim=obs_dim,
             obs_indices=kwargs.get('obs_indices', None),
@@ -91,18 +70,6 @@ def create_velocity_network(
         return ResNet1DVelocityNetwork(
             state_dim=state_dim,
             obs_dim=obs_dim,
-            conditioning_method=conditioning_method,
-            channels=kwargs.get('channels', 64),
-            num_blocks=kwargs.get('num_blocks', 6),
-            kernel_size=kwargs.get('kernel_size', 3),
-            time_embed_dim=kwargs.get('time_embed_dim', 64),
-            cond_embed_dim=kwargs.get('cond_embed_dim', 128),
-            num_attn_heads=kwargs.get('num_attn_heads', 4),
-        )
-    elif architecture == 'resnet1d_fixed':
-        return ResNet1DFixed(
-            state_dim=state_dim,
-            obs_dim=obs_dim,
             obs_indices=kwargs.get('obs_indices', None),
             channels=kwargs.get('channels', 64),
             num_blocks=kwargs.get('num_blocks', 6),
@@ -113,7 +80,7 @@ def create_velocity_network(
     else:
         raise ValueError(
             f"Unknown architecture: {architecture}. "
-            f"Available: 'mlp', 'mlp_fixed', 'resnet1d', 'resnet1d_fixed'"
+            f"Available: 'mlp', 'resnet1d'"
         )
 
 
@@ -123,9 +90,7 @@ __all__ = [
     'BaseConditioning',
     # Velocity networks
     'MLPVelocityNetwork',
-    'MLPFixed',
     'ResNet1DVelocityNetwork',
-    'ResNet1DFixed',
     # Deterministic networks
     'ResNet1DDeterministic',
     # Conditioning modules
@@ -137,4 +102,3 @@ __all__ = [
     'create_velocity_network',
     'create_conditioning',
 ]
-

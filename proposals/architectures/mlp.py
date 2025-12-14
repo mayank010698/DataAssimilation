@@ -1,94 +1,93 @@
 """
-MLP-based velocity network for rectified flow.
+Fixed MLP velocity network with concatenation conditioning.
 
-Suitable for low-dimensional systems like Lorenz63.
+Designed for low-dimensional systems like Lorenz-63.
+Treats all inputs as flat vectors and concatenates them at the input.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, List
 
 from .base import BaseVelocityNetwork
-from .conditioning import create_conditioning
 
 
 class MLPVelocityNetwork(BaseVelocityNetwork):
     """
-    MLP-based velocity network v_θ(x, s | x_prev, y)
+    Fixed MLP Architecture for Data Assimilation (Lorenz-63).
     
-    Supports multiple conditioning methods:
-    - 'concat': Concatenate [x, time_embed, x_prev, y]
-    - 'film': Feature-wise Linear Modulation
-    - 'adaln': Adaptive Layer Normalization  
-    - 'cross_attn': Cross-attention
+    Features:
+    - Input flattening: Concatenates [x, x_prev, y_full, mask, time_embed]
+    - Sparse observation handling via mapping and mask
+    - Simple concatenated conditioning
     
     Args:
         state_dim: Dimension of state space
-        hidden_dim: Hidden layer dimension
+        obs_dim: Dimension of observations
+        obs_indices: List of indices where observations occur
+        hidden_dim: Hidden dimension size
         depth: Number of hidden layers
         time_embed_dim: Dimension of time embedding
-        obs_dim: Dimension of observations
-        conditioning_method: One of ['concat', 'film', 'adaln', 'cross_attn']
-        cond_embed_dim: Embedding dimension for conditioning (for film/adaln/cross_attn)
-        num_attn_heads: Number of attention heads (for cross_attn only)
+        dropout: Dropout probability
     """
-    
     def __init__(
         self,
         state_dim: int,
+        obs_dim: int = 0,
+        obs_indices: Optional[List[int]] = None,
         hidden_dim: int = 128,
         depth: int = 4,
         time_embed_dim: int = 64,
-        obs_dim: int = 0,
-        conditioning_method: str = 'concat',
-        cond_embed_dim: int = 128,
-        num_attn_heads: int = 4,
+        dropout: float = 0.0,
     ):
-        super().__init__(state_dim, obs_dim, conditioning_method)
+        # We don't use the generic conditioning_method here
+        super().__init__(state_dim, obs_dim, conditioning_method='concat')
         
-        self.hidden_dim = hidden_dim
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
         self.time_embed_dim = time_embed_dim
-        self.depth = depth
         
-        # Time embedding: map s ∈ [0,1] to higher dimensional space
+        # Handle Observation Indices
+        if obs_indices is not None:
+            self.register_buffer('obs_indices', torch.tensor(obs_indices, dtype=torch.long))
+        else:
+            self.obs_indices = None
+            
+        # Time Embedding
         self.time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
         
-        # Create conditioning module
-        cond_dim = state_dim + obs_dim  # [x_prev, y]
+        # Input Dimension Calculation
+        # If obs_dim > 0: x (state_dim) + x_prev (state_dim) + y_full (state_dim) + mask (state_dim) + time (time_embed_dim)
+        # If obs_dim == 0: x (state_dim) + x_prev (state_dim) + time (time_embed_dim)
+        if obs_dim > 0:
+            input_dim = 4 * state_dim + time_embed_dim
+        else:
+            input_dim = 2 * state_dim + time_embed_dim
         
-        self.conditioning = create_conditioning(
-            method=conditioning_method,
-            hidden_dim=hidden_dim,
-            cond_dim=cond_dim,
-            num_layers=depth,
-            cond_embed_dim=cond_embed_dim,
-            num_attn_heads=num_attn_heads,
-        )
-        
-        # Input dimension: [x, time_embed] + optional conditioning (for concat only)
-        input_dim = state_dim + time_embed_dim + self.conditioning.get_input_dim_adjustment()
+        # Build MLP
+        layers = []
         
         # Input layer
-        self.input_layer = nn.Linear(input_dim, hidden_dim)
-        self.input_activation = nn.SiLU()
-        
+        layers.append(nn.Linear(input_dim, hidden_dim))
+        layers.append(nn.SiLU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+            
         # Hidden layers
-        self.hidden_layers = nn.ModuleList([
-            nn.Linear(hidden_dim, hidden_dim)
-            for _ in range(depth - 1)
-        ])
-        
-        self.hidden_activations = nn.ModuleList([
-            nn.SiLU()
-            for _ in range(depth - 1)
-        ])
-        
+        for _ in range(depth - 1):
+            layers.append(nn.Linear(hidden_dim, hidden_dim))
+            layers.append(nn.SiLU())
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+                
         # Output layer
-        self.output_layer = nn.Linear(hidden_dim, state_dim)
+        layers.append(nn.Linear(hidden_dim, state_dim))
+        
+        self.net = nn.Sequential(*layers)
         
     def forward(
         self, 
@@ -98,61 +97,50 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
         y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute velocity v_θ(x, s | x_prev, y)
+        Compute velocity v(x, s | x_prev, y).
         
         Args:
-            x: Current position in flow, shape (batch, state_dim)
-            s: Flow time ∈ [0,1], shape (batch, 1) or (batch,)
-            x_prev: Conditioning (previous state), shape (batch, state_dim)
-            y: Observation conditioning, shape (batch, obs_dim) or None
+            x: Current state (batch, state_dim)
+            s: Time (batch, 1) or (batch,)
+            x_prev: Previous state (batch, state_dim)
+            y: Observations (batch, obs_dim) or None
             
         Returns:
-            Velocity vector, shape (batch, state_dim)
+            Velocity (batch, state_dim)
         """
+        B = x.shape[0]
+        
+        # 1. Time Embedding
         if s.dim() == 1:
             s = s.unsqueeze(1)
+        t_embed = self.time_embed(s)  # (B, time_embed_dim)
         
-        # Time embedding
-        s_embed = self.time_embed(s)
-        
-        # Prepare conditioning: [x_prev, y] or just x_prev if y is None
-        if self.obs_dim > 0 and y is not None:
-            cond = torch.cat([x_prev, y], dim=-1)
-        else:
-            # If no observations, pad with zeros or just use x_prev
-            if self.obs_dim > 0:
-                # Expected observations but got None - pad with zeros
-                y_dummy = torch.zeros(x_prev.shape[0], self.obs_dim, 
-                                     device=x_prev.device, dtype=x_prev.dtype)
-                cond = torch.cat([x_prev, y_dummy], dim=-1)
-            else:
-                cond = x_prev
-        
-        # Build input based on conditioning method
-        if self.conditioning_method == 'concat':
-            # Concatenate everything at input
-            net_input = torch.cat([x, s_embed, cond], dim=-1)
-        else:
-            # For other methods, just concatenate x and time embedding
-            net_input = torch.cat([x, s_embed], dim=-1)
-        
-        # Input layer
-        h = self.input_layer(net_input)
-        h = self.input_activation(h)
-        
-        # Apply conditioning at input layer if not concat
-        if self.conditioning_method != 'concat':
-            h = self.conditioning(h, cond, layer_idx=0)
-        
-        # Hidden layers with conditioning
-        for i, (layer, activation) in enumerate(zip(self.hidden_layers, self.hidden_activations)):
-            h = layer(h)
-            h = activation(h)
+        # 2. Prepare Input based on Observations
+        if self.obs_dim > 0:
+            y_full = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+            mask = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
             
-            # Apply conditioning at each hidden layer if not concat
-            if self.conditioning_method != 'concat':
-                h = self.conditioning(h, cond, layer_idx=i+1)
+            if y is not None:
+                if self.obs_indices is not None:
+                    # Sparse observations
+                    y_full[:, self.obs_indices] = y
+                    mask[:, self.obs_indices] = 1.0
+                elif y.shape[1] == self.state_dim:
+                    # Dense observations
+                    y_full = y
+                    mask = torch.ones_like(mask)
+                else:
+                    # Fallback: assume first obs_dim indices
+                    y_full[:, :y.shape[1]] = y
+                    mask[:, :y.shape[1]] = 1.0
+            
+            # [x, x_prev, y_full, mask, t_embed]
+            net_input = torch.cat([x, x_prev, y_full, mask, t_embed], dim=-1)
+        else:
+            # [x, x_prev, t_embed]
+            net_input = torch.cat([x, x_prev, t_embed], dim=-1)
         
-        # Output layer
-        return self.output_layer(h)
-
+        # 4. Forward Pass
+        out = self.net(net_input)
+        
+        return out

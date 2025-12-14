@@ -1,419 +1,202 @@
 """
-1D ResNet velocity network with periodic (circular) convolutions.
+1D ResNet velocity network with AdaLN conditioning and inpainting-style observation handling.
 
-Designed for systems with periodic boundary conditions like Lorenz96.
-The circular padding naturally respects the wrap-around structure of such systems.
+Designed for Lorenz-96 and similar systems where observations are partial and spatial structure is important.
 """
 
 import torch
 import torch.nn as nn
-from typing import Optional
+from typing import Optional, List, Union
 
 from .base import BaseVelocityNetwork
 
 
-class Conv1dConditioning(nn.Module):
+class AdaLN1d(nn.Module):
     """
-    Base class for conditioning in 1D convolutional networks.
+    Adaptive Layer Normalization for 1D data.
     
-    Unlike the MLP conditioning which operates on (batch, hidden_dim),
-    this operates on (batch, channels, spatial_dim).
+    Regresses scale and shift parameters from a global embedding (e.g., time)
+    to modulate the normalized spatial feature map.
     """
-    
-    def __init__(self, channels: int, cond_dim: int):
+    def __init__(self, channels: int, embed_dim: int):
         super().__init__()
-        self.channels = channels
-        self.cond_dim = cond_dim
-    
-    def forward(
-        self, 
-        h: torch.Tensor, 
-        cond: torch.Tensor, 
-        layer_idx: int
-    ) -> torch.Tensor:
-        """
-        Apply conditioning to conv hidden activations.
+        # GroupNorm with 1 group is equivalent to LayerNorm over channels
+        self.norm = nn.GroupNorm(1, channels)
+        self.proj = nn.Linear(embed_dim, 2 * channels)
         
+        # Initialize projection to identity (scale=1, shift=0) for stability
+        nn.init.constant_(self.proj.weight, 0)
+        nn.init.constant_(self.proj.bias, 0)
+        # We'll add 1 to scale in forward to make it identity by default
+
+    def forward(self, x: torch.Tensor, embed: torch.Tensor) -> torch.Tensor:
+        """
         Args:
-            h: Hidden activations, shape (batch, channels, spatial_dim)
-            cond: Conditioning input [x_prev, y], shape (batch, cond_dim)
-            layer_idx: Which layer this is being applied to (0-indexed)
+            x: Input features, shape (batch, channels, spatial_dim)
+            embed: Global embedding, shape (batch, embed_dim)
             
         Returns:
-            Conditioned hidden activations, shape (batch, channels, spatial_dim)
+            Modulated features, shape (batch, channels, spatial_dim)
         """
-        raise NotImplementedError
-
-
-class Conv1dConcatConditioning(Conv1dConditioning):
-    """
-    Concatenation-based conditioning for conv networks.
-    
-    Expands conditioning to spatial dimension and concatenates with input channels.
-    """
-    
-    def __init__(self, channels: int, cond_dim: int):
-        super().__init__(channels, cond_dim)
-    
-    def get_extra_channels(self) -> int:
-        """Returns number of extra input channels needed for conditioning."""
-        return self.cond_dim
-    
-    def forward(
-        self, 
-        h: torch.Tensor, 
-        cond: torch.Tensor, 
-        layer_idx: int
-    ) -> torch.Tensor:
-        # For concat, conditioning is handled at input level
-        # This is a no-op for intermediate layers
-        return h
-
-
-class Conv1dFiLMConditioning(Conv1dConditioning):
-    """
-    Feature-wise Linear Modulation for 1D conv networks.
-    
-    Applies channel-wise affine transformation: h_out = scale * h + shift
-    where scale and shift are (batch, channels, 1) and broadcast over spatial dim.
-    """
-    
-    def __init__(
-        self, 
-        channels: int, 
-        cond_dim: int, 
-        num_layers: int,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(channels, cond_dim)
+        # 1. Normalize
+        x_norm = self.norm(x)
         
-        # Encode conditioning into a shared embedding
-        self.cond_encoder = nn.Sequential(
-            nn.Linear(cond_dim, cond_embed_dim),
-            nn.SiLU(),
-            nn.Linear(cond_embed_dim, cond_embed_dim),
-        )
+        # 2. Regress parameters
+        params = self.proj(embed)  # (batch, 2*channels)
+        scale, shift = params.chunk(2, dim=1)  # (batch, channels) each
         
-        # FiLM generators for each layer (scale and shift per channel)
-        self.film_layers = nn.ModuleList([
-            nn.Linear(cond_embed_dim, 2 * channels)
-            for _ in range(num_layers)
-        ])
-    
-    def forward(
-        self, 
-        h: torch.Tensor, 
-        cond: torch.Tensor, 
-        layer_idx: int
-    ) -> torch.Tensor:
-        # h: (batch, channels, spatial_dim)
-        cond_embed = self.cond_encoder(cond)  # (batch, cond_embed_dim)
-        
-        film_params = self.film_layers[layer_idx](cond_embed)  # (batch, 2*channels)
-        scale, shift = torch.chunk(film_params, 2, dim=-1)  # Each (batch, channels)
-        
-        # Reshape for broadcasting: (batch, channels, 1)
-        scale = scale.unsqueeze(-1)
+        # 3. Modulate (add 1 to scale so initialization at 0 results in identity)
+        scale = scale.unsqueeze(-1) + 1.0
         shift = shift.unsqueeze(-1)
         
-        return scale * h + shift
+        return scale * x_norm + shift
 
 
-class Conv1dAdaLNConditioning(Conv1dConditioning):
+class ResBlock1DAdaLN(nn.Module):
     """
-    Adaptive Layer Normalization for 1D conv networks.
+    Residual block with AdaLN conditioning and 1D circular convolutions.
     
-    Applies LayerNorm over channels, then channel-wise modulation.
+    Structure (Pre-activation):
+        AdaLN(x, t) -> SiLU -> Conv -> AdaLN(x, t) -> SiLU -> Conv + Residual
     """
-    
-    def __init__(
-        self, 
-        channels: int, 
-        cond_dim: int, 
-        num_layers: int,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(channels, cond_dim)
-        
-        # Encode conditioning
-        self.cond_encoder = nn.Sequential(
-            nn.Linear(cond_dim, cond_embed_dim),
-            nn.SiLU(),
-            nn.Linear(cond_embed_dim, cond_embed_dim),
-        )
-        
-        # Layer normalization for each layer (normalize over channels)
-        # Using GroupNorm with num_groups=1 is equivalent to LayerNorm over channels
-        self.layer_norms = nn.ModuleList([
-            nn.GroupNorm(num_groups=1, num_channels=channels)
-            for _ in range(num_layers)
-        ])
-        
-        # AdaLN parameters for each layer
-        self.adaLN_layers = nn.ModuleList([
-            nn.Linear(cond_embed_dim, 2 * channels)
-            for _ in range(num_layers)
-        ])
-    
-    def forward(
-        self, 
-        h: torch.Tensor, 
-        cond: torch.Tensor, 
-        layer_idx: int
-    ) -> torch.Tensor:
-        # h: (batch, channels, spatial_dim)
-        cond_embed = self.cond_encoder(cond)  # (batch, cond_embed_dim)
-        
-        # Apply layer normalization
-        h_norm = self.layer_norms[layer_idx](h)
-        
-        # Get scale and shift
-        adaLN_params = self.adaLN_layers[layer_idx](cond_embed)  # (batch, 2*channels)
-        scale, shift = torch.chunk(adaLN_params, 2, dim=-1)  # Each (batch, channels)
-        
-        # Reshape for broadcasting: (batch, channels, 1)
-        scale = scale.unsqueeze(-1)
-        shift = shift.unsqueeze(-1)
-        
-        return scale * h_norm + shift
-
-
-class Conv1dCrossAttentionConditioning(Conv1dConditioning):
-    """
-    Cross-attention conditioning for 1D conv networks.
-    
-    Pools spatial dimension, applies cross-attention with conditioning,
-    then broadcasts result back to spatial dimension.
-    """
-    
-    def __init__(
-        self, 
-        channels: int, 
-        cond_dim: int, 
-        num_layers: int,
-        num_heads: int = 4,
-        cond_embed_dim: int = 128,
-    ):
-        super().__init__(channels, cond_dim)
-        
-        # Ensure cond_embed_dim is divisible by num_heads
-        if cond_embed_dim % num_heads != 0:
-            cond_embed_dim = ((cond_embed_dim + num_heads - 1) // num_heads) * num_heads
-        
-        self.num_heads = num_heads
-        self.head_dim = cond_embed_dim // num_heads
-        self.cond_embed_dim = cond_embed_dim
-        
-        # Project conditioning to key/value space
-        self.cond_to_kv = nn.Linear(cond_dim, 2 * cond_embed_dim)
-        
-        # Query projection from pooled spatial features
-        self.query_projections = nn.ModuleList([
-            nn.Linear(channels, cond_embed_dim)
-            for _ in range(num_layers)
-        ])
-        
-        # Output projection back to channels
-        self.output_projections = nn.ModuleList([
-            nn.Linear(cond_embed_dim, channels)
-            for _ in range(num_layers)
-        ])
-        
-        self.scale = self.head_dim ** -0.5
-    
-    def forward(
-        self, 
-        h: torch.Tensor, 
-        cond: torch.Tensor, 
-        layer_idx: int
-    ) -> torch.Tensor:
-        # h: (batch, channels, spatial_dim)
-        batch_size, channels, spatial_dim = h.shape
-        
-        # Global average pooling over spatial dimension
-        h_pooled = h.mean(dim=-1)  # (batch, channels)
-        
-        # Project conditioning to key and value
-        kv = self.cond_to_kv(cond)  # (batch, 2 * cond_embed_dim)
-        k, v = torch.chunk(kv, 2, dim=-1)
-        
-        # Reshape for multi-head attention
-        k = k.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Project pooled h to query
-        q = self.query_projections[layer_idx](h_pooled)  # (batch, cond_embed_dim)
-        q = q.view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
-        
-        # Compute attention
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        attn_output = torch.matmul(attn_weights, v)
-        
-        # Reshape back
-        attn_output = attn_output.transpose(1, 2).contiguous()
-        attn_output = attn_output.view(batch_size, self.cond_embed_dim)
-        
-        # Output projection
-        output = self.output_projections[layer_idx](attn_output)  # (batch, channels)
-        
-        # Broadcast over spatial dimension and add residually
-        output = output.unsqueeze(-1)  # (batch, channels, 1)
-        
-        return h + output
-
-
-class ResBlock1D(nn.Module):
-    """
-    Residual block with 1D circular convolutions.
-    
-    Structure:
-        h -> Conv1d -> Activation -> Conv1d -> + h (skip)
-                                    ^
-                                    |-- Conditioning
-    """
-    
     def __init__(
         self,
         channels: int,
-        kernel_size: int = 3,
+        kernel_size: int,
+        time_embed_dim: int,
+        dropout: float = 0.0,
     ):
         super().__init__()
         
-        # Compute padding for 'same' output size
-        # With circular padding, padding = (kernel_size - 1) // 2 works for odd kernels
+        # Padding for 'same' convolution with circular mode
         padding = (kernel_size - 1) // 2
         
+        # First sub-block
+        self.adaln1 = AdaLN1d(channels, time_embed_dim)
+        self.act1 = nn.SiLU()
         self.conv1 = nn.Conv1d(
             channels, channels, 
             kernel_size=kernel_size, 
-            padding=padding,
+            padding=padding, 
             padding_mode='circular'
         )
-        self.activation1 = nn.SiLU()
         
+        # Second sub-block
+        self.adaln2 = AdaLN1d(channels, time_embed_dim)
+        self.act2 = nn.SiLU()
         self.conv2 = nn.Conv1d(
-            channels, channels,
-            kernel_size=kernel_size,
-            padding=padding,
+            channels, channels, 
+            kernel_size=kernel_size, 
+            padding=padding, 
             padding_mode='circular'
         )
-        self.activation2 = nn.SiLU()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor, shape (batch, channels, spatial_dim)
-            
-        Returns:
-            Output tensor, shape (batch, channels, spatial_dim)
-        """
+        
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+    def forward(self, x: torch.Tensor, t_embed: torch.Tensor) -> torch.Tensor:
         residual = x
         
-        out = self.conv1(x)
-        out = self.activation1(out)
-        out = self.conv2(out)
-        out = out + residual
-        out = self.activation2(out)
+        # First sub-block
+        h = self.adaln1(x, t_embed)
+        h = self.act1(h)
+        h = self.conv1(h)
         
-        return out
+        # Second sub-block
+        h = self.adaln2(h, t_embed)
+        h = self.act2(h)
+        h = self.dropout(h)
+        h = self.conv2(h)
+        
+        return h + residual
 
 
 class ResNet1DVelocityNetwork(BaseVelocityNetwork):
     """
-    1D ResNet velocity network with periodic (circular) convolutions.
+    Fixed 1D ResNet Architecture for Data Assimilation.
     
-    Designed for systems with periodic boundary conditions like Lorenz96.
-    
-    Architecture:
-        1. Project state to channels: (batch, D) -> (batch, C, D)
-        2. Stack of ResBlock1D with conditioning after each block
-        3. Project back: (batch, C, D) -> (batch, D)
+    Features:
+    - Inpainting-style conditioning: [x, x_prev, y, mask] stacked at input.
+    - Global time conditioning via AdaLN.
+    - Sparse observation mapping.
+    - Circular convolutions for periodic boundary conditions.
     
     Args:
-        state_dim: Dimension of state space (also spatial dimension for conv)
-        channels: Number of channels in conv layers
-        num_blocks: Number of residual blocks
-        kernel_size: Kernel size for conv layers (should be odd). Default 5 to capture
-                     Lorenz96's x_{i-2} dependency (dynamics depend on i-2, i-1, i+1).
-        time_embed_dim: Dimension of time embedding
-        obs_dim: Dimension of observations
-        conditioning_method: One of ['concat', 'film', 'adaln', 'cross_attn']
-        cond_embed_dim: Embedding dimension for conditioning
-        num_attn_heads: Number of attention heads (for cross_attn only)
+        state_dim: Dimension of state space (spatial dimension).
+        obs_dim: Dimension of observations (can be < state_dim).
+        obs_indices: List of indices where observations occur. 
+                     If None and obs_dim < state_dim, assumes first obs_dim indices? 
+                     Better: Must be provided if obs_dim < state_dim for correct mapping.
+                     If None and obs_dim == state_dim, assumes full observation.
+        channels: Number of hidden channels.
+        num_blocks: Number of residual blocks.
+        kernel_size: Convolution kernel size (should be odd).
+        time_embed_dim: Dimension of time embedding.
     """
-    
     def __init__(
         self,
         state_dim: int,
+        obs_dim: int = 0,
+        obs_indices: Optional[List[int]] = None,
         channels: int = 64,
         num_blocks: int = 6,
-        kernel_size: int = 5,  # Changed from 3 to 5 to capture x_{i-2} dependency in Lorenz96
-        time_embed_dim: int = 32,
-        obs_dim: int = 0,
-        conditioning_method: str = 'adaln',
-        cond_embed_dim: int = 128,
-        num_attn_heads: int = 4,
+        kernel_size: int = 5,
+        time_embed_dim: int = 64,
+        dropout: float = 0.0,
     ):
-        super().__init__(state_dim, obs_dim, conditioning_method)
+        # We don't use the base class conditioning_method argument since this architecture is fixed
+        super().__init__(state_dim, obs_dim, conditioning_method='adaln')
         
+        self.state_dim = state_dim
+        self.obs_dim = obs_dim
         self.channels = channels
-        self.num_blocks = num_blocks
-        self.kernel_size = kernel_size
         self.time_embed_dim = time_embed_dim
         
-        # Time embedding
+        # Handle Observation Indices
+        if obs_indices is not None:
+            # Register as buffer so it moves to device and saves with model
+            self.register_buffer('obs_indices', torch.tensor(obs_indices, dtype=torch.long))
+        else:
+            # Set attribute to None directly (register_buffer expects Tensor)
+            self.obs_indices = None
+
+        # Time Embedding
         self.time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
         
-        # Conditioning dimension: y + time_embedding (x_prev is now input)
-        cond_dim = obs_dim + time_embed_dim
+        # Input Projection
+        # Channels: 
+        # 1 (x_s) 
+        # + 1 (x_prev) 
+        # + 1 (y_full) 
+        # + 1 (mask)
+        # = 4 input channels
+        self.input_channels = 4
         
-        # Create conditioning module based on method
-        if conditioning_method == 'concat':
-            self.conditioning = Conv1dConcatConditioning(channels, cond_dim)
-            # For concat, we add cond as extra channels at input
-            input_channels = 2 + cond_dim  # 1 for x, 1 for x_prev, cond_dim for conditioning
-        elif conditioning_method == 'film':
-            self.conditioning = Conv1dFiLMConditioning(
-                channels, cond_dim, num_blocks, cond_embed_dim
-            )
-            input_channels = 2  # x and x_prev
-        elif conditioning_method == 'adaln':
-            self.conditioning = Conv1dAdaLNConditioning(
-                channels, cond_dim, num_blocks, cond_embed_dim
-            )
-            input_channels = 2  # x and x_prev
-        elif conditioning_method == 'cross_attn':
-            self.conditioning = Conv1dCrossAttentionConditioning(
-                channels, cond_dim, num_blocks, num_attn_heads, cond_embed_dim
-            )
-            input_channels = 2  # x and x_prev
-        else:
-            raise ValueError(f"Unknown conditioning method: {conditioning_method}")
-        
-        # Input projection: lift to channel dimension
-        # Input shape: (batch, input_channels, state_dim)
         self.input_proj = nn.Conv1d(
-            input_channels, channels,
-            kernel_size=1,
+            self.input_channels, channels,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            padding_mode='circular'
         )
         
-        # Residual blocks
-        self.res_blocks = nn.ModuleList([
-            ResBlock1D(channels, kernel_size)
+        # Residual Blocks
+        self.blocks = nn.ModuleList([
+            ResBlock1DAdaLN(channels, kernel_size, time_embed_dim, dropout)
             for _ in range(num_blocks)
         ])
         
-        # Output projection: back to single channel
-        self.output_proj = nn.Conv1d(
-            channels, 1,
-            kernel_size=1,
-        )
-    
+        # Output Projection (Initialize to zero for better convergence?)
+        self.final_norm = nn.GroupNorm(1, channels)
+        self.final_act = nn.SiLU()
+        self.output_proj = nn.Conv1d(channels, 1, kernel_size=1)
+        
+        # Zero-init output projection for "start from identity/zero-velocity" behavior
+        nn.init.constant_(self.output_proj.weight, 0)
+        nn.init.constant_(self.output_proj.bias, 0)
+
     def forward(
         self, 
         x: torch.Tensor, 
@@ -422,69 +205,76 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute velocity v_θ(x, s | x_prev, y)
+        Compute velocity v(x, s | x_prev, y).
         
         Args:
-            x: Current position in flow, shape (batch, state_dim)
-            s: Flow time ∈ [0,1], shape (batch, 1) or (batch,)
-            x_prev: Conditioning (previous state), shape (batch, state_dim)
-            y: Observation conditioning, shape (batch, obs_dim) or None
+            x: Current state (batch, state_dim)
+            s: Time (batch, 1) or (batch,)
+            x_prev: Previous state (batch, state_dim)
+            y: Observations (batch, obs_dim) or None
             
         Returns:
-            Velocity vector, shape (batch, state_dim)
+            Velocity (batch, state_dim)
         """
-        batch_size = x.shape[0]
+        B = x.shape[0]
         
+        # 1. Time Embedding
         if s.dim() == 1:
             s = s.unsqueeze(1)
+        t_embed = self.time_embed(s)  # (B, time_embed_dim)
         
-        # Time embedding
-        s_embed = self.time_embed(s)  # (batch, time_embed_dim)
+        # 2. Prepare Observation Channels
+        # We need to construct y_full and mask
         
-        # Build conditioning vector: [y, s_embed] (x_prev moved to input)
+        # Initialize containers on correct device
+        y_full = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+        mask = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+        
         if self.obs_dim > 0 and y is not None:
-            cond = torch.cat([y, s_embed], dim=-1)
-        elif self.obs_dim > 0:
-            # Expected observations but got None - pad with zeros
-            y_dummy = torch.zeros(batch_size, self.obs_dim, 
-                                 device=x.device, dtype=x.dtype)
-            cond = torch.cat([y_dummy, s_embed], dim=-1)
-        else:
-            # cond = torch.cat([x_prev, s_embed], dim=-1) # Old way
-            cond = s_embed
-        
-        # Reshape x for conv: (batch, state_dim) -> (batch, 1, state_dim)
-        x_conv = x.unsqueeze(1)
-        
-        # Reshape x_prev for conv: (batch, state_dim) -> (batch, 1, state_dim)
-        x_prev_conv = x_prev.unsqueeze(1)
-        
-        # Stack x and x_prev as input channels: (batch, 2, state_dim)
-        x_input = torch.cat([x_conv, x_prev_conv], dim=1)
-        
-        # Handle input based on conditioning method
-        if self.conditioning_method == 'concat':
-            # Expand conditioning to spatial dimension and concatenate as channels
-            cond_spatial = cond.unsqueeze(-1).expand(-1, -1, self.state_dim)
-            # cond_spatial: (batch, cond_dim, state_dim)
-            x_input = torch.cat([x_input, cond_spatial], dim=1)
-            # x_input: (batch, 2 + cond_dim, state_dim)
-        
-        # Input projection
-        h = self.input_proj(x_input)  # (batch, channels, state_dim)
-        
-        # Residual blocks with conditioning
-        for i, block in enumerate(self.res_blocks):
-            h = block(h)
-            # Apply conditioning after each block (for non-concat methods)
-            if self.conditioning_method != 'concat':
-                h = self.conditioning(h, cond, layer_idx=i)
-        
-        # Output projection
-        out = self.output_proj(h)  # (batch, 1, state_dim)
-        
-        # Reshape back: (batch, 1, state_dim) -> (batch, state_dim)
-        out = out.squeeze(1)
-        
-        return out
+            if self.obs_indices is not None:
+                # Sparse observations with known indices
+                # y is (B, obs_dim)
+                # We scatter y into y_full at obs_indices
+                
+                # Check dimensions match
+                if y.shape[1] != self.obs_dim:
+                    # If passed y doesn't match expected obs_dim, try to handle or warn
+                    pass
 
+                # Scatter logic:
+                # y_full[:, indices] = y
+                y_full[:, self.obs_indices] = y
+                mask[:, self.obs_indices] = 1.0
+                
+            elif y.shape[1] == self.state_dim:
+                # Dense observations (or pre-padded)
+                y_full = y
+                # If dense, assume all observed (mask=1) unless y contains specific missing values (not handled here)
+                mask = torch.ones_like(mask)
+            else:
+                # obs_indices is None BUT y is smaller than state_dim
+                # Fallback: assume first obs_dim indices (e.g. truncated state)
+                y_full[:, :y.shape[1]] = y
+                mask[:, :y.shape[1]] = 1.0
+
+        # 3. Stack Inputs
+        # Reshape inputs to (B, 1, L)
+        x_in = x.unsqueeze(1)          # (B, 1, L)
+        x_prev_in = x_prev.unsqueeze(1)# (B, 1, L)
+        y_in = y_full.unsqueeze(1)     # (B, 1, L)
+        mask_in = mask.unsqueeze(1)    # (B, 1, L)
+        
+        # Stack channels: (B, 4, L)
+        net_input = torch.cat([x_in, x_prev_in, y_in, mask_in], dim=1)
+        
+        # 4. Forward Pass
+        h = self.input_proj(net_input)
+        
+        for block in self.blocks:
+            h = block(h, t_embed)
+            
+        h = self.final_norm(h)
+        h = self.final_act(h)
+        out = self.output_proj(h) # (B, 1, L)
+        
+        return out.squeeze(1) # (B, L)
