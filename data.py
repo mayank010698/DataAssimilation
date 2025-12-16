@@ -91,6 +91,7 @@ class DynamicalSystem(ABC):
         k3 = self.dynamics(0, x + dt * k2 / 2)
         k4 = self.dynamics(0, x + dt * k3)
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+    
     def integrate(self, x0: torch.Tensor, n_steps: int, dt: float = None) -> torch.Tensor:
         """Integrate the system forward in time"""
         if dt is None:
