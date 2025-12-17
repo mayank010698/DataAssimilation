@@ -170,10 +170,13 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         # Channels: 
         # 1 (x_s) 
         # + 1 (x_prev) 
-        # + 1 (y_full) 
-        # + 1 (mask)
-        # = 4 input channels
-        self.input_channels = 4
+        # + 1 (y_full) [if obs_dim > 0]
+        # + 1 (mask)   [if obs_dim > 0]
+        
+        if self.obs_dim > 0:
+            self.input_channels = 4
+        else:
+            self.input_channels = 2
         
         self.input_proj = nn.Conv1d(
             self.input_channels, channels,
@@ -226,46 +229,55 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         # 2. Prepare Observation Channels
         # We need to construct y_full and mask
         
-        # Initialize containers on correct device
-        y_full = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
-        mask = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+        # Initialize containers
+        y_full = None
+        mask = None
         
-        if self.obs_dim > 0 and y is not None:
-            if self.obs_indices is not None:
-                # Sparse observations with known indices
-                # y is (B, obs_dim)
-                # We scatter y into y_full at obs_indices
-                
-                # Check dimensions match
-                if y.shape[1] != self.obs_dim:
-                    # If passed y doesn't match expected obs_dim, try to handle or warn
-                    pass
+        if self.obs_dim > 0:
+            y_full = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+            mask = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
+            
+            if y is not None:
+                if self.obs_indices is not None:
+                    # Sparse observations with known indices
+                    # y is (B, obs_dim)
+                    # We scatter y into y_full at obs_indices
+                    
+                    # Check dimensions match
+                    if y.shape[1] != self.obs_dim:
+                        # If passed y doesn't match expected obs_dim, try to handle or warn
+                        pass
 
-                # Scatter logic:
-                # y_full[:, indices] = y
-                y_full[:, self.obs_indices] = y
-                mask[:, self.obs_indices] = 1.0
-                
-            elif y.shape[1] == self.state_dim:
-                # Dense observations (or pre-padded)
-                y_full = y
-                # If dense, assume all observed (mask=1) unless y contains specific missing values (not handled here)
-                mask = torch.ones_like(mask)
-            else:
-                # obs_indices is None BUT y is smaller than state_dim
-                # Fallback: assume first obs_dim indices (e.g. truncated state)
-                y_full[:, :y.shape[1]] = y
-                mask[:, :y.shape[1]] = 1.0
+                    # Scatter logic:
+                    # y_full[:, indices] = y
+                    y_full[:, self.obs_indices] = y
+                    mask[:, self.obs_indices] = 1.0
+                    
+                elif y.shape[1] == self.state_dim:
+                    # Dense observations (or pre-padded)
+                    y_full = y
+                    # If dense, assume all observed (mask=1) unless y contains specific missing values (not handled here)
+                    mask = torch.ones_like(mask)
+                else:
+                    # obs_indices is None BUT y is smaller than state_dim
+                    # Fallback: assume first obs_dim indices (e.g. truncated state)
+                    y_full[:, :y.shape[1]] = y
+                    mask[:, :y.shape[1]] = 1.0
 
         # 3. Stack Inputs
         # Reshape inputs to (B, 1, L)
         x_in = x.unsqueeze(1)          # (B, 1, L)
         x_prev_in = x_prev.unsqueeze(1)# (B, 1, L)
-        y_in = y_full.unsqueeze(1)     # (B, 1, L)
-        mask_in = mask.unsqueeze(1)    # (B, 1, L)
         
-        # Stack channels: (B, 4, L)
-        net_input = torch.cat([x_in, x_prev_in, y_in, mask_in], dim=1)
+        if self.obs_dim > 0:
+            y_in = y_full.unsqueeze(1)     # (B, 1, L)
+            mask_in = mask.unsqueeze(1)    # (B, 1, L)
+            
+            # Stack channels: (B, 4, L)
+            net_input = torch.cat([x_in, x_prev_in, y_in, mask_in], dim=1)
+        else:
+            # Stack channels: (B, 2, L)
+            net_input = torch.cat([x_in, x_prev_in], dim=1)
         
         # 4. Forward Pass
         h = self.input_proj(net_input)

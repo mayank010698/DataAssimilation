@@ -146,6 +146,7 @@ def train_rectified_flow(
         num_workers=num_workers,
         window=1,
         use_observations=use_observations,
+        obs_indices=obs_indices,
     )
     
     # Create model

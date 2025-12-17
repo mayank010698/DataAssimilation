@@ -56,7 +56,7 @@ def create_velocity_network(
             obs_indices: Optional[List[int]] = None
             dropout: float = 0.0
     """
-    if architecture == 'mlp':
+    if architecture == 'mlp' or architecture == 'mlp_fixed':
         return MLPVelocityNetwork(
             state_dim=state_dim,
             obs_dim=obs_dim,
