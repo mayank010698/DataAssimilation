@@ -14,4 +14,3 @@ datasets/
 rf_runs/
 logs/
 wandb/
-scripts/

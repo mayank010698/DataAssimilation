@@ -1,0 +1,238 @@
+#!/bin/bash
+
+# Get the directory where this script is located
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+# Change to project root so relative paths work
+cd "$SCRIPT_DIR/.." || exit
+
+# Setup PYTHONPATH
+export PYTHONPATH=$(pwd)
+
+# Create logs directory if it doesn't exist
+mkdir -p logs
+
+echo "=========================================="
+echo "Lorenz96 (50D) Training Experiments"
+echo "=========================================="
+echo "Configuration:"
+echo "- 8 Experiments total (4 No Noise, 4 With Noise)"
+echo "- Variations: Full (50), Half (25), 1/5 (10), No Obs"
+echo "- Architecture: ResNet1D"
+echo "=========================================="
+
+# Common parameters
+STATE_DIM=50
+BATCH_SIZE=1024
+LR=3e-4
+MAX_EPOCHS=500
+CHANNELS=64
+NUM_BLOCKS=10
+KERNEL_SIZE=5
+COND_EMBED_DIM=128
+
+# Dataset paths
+DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan"
+DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100"
+
+# Indices strings
+INDICES_50="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49"
+INDICES_25="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24"
+INDICES_10="0,1,2,3,4,5,6,7,8,9"
+
+# --- GROUP 1: NO PROCESS NOISE (GPU 0-3) ---
+
+# 1. Full Obs (50) - GPU 0
+echo "Starting Exp 1: No Noise, Full Obs (50) (GPU 0)..."
+CUDA_VISIBLE_DEVICES=0 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_NO_NOISE" \
+    --output_dir "rf_runs/l96_nonoise_full" \
+    --state_dim $STATE_DIM \
+    --obs_dim 50 \
+    --obs_indices "$INDICES_50" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_nonoise_full.log 2>&1 &
+PID1=$!
+echo "Started PID $PID1"
+
+# 2. Half Obs (25) - GPU 1
+echo "Starting Exp 2: No Noise, Half Obs (25) (GPU 1)..."
+CUDA_VISIBLE_DEVICES=1 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_NO_NOISE" \
+    --output_dir "rf_runs/l96_nonoise_half" \
+    --state_dim $STATE_DIM \
+    --obs_dim 25 \
+    --obs_indices "$INDICES_25" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_nonoise_half.log 2>&1 &
+PID2=$!
+echo "Started PID $PID2"
+
+# 3. 1/5 Obs (10) - GPU 2
+echo "Starting Exp 3: No Noise, 1/5 Obs (10) (GPU 2)..."
+CUDA_VISIBLE_DEVICES=2 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_NO_NOISE" \
+    --output_dir "rf_runs/l96_nonoise_tenth" \
+    --state_dim $STATE_DIM \
+    --obs_dim 10 \
+    --obs_indices "$INDICES_10" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_nonoise_tenth.log 2>&1 &
+PID3=$!
+echo "Started PID $PID3"
+
+# 4. No Obs - GPU 3
+echo "Starting Exp 4: No Noise, No Obs (GPU 3)..."
+CUDA_VISIBLE_DEVICES=3 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_NO_NOISE" \
+    --output_dir "rf_runs/l96_nonoise_no_obs" \
+    --state_dim $STATE_DIM \
+    --obs_dim 0 \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_nonoise_no_obs.log 2>&1 &
+PID4=$!
+echo "Started PID $PID4"
+
+# --- GROUP 2: WITH PROCESS NOISE 0.1 (GPU 4-7) ---
+
+# 5. Full Obs (50) - GPU 4
+echo "Starting Exp 5: Noise 0.1, Full Obs (50) (GPU 4)..."
+CUDA_VISIBLE_DEVICES=4 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_WITH_NOISE" \
+    --output_dir "rf_runs/l96_noise0p1_full" \
+    --state_dim $STATE_DIM \
+    --obs_dim 50 \
+    --obs_indices "$INDICES_50" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_noise0p1_full.log 2>&1 &
+PID5=$!
+echo "Started PID $PID5"
+
+# 6. Half Obs (25) - GPU 5
+echo "Starting Exp 6: Noise 0.1, Half Obs (25) (GPU 5)..."
+CUDA_VISIBLE_DEVICES=5 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_WITH_NOISE" \
+    --output_dir "rf_runs/l96_noise0p1_half" \
+    --state_dim $STATE_DIM \
+    --obs_dim 25 \
+    --obs_indices "$INDICES_25" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_noise0p1_half.log 2>&1 &
+PID6=$!
+echo "Started PID $PID6"
+
+# 7. 1/5 Obs (10) - GPU 6
+echo "Starting Exp 7: Noise 0.1, 1/5 Obs (10) (GPU 6)..."
+CUDA_VISIBLE_DEVICES=6 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_WITH_NOISE" \
+    --output_dir "rf_runs/l96_noise0p1_tenth" \
+    --state_dim $STATE_DIM \
+    --obs_dim 10 \
+    --obs_indices "$INDICES_10" \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --use_observations \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_noise0p1_tenth.log 2>&1 &
+PID7=$!
+echo "Started PID $PID7"
+
+# 8. No Obs - GPU 7
+echo "Starting Exp 8: Noise 0.1, No Obs (GPU 7)..."
+CUDA_VISIBLE_DEVICES=7 nohup python proposals/train_rf.py \
+    --data_dir "$DATA_DIR_WITH_NOISE" \
+    --output_dir "rf_runs/l96_noise0p1_no_obs" \
+    --state_dim $STATE_DIM \
+    --obs_dim 0 \
+    --architecture resnet1d \
+    --channels $CHANNELS \
+    --num_blocks $NUM_BLOCKS \
+    --kernel_size $KERNEL_SIZE \
+    --train-cond-method adaln \
+    --cond_embed_dim $COND_EMBED_DIM \
+    --batch_size $BATCH_SIZE \
+    --learning_rate $LR \
+    --max_epochs $MAX_EPOCHS \
+    --gpus 1 \
+    --evaluate \
+    > logs/l96_noise0p1_no_obs.log 2>&1 &
+PID8=$!
+echo "Started PID $PID8"
+
+echo "=========================================="
+echo "All 8 training experiments started in background."
+echo "Logs are being written to logs/"
+echo "Monitor with: tail -f logs/l96_*.log"
+echo "=========================================="
