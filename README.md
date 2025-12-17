@@ -1,25 +1,41 @@
 # Data Assimilation with Particle Filters
 
+## How to Run for Lorenz 96
+* Use commands such as in `scripts/gen_96.sh` to generate datasets
+* Use commands such as in `scripts/train_96.sh` to train RF proposals
+* Use commands such as in `scripts/eval_proposal_96.sh` to optionally evaluate proposals in an autoregressive manner (like in FlowDAS)
+* Use commands such as in `scripts/eval_96.sh` to run a BPF with a standard transition proposal or with learned flow proposal
+
 ## Project Structure
 
 ```
-├── data.py                  # Core data generation, Lorenz63 system, datasets
-├── run.py                   # Main evaluation script with visualization
-├── eval.py                  # Comprehensive evaluation across trajectories
+├── data.py                  # Core data generation
+├── generate.py              # Data generation script
+├── generate_l96.py          # Data generation for Lorenz 96
+├── run.py                   # Main evaluation script
+├── eval.py                  # Evaluation script
+├── eval_proposal_dist.py    # Evaluation of proposal distributions
 ├── models/                  # Particle filter implementations
-│   ├── base_pf.py          # Abstract base class for filtering methods
-│   ├── bpf.py              # Bootstrap Particle Filter implementation
-│   ├── proposals.py        # Proposal distribution classes
+│   ├── base_pf.py          # Abstract base class
+│   ├── bpf.py              # Bootstrap Particle Filter
+│   ├── flow_pf.py          # Flow-based Particle Filter
+│   ├── score_pf.py         # Score-based Particle Filter
+│   └── proposals.py        # Proposal distribution classes
+├── proposals/              # Proposal training and architectures
+│   ├── architectures/      # Neural network architectures
+│   │   ├── mlp.py
+│   │   ├── resnet1d.py
+│   │   └── ...
+│   ├── rectified_flow.py   # Rectified Flow model
+│   ├── deterministic_model.py # Deterministic model
+│   ├── train_rf.py         # Training script for RF
+│   ├── train_deterministic.py # Training script for deterministic models
 │   └── ...
-├── proposals/              # Rectified Flow training
-│   ├── rectified_flow.py   # RF model implementation
-│   ├── rf_dataset.py       # Dataset for RF training
-│   └── train_rf.py         # Training script for RF models
-├── rf_runs/                # Trained RF model checkpoints
-├── lorenz63_data_*/        # Generated trajectory datasets
-├── *.png                   # Experiment result plots
-├── run.sbatch              # SLURM job script for evaluation
-└── train.sbatch            # SLURM job script for RF training
+├── scripts/                # Shell scripts for running experiments
+│   ├── gen_*.sh            # Data generation scripts
+│   ├── train_*.sh          # Training scripts
+│   ├── eval_*.sh           # Evaluation scripts
+│   └── ...
 ```
 
 ## Features
