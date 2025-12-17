@@ -27,6 +27,9 @@ class DataAssimilationConfig:
     obs_components: list = None
     observation_operator: Union[Callable, np.ndarray, torch.Tensor, None] = None
 
+    # Process noise (for stochastic trajectory generation)
+    process_noise_std: float = 0.0  # 0.0 = deterministic dynamics
+
     # Data splits
     train_ratio: float = 0.8
     val_ratio: float = 0.1
@@ -91,14 +94,20 @@ class DynamicalSystem(ABC):
         k3 = self.dynamics(0, x + dt * k2 / 2)
         k4 = self.dynamics(0, x + dt * k3)
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
-    
-    def integrate(self, x0: torch.Tensor, n_steps: int, dt: float = None) -> torch.Tensor:
-        """Integrate the system forward in time"""
+    def integrate(
+        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0
+    ) -> torch.Tensor:
+        """Integrate the system forward in time.
+        
+        Args:
+            x0: Initial state(s), shape (state_dim,) or (batch, state_dim)
+            n_steps: Number of time steps to integrate
+            dt: Time step size (defaults to config.dt)
+            process_noise_std: Standard deviation of additive Gaussian process noise.
+                              If > 0, noise is added after each RK4 step: x_{t+1} = RK4(x_t) + σ·ε
+        """
         if dt is None:
             dt = self.config.dt
-            
-        t_span = (0, (n_steps - 1) * dt)
-        t_eval = torch.arange(0, n_steps * dt, dt)
 
         # Ensure input is tensor
         if not isinstance(x0, torch.Tensor):
@@ -115,6 +124,9 @@ class DynamicalSystem(ABC):
         # We start from t=0, so we need n_steps-1 more steps to get n_steps total points
         for _ in range(n_steps - 1):
             x_curr = self.rk4_step(x_curr, dt)
+            # Add process noise if specified (stochastic dynamics)
+            if process_noise_std > 0:
+                x_curr = x_curr + process_noise_std * torch.randn_like(x_curr)
             trajectories.append(x_curr)
             
         # Stack along time dimension: (batch, time, state)
@@ -306,10 +318,29 @@ class Lorenz96(DynamicalSystem):
             eps = torch.randn(n_samples, self.dim, device=self.init_mean.device)
             return self.init_mean.unsqueeze(0) + self.init_std * eps
 
-    def preprocess(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-    def postprocess(self, x: torch.Tensor) -> torch.Tensor:
-        return x
+    def preprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        """Scale data using init_mean and init_std (loaded from data file)."""
+        if isinstance(x, np.ndarray):
+            init_mean_np = self.init_mean.numpy() if isinstance(self.init_mean, torch.Tensor) else np.asarray(self.init_mean)
+            init_std_np = self.init_std.numpy() if isinstance(self.init_std, torch.Tensor) else np.asarray(self.init_std)
+            return (x - init_mean_np) / init_std_np
+        
+        device = x.device
+        init_mean = self.init_mean.to(device) if isinstance(self.init_mean, torch.Tensor) else torch.as_tensor(self.init_mean, device=device)
+        init_std = self.init_std.to(device) if isinstance(self.init_std, torch.Tensor) else torch.as_tensor(self.init_std, device=device)
+        return (x - init_mean) / init_std
+
+    def postprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        """Unscale data using init_mean and init_std (loaded from data file)."""
+        if isinstance(x, np.ndarray):
+            init_mean_np = self.init_mean.numpy() if isinstance(self.init_mean, torch.Tensor) else np.asarray(self.init_mean)
+            init_std_np = self.init_std.numpy() if isinstance(self.init_std, torch.Tensor) else np.asarray(self.init_std)
+            return init_mean_np + init_std_np * x
+            
+        device = x.device
+        init_mean = self.init_mean.to(device) if isinstance(self.init_mean, torch.Tensor) else torch.as_tensor(self.init_mean, device=device)
+        init_std = self.init_std.to(device) if isinstance(self.init_std, torch.Tensor) else torch.as_tensor(self.init_std, device=device)
+        return init_mean + init_std * x
 
 class DataAssimilationDataset(Dataset):
     """Dataset for data assimilation experiments"""
@@ -538,62 +569,74 @@ class DataAssimilationDataModule(pl.LightningDataModule):
 
     def _generate_data(self):
         """Generate trajectory data (both unscaled and scaled versions)"""
-        x0 = self.system.sample_initial_state(self.config.num_trajectories)
-
         total_steps = self.config.warmup_steps + self.config.len_trajectory
-        trajectories = self.system.integrate(x0, total_steps, self.config.dt)
-
-        # Keep trajectories unscaled initially
-        trajectories = trajectories[:, self.config.warmup_steps :, :]
-
-        # Generate observations mask
-        obs_mask = np.zeros(self.config.len_trajectory, dtype=bool)
-        obs_mask[:: self.config.obs_frequency] = True
-
-        obs_time_indices = np.where(obs_mask)[0]
-        observations = []
-
-        # Generate observations from unscaled trajectories
-        # Use torch loop to keep things in tensor land until the end
-        # trajectories is (N, T, D)
-        for t in obs_time_indices:
-            obs_t = self.system.observe(trajectories[:, t, :], add_noise=True)
-            observations.append(obs_t)
-
-        observations = torch.stack(observations, dim=1)
         
-        # Convert to numpy for splitting and saving
-        trajectories_np = trajectories.cpu().numpy()
-        observations_np = observations.cpu().numpy()
-
+        # Calculate split sizes
         n_train = int(self.config.train_ratio * self.config.num_trajectories)
         n_val = int(self.config.val_ratio * self.config.num_trajectories)
-
-        # Split unscaled data
+        n_test = self.config.num_trajectories - n_train - n_val
+        
+        process_noise_std = self.config.process_noise_std
+        if process_noise_std > 0:
+            logging.info(f"Generating training data with process noise std={process_noise_std}")
+        
+        # Generate observations mask (same for all splits)
+        obs_mask = np.zeros(self.config.len_trajectory, dtype=bool)
+        obs_mask[:: self.config.obs_frequency] = True
+        obs_time_indices = np.where(obs_mask)[0]
+        
+        def generate_split(n_samples: int, use_process_noise: bool) -> Tuple[np.ndarray, np.ndarray]:
+            """Generate trajectories and observations for a split."""
+            if n_samples == 0:
+                state_dim = self.system.state_dim
+                obs_dim = self.system.obs_dim
+                return (
+                    np.zeros((0, self.config.len_trajectory, state_dim)),
+                    np.zeros((0, len(obs_time_indices), obs_dim)),
+                )
+            
+            x0 = self.system.sample_initial_state(n_samples)
+            noise_std = process_noise_std if use_process_noise else 0.0
+            trajectories = self.system.integrate(x0, total_steps, self.config.dt, process_noise_std=noise_std)
+            
+            # Remove warmup steps
+            trajectories = trajectories[:, self.config.warmup_steps:, :]
+            
+            # Generate observations
+            observations = []
+            for t in obs_time_indices:
+                obs_t = self.system.observe(trajectories[:, t, :], add_noise=True)
+                observations.append(obs_t)
+            observations = torch.stack(observations, dim=1)
+            
+            return trajectories.cpu().numpy(), observations.cpu().numpy()
+        
+        # Generate each split separately
+        # Training data: with process noise (if configured)
+        train_traj, train_obs = generate_split(n_train, use_process_noise=True)
+        # Validation and test data: always deterministic
+        val_traj, val_obs = generate_split(n_val, use_process_noise=False)
+        test_traj, test_obs = generate_split(n_test, use_process_noise=False)
+        
         splits_unscaled = {
-            "train": {
-                "trajectories": trajectories_np[:n_train],
-                "observations": observations_np[:n_train],
-            },
-            "val": {
-                "trajectories": trajectories_np[n_train : n_train + n_val],
-                "observations": observations_np[n_train : n_train + n_val],
-            },
-            "test": {
-                "trajectories": trajectories_np[n_train + n_val :],
-                "observations": observations_np[n_train + n_val :],
-            },
+            "train": {"trajectories": train_traj, "observations": train_obs},
+            "val": {"trajectories": val_traj, "observations": val_obs},
+            "test": {"trajectories": test_traj, "observations": test_obs},
         }
+        
+        # Get state dim from first non-empty split for scaler computation
+        state_dim = train_traj.shape[-1] if n_train > 0 else val_traj.shape[-1]
+        obs_dim = train_obs.shape[-1] if n_train > 0 else val_obs.shape[-1]
 
         # Fit scaler on train trajectories
-        train_traj_flat = splits_unscaled["train"]["trajectories"].reshape(-1, trajectories_np.shape[-1])
+        train_traj_flat = splits_unscaled["train"]["trajectories"].reshape(-1, state_dim)
         scaler_mean = np.mean(train_traj_flat, axis=0)
         scaler_std = np.std(train_traj_flat, axis=0)
         # Avoid division by zero
         scaler_std = np.where(scaler_std < 1e-8, 1.0, scaler_std)
 
         # Fit scaler on train observations
-        train_obs_flat = splits_unscaled["train"]["observations"].reshape(-1, observations_np.shape[-1])
+        train_obs_flat = splits_unscaled["train"]["observations"].reshape(-1, obs_dim)
         obs_scaler_mean = np.mean(train_obs_flat, axis=0)
         obs_scaler_std = np.std(train_obs_flat, axis=0)
         # Avoid division by zero
@@ -846,6 +889,10 @@ def dict_to_config(config_dict: Dict[str, Any]) -> DataAssimilationConfig:
     
     config_dict["observation_operator"] = observation_operator
     
+    # Backward compatibility: default process_noise_std if not present
+    if "process_noise_std" not in config_dict:
+        config_dict["process_noise_std"] = 0.0
+    
     # Convert system_params lists back to numpy arrays if needed (or just leave as lists/values)
     # DynamicalSystem can handle them. But preserving original behavior is good.
     if config_dict.get("system_params"):
@@ -865,7 +912,12 @@ def generate_dataset_directory_name(
 ) -> str:
     """Generate comprehensive directory name from config parameters"""
     obs_op_type = _get_observation_operator_type(config.observation_operator)
-    obs_comp_str = ",".join(map(str, config.obs_components))
+    
+    # For many obs_components (like Lorenz96), just indicate count
+    if len(config.obs_components) > 5:
+        obs_comp_str = f"{len(config.obs_components)}of{config.system_params.get('dim', len(config.obs_components))}"
+    else:
+        obs_comp_str = ",".join(map(str, config.obs_components))
     
     # Build directory name with key parameters
     parts = [
@@ -878,6 +930,10 @@ def generate_dataset_directory_name(
         f"comp{obs_comp_str}",
         obs_op_type,
     ]
+    
+    # Add process noise to directory name if non-zero
+    if config.process_noise_std > 0:
+        parts.append(f"pnoise{config.process_noise_std:.3f}".replace(".", "p"))
     
     return "_".join(parts)
 

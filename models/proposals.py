@@ -107,7 +107,16 @@ class TransitionProposal(ProposalDistribution):
              reduce_dim = 0
              
         log_prob = -0.5 * torch.sum(diff**2 / noise_var, dim=reduce_dim)
-        log_prob -= 0.5 * torch.sum(torch.log(2 * np.pi * noise_var)) # Note: this sum might need adjustment for dimensions
+        
+        # Log determinant term
+        # If noise_std is scalar, we need to multiply by state_dim
+        # If noise_std is vector (D,), sum handles it
+        if noise_std.ndim == 0:
+            log_det = self.state_dim * torch.log(noise_std)
+        else:
+            log_det = torch.sum(torch.log(noise_std))
+            
+        log_prob -= (0.5 * self.state_dim * np.log(2 * np.pi) + log_det)
         
         return log_prob
 
@@ -252,6 +261,9 @@ class RectifiedFlowProposal(ProposalDistribution):
         system: Optional[Any] = None,
         obs_mean: Optional[torch.Tensor] = None,
         obs_std: Optional[torch.Tensor] = None,
+        mc_guidance: bool = False,
+        guidance_scale: float = 1.0,
+        obs_components: Optional[list] = None,
     ):
         """
         Args:
@@ -262,6 +274,9 @@ class RectifiedFlowProposal(ProposalDistribution):
             system: DynamicalSystem instance (required for pre/post processing)
             obs_mean: Mean of observations for scaling (if preprocessing used)
             obs_std: Std of observations for scaling (if preprocessing used)
+            mc_guidance: Whether to use Monte Carlo guidance
+            guidance_scale: Scale for guidance
+            obs_components: List of observed state indices (needed for guidance)
         """
         import sys
         from pathlib import Path
@@ -288,6 +303,27 @@ class RectifiedFlowProposal(ProposalDistribution):
             self.rf_model.num_likelihood_steps = num_likelihood_steps
         if num_sampling_steps is not None:
             self.rf_model.num_sampling_steps = num_sampling_steps
+            
+        # Guidance settings
+        if mc_guidance:
+            self.rf_model.mc_guidance = True
+        if guidance_scale != 1.0:
+            self.rf_model.guidance_scale = guidance_scale
+            
+        # Construct observation_fn for guidance if enabled
+        self.observation_fn = None
+        if self.rf_model.mc_guidance and obs_components is not None:
+            self.obs_components = obs_components
+            
+            # NOTE: guidance is computed in SCALED space.
+            # So observation_fn needs to act on scaled x.
+            # But obs_components indices are valid for state vector regardless of scaling
+            # (assuming scaling is component-wise or linear).
+            def obs_fn(x):
+                # x is (..., state_dim)
+                return x[..., self.obs_components]
+            
+            self.observation_fn = obs_fn
             
         # Get state_dim from model
         self.state_dim = self.rf_model.state_dim
@@ -325,7 +361,11 @@ class RectifiedFlowProposal(ProposalDistribution):
 
         # RF model's sample method already handles the interface
         # RF expects and produces scaled data
-        x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt)
+        # Pass observation_fn if needed for guidance
+        if self.rf_model.mc_guidance and self.observation_fn is not None:
+            x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt, observation_fn=self.observation_fn)
+        else:
+            x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt)
         
         # Postprocess output (scaled -> unscaled)
         if self.system is not None:
@@ -375,4 +415,26 @@ class RectifiedFlowProposal(ProposalDistribution):
         # RF model's log_prob method already handles the interface
         # We compute log probability in scaled space.
         # Since weight update does normalization, we don't strictly need Jacobian correction.
+        # IMPORTANT: If using guidance, we need sample_and_log_prob equivalent logic? 
+        # Actually RFProposal.log_prob currently does NOT support guidance divergence correction natively 
+        # unless we modify it or call sample_and_log_prob during sampling (which BPF separates).
+        
+        # Current BPF implementation calls sample() then log_prob().
+        # If guidance was used in sample(), x_curr was generated from a guided process.
+        # To get the correct density q_guided(x_curr), we MUST account for the guidance term in the divergence.
+        # RFProposal.log_prob needs to support guidance too if we want correct weights.
+        
+        # Wait, RFProposal.log_prob integrates BACKWARDS from x_curr to x_0.
+        # Does the guidance term apply in reverse? 
+        # Actually, for standard CNF log-likelihood:
+        # log p(x_1) = log p(x_0) - \int div(v) dt
+        # This holds regardless of how x_1 was generated, as long as v is the vector field OF THE MODEL/GUIDED PROCESS.
+        # So we just need to ensure we use the guided velocity field in log_prob calculation.
+        
+        # RFProposal.log_prob uses self.velocity_net.
+        # We haven't updated RFProposal.log_prob to use guidance yet in previous steps?
+        # Let's check rectified_flow.py.
+        # Ah, we added sample_and_log_prob but log_prob itself might not use guidance?
+        # Let's check.
+        
         return self.rf_model.log_prob(x_curr, x_prev, y_curr, dt)

@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import logging
 import time
 
@@ -147,7 +147,13 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         # Sum over state dimensions (D)
         # If noise_std is scalar or vector (D,), broadcasting works.
         log_prob = -0.5 * torch.sum(diff**2 / noise_var, dim=1)
-        log_prob -= 0.5 * torch.sum(torch.log(2 * np.pi * noise_var))
+        
+        if noise_std.ndim == 0:
+            log_det = self.state_dim * torch.log(noise_std)
+        else:
+            log_det = torch.sum(torch.log(noise_std))
+            
+        log_prob -= (0.5 * self.state_dim * np.log(2 * np.pi) + log_det)
 
         return log_prob
 
@@ -247,7 +253,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
             f"Importance weights: max_iw = {max_iw:.3f}, mean_iw = {mean_iw:.3f}"
         )
 
-    def resample(self) -> bool:
+    def resample(self) -> Tuple[bool, float]:
         """Systematic resampling of particles"""
         max_log_weight = torch.max(self.log_weights)
         log_weights_normalized = self.log_weights - max_log_weight
@@ -260,10 +266,10 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
                 torch.ones(self.n_particles, device=self.device) / self.n_particles
             )
             self.log_weights = torch.log(self.weights)
-            return False
+            return False, self.n_particles
 
         self.weights = weights_unnormalized / weight_sum
-        ess = 1.0 / torch.sum(self.weights**2)
+        ess = (1.0 / torch.sum(self.weights**2)).item()
         resample_threshold = self.n_particles / 3
 
         if ess < resample_threshold:
@@ -291,10 +297,10 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
 
             self.resampling_history.append(self.step_count)
             logging.debug(f"Resampled at step {self.step_count}, ESS={ess:.1f}")
-            return True
+            return True, ess
 
         logging.debug(f"No resampling needed, ESS = {ess:.1f}")
-        return False
+        return False, ess
 
     def get_state_estimate(self) -> torch.Tensor:
         """Get current state estimate (weighted mean)"""
@@ -363,7 +369,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         start_time = time.perf_counter()
         self.step_count += 1
         metrics = super().step(x_prev, x_curr, y_curr, dt, trajectory_idx, time_idx)
-        resampled = self.resample()
+        resampled, ess_pre = self.resample()
         
         if self.last_proposal_log_probs is not None:
              metrics["proposal_log_prob_mean"] = self.last_proposal_log_probs.mean().item()
@@ -372,6 +378,8 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
              metrics["obs_log_prob_std"] = self.last_obs_log_likelihoods.std().item()
 
         metrics["resampled"] = resampled
+        metrics["ess_pre_resample"] = ess_pre
+        # Compute current ESS (will be N if resampled)
         metrics["ess"] = (1.0 / torch.sum(self.weights**2)).item()
         metrics["n_effective_particles"] = metrics["ess"]
         metrics["max_weight"] = torch.max(self.weights).item()
@@ -602,10 +610,12 @@ class BootstrapParticleFilter(FilteringMethod):
 
         self.log_weights += importance_weights
 
-    def resample(self) -> List[bool]:
+    def resample(self) -> Tuple[List[bool], torch.Tensor]:
         """
         Systematic resampling of particles (Batched)
-        Returns list of booleans indicating if resampling happened for each batch item
+        Returns:
+            - list of booleans indicating if resampling happened for each batch item
+            - tensor of ESS values before resampling (Batch,)
         """
         batch_size = self.log_weights.shape[0]
         
@@ -634,12 +644,9 @@ class BootstrapParticleFilter(FilteringMethod):
         
         if not needs_resample.any():
              self.log_weights = torch.log(self.weights) # Just update log weights
-             return resampled_flags
+             return resampled_flags, ess
 
         # Perform resampling for those that need it
-        # For vectorized implementation, we can do it for all, or mask. 
-        # Doing for all is often cleaner in torch if most need it.
-        # Here we'll do it for all to keep it vectorized, or selectively.
         # Vectorized systematic resampling:
         
         cumsum = torch.cumsum(self.weights, dim=1) # (Batch, N)
@@ -651,8 +658,6 @@ class BootstrapParticleFilter(FilteringMethod):
         positions = u + torch.arange(self.n_particles, device=self.device, dtype=torch.float32).unsqueeze(0) / self.n_particles
         
         # Perform searchsorted for each batch row
-        # torch.searchsorted expects 1D boundaries or matching dims. 
-        # It supports batched inputs if right=True/False matching.
         indices = torch.searchsorted(cumsum, positions)
         indices = torch.clamp(indices, 0, self.n_particles - 1)
         
@@ -665,9 +670,6 @@ class BootstrapParticleFilter(FilteringMethod):
         particles_prev_resampled = torch.gather(self.particles_prev, 1, indices_expanded)
         
         # Only apply to batches that needed resampling
-        # This is slightly complex to do partially vectorized. 
-        # Alternative: Update ONLY where needs_resample is True
-        
         mask_resample = needs_resample.unsqueeze(-1).unsqueeze(-1) # (Batch, 1, 1)
         
         self.particles = torch.where(mask_resample, particles_resampled, self.particles)
@@ -682,7 +684,7 @@ class BootstrapParticleFilter(FilteringMethod):
         self.weights = new_weights
         self.log_weights = torch.log(self.weights)
         
-        return resampled_flags
+        return resampled_flags, ess
 
     def get_state_estimate(self) -> torch.Tensor:
         """Get current state estimate (weighted mean) - (Batch, D)"""
@@ -777,7 +779,7 @@ class BootstrapParticleFilter(FilteringMethod):
         P_est = self.get_state_covariance()
         
         # Resample
-        resampled_flags = self.resample()
+        resampled_flags, ess_pre = self.resample()
         
         # Metrics
         elapsed_time = (time.perf_counter() - start_time) / x_curr.shape[0] # Average time per item
@@ -806,6 +808,7 @@ class BootstrapParticleFilter(FilteringMethod):
                 "trajectory_idx": trajectory_idxs[i].item(),
                 "time_idx": time_idxs[i].item(),
                 "resampled": resampled_flags[i],
+                "ess_pre_resample": ess_pre[i].item(),
                 "ess": ess[i].item(),
                 "step_time": elapsed_time,
                 "proposal_log_prob_mean": prop_means[i].item(),

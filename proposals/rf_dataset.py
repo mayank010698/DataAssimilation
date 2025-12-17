@@ -93,6 +93,7 @@ class RFDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         window: int = 1,
         use_observations: bool = False,
+        obs_indices: Optional[list] = None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -100,6 +101,7 @@ class RFDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.window = window
         self.use_observations = use_observations
+        self.obs_indices = obs_indices
         
         self.train_dataset = None
         self.val_dataset = None
@@ -131,6 +133,19 @@ class RFDataModule(pl.LightningDataModule):
                 if self.use_observations:
                     train_obs = f["train/observations"][:]
                     val_obs = f["val/observations"][:]
+                    
+                    logging.info(f"Original obs shape: {train_obs.shape}")
+                    logging.info(f"obs_indices in DataModule: {self.obs_indices}")
+
+                    # Filter observations if indices are provided
+                    if self.obs_indices is not None:
+                        # obs_indices is a list of integers
+                        # We need to slice the last dimension
+                        train_obs = train_obs[..., self.obs_indices]
+                        val_obs = val_obs[..., self.obs_indices]
+                        
+                        logging.info(f"Filtered observations to {len(self.obs_indices)} indices")
+                        logging.info(f"New obs shape: {train_obs.shape}")
                 
                 self.train_dataset = RFTransitionDataset(
                     train_traj, 
@@ -152,6 +167,9 @@ class RFDataModule(pl.LightningDataModule):
                 test_obs = None
                 if self.use_observations:
                     test_obs = f["test/observations"][:]
+                    
+                    if self.obs_indices is not None:
+                        test_obs = test_obs[..., self.obs_indices]
                 
                 self.test_dataset = RFTransitionDataset(
                     test_traj,
