@@ -13,29 +13,146 @@ from typing import Optional
 import sys
 from pathlib import Path
 
-# Handle both package import and direct script execution
-try:
-    from .resnet1d import (
-        ResBlock1D,
-        Conv1dConcatConditioning,
-        Conv1dFiLMConditioning,
-        Conv1dAdaLNConditioning,
-        Conv1dCrossAttentionConditioning,
-    )
-except ImportError:
-    # Add parent directories to path for direct script execution
-    file_path = Path(__file__).resolve()
-    parent_dir = file_path.parent.parent.parent
-    if str(parent_dir) not in sys.path:
-        sys.path.insert(0, str(parent_dir))
-    
-    from proposals.architectures.resnet1d import (
-        ResBlock1D,
-        Conv1dConcatConditioning,
-        Conv1dFiLMConditioning,
-        Conv1dAdaLNConditioning,
-        Conv1dCrossAttentionConditioning,
-    )
+# --- Helper Classes (Moved here to avoid circular imports) ---
+
+class ResBlock1D(nn.Module):
+    """
+    Standard 1D Residual Block with circular padding.
+    """
+    def __init__(self, channels, kernel_size):
+        super().__init__()
+        padding = (kernel_size - 1) // 2
+        self.conv1 = nn.Conv1d(channels, channels, kernel_size, padding=padding, padding_mode='circular')
+        self.act1 = nn.SiLU()
+        self.conv2 = nn.Conv1d(channels, channels, kernel_size, padding=padding, padding_mode='circular')
+        self.act2 = nn.SiLU()
+
+    def forward(self, x):
+        residual = x
+        h = self.act1(self.conv1(x))
+        h = self.act2(self.conv2(h))
+        return h + residual
+
+
+class Conv1dConcatConditioning(nn.Module):
+    def __init__(self, channels, cond_dim):
+        super().__init__()
+        self.cond_dim = cond_dim
+
+    def forward(self, h, cond, layer_idx):
+        # Concat is handled at input, so this is no-op
+        return h
+
+
+class Conv1dAdaLNConditioning(nn.Module):
+    """
+    AdaLN for 1D data: GroupNorm(1) -> Scale/Shift modulated by conditioning.
+    """
+    def __init__(self, channels, cond_dim, num_layers, cond_embed_dim=128):
+        super().__init__()
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(cond_dim, cond_embed_dim),
+            nn.SiLU(),
+            nn.Linear(cond_embed_dim, cond_embed_dim),
+        )
+        self.norm = nn.GroupNorm(1, channels)
+        self.controllers = nn.ModuleList([
+            nn.Linear(cond_embed_dim, 2 * channels) for _ in range(num_layers)
+        ])
+        
+        # Initialize controllers to 0 => identity modulation (scale=1, shift=0)
+        for linear in self.controllers:
+            nn.init.zeros_(linear.weight)
+            nn.init.zeros_(linear.bias)
+
+    def forward(self, h, cond, layer_idx):
+        # h: (B, C, L)
+        embed = self.cond_encoder(cond) # (B, E)
+        params = self.controllers[layer_idx](embed) # (B, 2*C)
+        scale, shift = params.chunk(2, dim=1) # (B, C)
+        
+        # Broadcast to (B, C, 1)
+        scale = scale.unsqueeze(-1) + 1.0
+        shift = shift.unsqueeze(-1)
+        
+        h_norm = self.norm(h)
+        return h_norm * scale + shift
+
+
+class Conv1dFiLMConditioning(nn.Module):
+    """
+    FiLM for 1D data: Scale/Shift modulated by conditioning (no norm).
+    """
+    def __init__(self, channels, cond_dim, num_layers, cond_embed_dim=128):
+        super().__init__()
+        self.cond_encoder = nn.Sequential(
+            nn.Linear(cond_dim, cond_embed_dim),
+            nn.SiLU(),
+            nn.Linear(cond_embed_dim, cond_embed_dim),
+        )
+        self.controllers = nn.ModuleList([
+            nn.Linear(cond_embed_dim, 2 * channels) for _ in range(num_layers)
+        ])
+        
+        # Initialize to identity
+        for linear in self.controllers:
+             nn.init.zeros_(linear.weight)
+             nn.init.zeros_(linear.bias)
+
+    def forward(self, h, cond, layer_idx):
+        embed = self.cond_encoder(cond)
+        params = self.controllers[layer_idx](embed)
+        scale, shift = params.chunk(2, dim=1)
+        
+        scale = scale.unsqueeze(-1) + 1.0 # Initialize scale around 1
+        shift = shift.unsqueeze(-1)
+        
+        return h * scale + shift
+
+class Conv1dCrossAttentionConditioning(nn.Module):
+    """
+    Cross-attention for 1D data.
+    """
+    def __init__(self, channels, cond_dim, num_layers, num_heads=4, cond_embed_dim=128):
+        super().__init__()
+        self.num_heads = num_heads
+        self.channels = channels
+        
+        # Project conditioning to Key/Value dim
+        self.cond_proj = nn.Linear(cond_dim, 2 * channels)
+        
+        # Attention modules for each layer
+        self.attentions = nn.ModuleList([
+            nn.MultiheadAttention(embed_dim=channels, num_heads=num_heads, batch_first=True)
+            for _ in range(num_layers)
+        ])
+        
+        self.norm = nn.GroupNorm(1, channels)
+
+    def forward(self, h, cond, layer_idx):
+        # h: (B, C, L)
+        B, C, L = h.shape
+        
+        # Prepare Query: (B, L, C)
+        x = h.transpose(1, 2)
+        
+        # Prepare Key/Value from conditioning
+        # cond: (B, cond_dim)
+        kv = self.cond_proj(cond) # (B, 2*C)
+        k, v = kv.chunk(2, dim=1) # (B, C) each
+        
+        # Reshape to (B, 1, C) sequence of length 1
+        k = k.unsqueeze(1)
+        v = v.unsqueeze(1)
+        
+        # Attention
+        # Q: x (B, L, C)
+        # K, V: (B, 1, C)
+        attn_out, _ = self.attentions[layer_idx](x, k, v) # (B, L, C)
+        
+        # Residual + Norm
+        out = h + attn_out.transpose(1, 2)
+        return self.norm(out)
 
 
 class ResNet1DDeterministic(nn.Module):
