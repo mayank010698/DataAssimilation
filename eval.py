@@ -533,10 +533,12 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation. >1 uses batched evaluation.")
     parser.add_argument("--obs-dim", type=int, default=None)
+    parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
+    parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
     parser.add_argument(
         "--proposal-type", type=str, choices=["transition", "rf"], default="transition"
     )
@@ -888,6 +890,10 @@ def main():
     print(f"\nLoading config from {config_path}")
     config = load_config_yaml(config_path)
 
+    if args.obs_noise_std is not None:
+        config.obs_noise_std = args.obs_noise_std
+        print(f"Overriding obs_noise_std to {config.obs_noise_std}")
+
     # Print config details
     print("\nDataset Configuration:")
     print(f"  num_trajectories: {config.num_trajectories}")
@@ -923,6 +929,25 @@ def main():
     print(f"\nLoading data...")
     data_module.setup("test")
     print(f"Test dataset size: {len(data_module.test_dataset)}")
+    
+    # Optional: Limit number of trajectories for evaluation
+    if args.num_eval_trajectories is not None:
+        test_dataset = data_module.test_dataset
+        original_n_trajs = test_dataset.n_trajectories
+        
+        if args.num_eval_trajectories < original_n_trajs:
+            print(f"Limiting evaluation to first {args.num_eval_trajectories} trajectories (dataset had {original_n_trajs})")
+            
+            # Filter items to only include the first N trajectories
+            # items is a list of (traj_idx, time_idx)
+            test_dataset.items = [item for item in test_dataset.items if item[0] < args.num_eval_trajectories]
+            
+            # Update n_trajectories count
+            test_dataset.n_trajectories = args.num_eval_trajectories
+            
+            print(f"New test dataset size: {len(test_dataset)}")
+        else:
+             print(f"Requested {args.num_eval_trajectories} trajectories, but dataset only has {original_n_trajs}. Using all.")
 
     # Use the system instance from data_module which has updated normalization stats
     system = data_module.system

@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -14,12 +15,13 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
 # Add project root to path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.append(str(Path(__file__).parent.parent))
 
 from data import (
     DataAssimilationConfig,
     DataAssimilationDataModule,
     Lorenz63,
+    Lorenz96,
     TimeAlignedBatchSampler,
     load_config_yaml,
 )
@@ -155,8 +157,8 @@ def plot_trajectory_comparison(
     return fig
 
 
-def _derive_eval_run_name(checkpoint_path: str) -> str:
-    """Build wandb run name like eval-<training_run> for clarity."""
+def _derive_eval_run_name(checkpoint_path: str, mc_guidance: bool = False) -> str:
+    """Build wandb run name like eval-<training_run>[-mc] for clarity."""
     ckpt_path = Path(checkpoint_path)
     try:
         # Expect .../<run_name>/checkpoints/<file>.ckpt
@@ -164,7 +166,11 @@ def _derive_eval_run_name(checkpoint_path: str) -> str:
         base_name = run_dir.name
     except IndexError:
         base_name = ckpt_path.stem
-    return f"eval-{base_name}"
+    
+    run_name = f"eval-{base_name}"
+    if mc_guidance:
+        run_name += "-mc"
+    return run_name
 
 
 def run_proposal_eval(
@@ -210,6 +216,11 @@ def run_proposal_eval(
     
     # Load Model
     model = RFProposal.load_from_checkpoint(checkpoint_path)
+
+    # Determine system class
+    system_class = Lorenz63
+    if "dim" in config.system_params and config.system_params["dim"] > 3:
+        system_class = Lorenz96
     
     # Override guidance settings
     if mc_guidance:
@@ -241,6 +252,40 @@ def run_proposal_eval(
     
     logger.info(f"Using num_sampling_steps: {model.num_sampling_steps}")
     logger.info(f"Using num_likelihood_steps: {model.num_likelihood_steps}")
+
+    # Extract training process noise from checkpoint path
+    train_has_pnoise = False
+    if "pnoise" in checkpoint_path or "noise0p1" in checkpoint_path:
+        train_has_pnoise = True
+    elif "nonoise" in checkpoint_path:
+        train_has_pnoise = False
+        
+    # Determine number of observed dimensions
+    num_obs_dims = 0
+    if not model.hparams.get("use_observations", True):
+        num_obs_dims = 0
+    elif model.obs_indices is not None:
+        num_obs_dims = len(model.obs_indices)
+    elif model.hparams.get("obs_dim") is not None:
+        num_obs_dims = model.hparams.get("obs_dim")
+    elif config.obs_components is not None:
+        num_obs_dims = len(config.obs_components)
+    
+    # Log additional config to wandb
+    if wandb_run:
+        wandb_config = {
+            "eval/mc_guidance": model.mc_guidance,
+            "eval/guidance_scale": model.guidance_scale,
+            "train/has_process_noise": train_has_pnoise,
+            "eval/num_obs_dims": num_obs_dims,
+            "model/architecture": model.hparams.get("architecture"),
+            "model/state_dim": model.hparams.get("state_dim"),
+            "model/hidden_dim": model.hparams.get("hidden_dim"),
+            "model/depth": model.hparams.get("depth"),
+            "model/channels": model.hparams.get("channels"),
+            "model/num_blocks": model.hparams.get("num_blocks"),
+        }
+        wandb_run.config.update(wandb_config)
     
     model.to(device)
     model.eval()
@@ -357,6 +402,19 @@ def run_proposal_eval(
             y_curr_stack = torch.stack(batch_y_curr) # (B_eff, K, D_obs)
             D_obs = y_curr_stack.shape[-1]
             y_curr_flat = y_curr_stack.reshape(B_eff * K, D_obs)
+
+            # Filter observations if model expects specific indices
+            # The dataset provides full observations (e.g. 50 dims), but model might be trained on subset (e.g. 25 dims)
+            if hasattr(model, 'obs_indices') and model.obs_indices is not None:
+                # model.obs_indices is a tensor or list
+                if isinstance(model.obs_indices, torch.Tensor):
+                    indices = model.obs_indices
+                else:
+                    indices = torch.tensor(model.obs_indices, device=y_curr_flat.device)
+                
+                # Check if we need to filter
+                if y_curr_flat.shape[1] > len(indices):
+                    y_curr_flat = y_curr_flat[:, indices]
         
         # Sample next states
         # x_next ~ p(x_t | x_{t-1}, y_t)
@@ -422,7 +480,7 @@ def run_proposal_eval(
                 "time_idx": t,
                 "x_true": x_true_orig.cpu().numpy(),
                 "x_est": x_mean_orig.cpu().numpy(), # Mean estimate
-                "x_std": torch.std(x_gen_orig_k, dim=0).cpu().numpy(), # Std dev for uncertainty
+                "x_std": torch.std(x_gen_orig_k, dim=0, correction=0).cpu().numpy(), # Std dev for uncertainty
                 "observation": obs,
                 "has_observation": has_obs,
                 "rmse": rmse,
@@ -518,19 +576,23 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--n-samples-per-traj", type=int, default=1, help="Number of samples per trajectory (for CRPS)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--num-sampling-steps", type=int, default=None, help="Override number of Euler steps for sampling (default: use checkpoint value)")
     parser.add_argument("--num-likelihood-steps", type=int, default=None, help="Override number of Euler steps for likelihood computation (default: use checkpoint value)")
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
+    parser.add_argument("--run-name", type=str, default=None, help="Name for the wandb run")
     
     args = parser.parse_args()
     
     logging.basicConfig(level=logging.INFO)
     
     run = None
-    if args.wandb:
-        run_name = _derive_eval_run_name(args.checkpoint)
+    if not args.no_wandb:
+        if args.run_name:
+            run_name = args.run_name
+        else:
+            run_name = _derive_eval_run_name(args.checkpoint, args.mc_guidance)
         run = wandb.init(project="rf-proposal-eval", name=run_name, entity="ml-climate")
         
     run_proposal_eval(
