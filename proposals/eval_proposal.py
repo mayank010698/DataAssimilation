@@ -230,18 +230,6 @@ def run_proposal_eval(
         logger.info(f"Overriding Guidance Scale: {model.guidance_scale} -> {guidance_scale}")
         model.guidance_scale = guidance_scale
         
-    # Construct observation_fn for guidance
-    # This selects the observed components from the state vector
-    if model.mc_guidance:
-        obs_components = config.obs_components
-        logger.info(f"Constructing observation_fn with components: {obs_components}")
-        
-        def observation_fn(x):
-            # x is shape (..., state_dim)
-            return x[..., obs_components]
-    else:
-        observation_fn = None
-    
     # Override sampling/likelihood steps if provided
     if num_sampling_steps is not None:
         logger.info(f"Overriding num_sampling_steps: {model.num_sampling_steps} -> {num_sampling_steps}")
@@ -301,6 +289,40 @@ def run_proposal_eval(
     )
     data_module.setup("test")
     test_dataset = data_module.test_dataset
+
+    # Construct observation_fn for guidance (Robust to Scaling)
+    if model.mc_guidance:
+        obs_components = config.obs_components
+        logger.info(f"Constructing robust observation_fn with components: {obs_components}")
+        
+        # Get statistics from data module
+        obs_scaler_mean = data_module.obs_scaler_mean.to(device) if data_module.obs_scaler_mean is not None else None
+        obs_scaler_std = data_module.obs_scaler_std.to(device) if data_module.obs_scaler_std is not None else None
+        
+        if obs_scaler_mean is None:
+             logger.warning("No observation scalers found in data module! Guidance might be incorrect if data is scaled.")
+        
+        def observation_fn(x_scaled):
+            # x_scaled is shape (..., state_dim) in SCALED space
+            
+            # 1. Unscale to physical space
+            # system.postprocess handles unscaling using system.init_mean/std
+            # We need to make sure x_scaled is on correct device, usually it is
+            x_physical = data_module.system.postprocess(x_scaled)
+            
+            # 2. Apply Observation Operator (Physical Space)
+            y_physical = data_module.system.apply_observation_operator(x_physical)
+            
+            # 3. Rescale to Observation Space (if scalers exist)
+            if obs_scaler_mean is not None:
+                # Handle broadcasting if needed, though usually shapes align
+                y_scaled = (y_physical - obs_scaler_mean) / obs_scaler_std
+            else:
+                y_scaled = y_physical
+                
+            return y_scaled
+    else:
+        observation_fn = None
     
     # We only want n_trajectories
     total_trajs_in_data = test_dataset.n_trajectories

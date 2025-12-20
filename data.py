@@ -94,6 +94,7 @@ class DynamicalSystem(ABC):
         k3 = self.dynamics(0, x + dt * k2 / 2)
         k4 = self.dynamics(0, x + dt * k3)
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
+    
     def integrate(
         self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0
     ) -> torch.Tensor:
@@ -729,6 +730,14 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                 self.system.init_mean = scaler_mean
                 self.system.init_std = scaler_std
                 logging.info(f"Updated system normalization stats from data.h5")
+
+            if "obs_scaler_mean" in f:
+                self.obs_scaler_mean = torch.from_numpy(f["obs_scaler_mean"][:]).float()
+                self.obs_scaler_std = torch.from_numpy(f["obs_scaler_std"][:]).float()
+                logging.info(f"Loaded observation scaler stats from data.h5")
+            else:
+                self.obs_scaler_mean = None
+                self.obs_scaler_std = None
 
             if stage == "fit" or stage is None:
                 train_traj = f["train/trajectories"][:]
