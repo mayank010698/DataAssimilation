@@ -264,6 +264,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         mc_guidance: bool = False,
         guidance_scale: float = 1.0,
         obs_components: Optional[list] = None,
+        use_exact_trace: bool = True,
     ):
         """
         Args:
@@ -277,6 +278,7 @@ class RectifiedFlowProposal(ProposalDistribution):
             mc_guidance: Whether to use Monte Carlo guidance
             guidance_scale: Scale for guidance
             obs_components: List of observed state indices (needed for guidance)
+            use_exact_trace: Whether to use exact trace or Hutchinson estimator
         """
         import sys
         from pathlib import Path
@@ -294,6 +296,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.rf_model.to(device)
         self.device = device
         self.system = system
+        self.use_exact_trace = use_exact_trace
         
         self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
         self.obs_std = obs_std.to(device) if obs_std is not None else None
@@ -437,4 +440,4 @@ class RectifiedFlowProposal(ProposalDistribution):
         # Ah, we added sample_and_log_prob but log_prob itself might not use guidance?
         # Let's check.
         
-        return self.rf_model.log_prob(x_curr, x_prev, y_curr, dt)
+        return self.rf_model.log_prob(x_curr, x_prev, y_curr, dt, use_exact_trace=self.use_exact_trace)

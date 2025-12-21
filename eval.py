@@ -550,6 +550,7 @@ def parse_args():
     # Guidance configuration
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance during inference")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
+    parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -988,6 +989,7 @@ def main():
             mc_guidance=args.mc_guidance,
             guidance_scale=args.guidance_scale,
             obs_components=config.obs_components, # Needed to construct observation_fn
+            use_exact_trace=args.use_exact_trace,
         )
         
         test_rf_log_probs(proposal, system)
