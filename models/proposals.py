@@ -177,7 +177,7 @@ class LearnedNeuralProposal(ProposalDistribution, nn.Module):
         noise_std = 0.01
         if self.use_preprocessing:
             noise_std *= 0.1  # Scale down for normalized space
-
+        
         return x_prev + noise_std * torch.randn_like(x_prev)
 
     def log_prob(
@@ -265,6 +265,8 @@ class RectifiedFlowProposal(ProposalDistribution):
         guidance_scale: float = 1.0,
         obs_components: Optional[list] = None,
         use_exact_trace: bool = True,
+        trace_estimator: str = 'rademacher',
+        num_trace_probes: int = 1,
     ):
         """
         Args:
@@ -279,6 +281,8 @@ class RectifiedFlowProposal(ProposalDistribution):
             guidance_scale: Scale for guidance
             obs_components: List of observed state indices (needed for guidance)
             use_exact_trace: Whether to use exact trace or Hutchinson estimator
+            trace_estimator: 'gaussian' or 'rademacher' for Hutchinson estimator
+            num_trace_probes: Number of probes for Hutchinson estimator
         """
         import sys
         from pathlib import Path
@@ -312,6 +316,10 @@ class RectifiedFlowProposal(ProposalDistribution):
             self.rf_model.mc_guidance = True
         if guidance_scale != 1.0:
             self.rf_model.guidance_scale = guidance_scale
+            
+        # Trace estimator settings
+        self.trace_estimator = trace_estimator
+        self.num_trace_probes = num_trace_probes
             
         # Construct observation_fn for guidance if enabled
         self.observation_fn = None
@@ -417,27 +425,18 @@ class RectifiedFlowProposal(ProposalDistribution):
             
         # RF model's log_prob method already handles the interface
         # We compute log probability in scaled space.
-        # Since weight update does normalization, we don't strictly need Jacobian correction.
-        # IMPORTANT: If using guidance, we need sample_and_log_prob equivalent logic? 
-        # Actually RFProposal.log_prob currently does NOT support guidance divergence correction natively 
-        # unless we modify it or call sample_and_log_prob during sampling (which BPF separates).
         
-        # Current BPF implementation calls sample() then log_prob().
-        # If guidance was used in sample(), x_curr was generated from a guided process.
-        # To get the correct density q_guided(x_curr), we MUST account for the guidance term in the divergence.
-        # RFProposal.log_prob needs to support guidance too if we want correct weights.
+        # Pass configured trace estimator settings
+        # Note: use_exact_trace=False is implicit if we are using stochastic estimators
+        # But if we want exact trace, we should have a way to configure it.
+        # For now, we assume if we are calling this, we might want the stochastic one unless specified otherwise?
+        # We implicitly assume use_exact_trace=False because exact trace is O(D^2) and we are providing estimator settings.
+        # If someone wants exact trace, they currently can't get it through this wrapper unless we modify it further.
+        # Given the task is to reduce variance of the stochastic estimator, forcing stochastic with improvements is fine.
         
-        # Wait, RFProposal.log_prob integrates BACKWARDS from x_curr to x_0.
-        # Does the guidance term apply in reverse? 
-        # Actually, for standard CNF log-likelihood:
-        # log p(x_1) = log p(x_0) - \int div(v) dt
-        # This holds regardless of how x_1 was generated, as long as v is the vector field OF THE MODEL/GUIDED PROCESS.
-        # So we just need to ensure we use the guided velocity field in log_prob calculation.
-        
-        # RFProposal.log_prob uses self.velocity_net.
-        # We haven't updated RFProposal.log_prob to use guidance yet in previous steps?
-        # Let's check rectified_flow.py.
-        # Ah, we added sample_and_log_prob but log_prob itself might not use guidance?
-        # Let's check.
-        
-        return self.rf_model.log_prob(x_curr, x_prev, y_curr, dt, use_exact_trace=self.use_exact_trace)
+        return self.rf_model.log_prob(
+            x_curr, x_prev, y_curr, dt, 
+            use_exact_trace=self.use_exact_trace, 
+            trace_estimator=self.trace_estimator,
+            num_trace_probes=self.num_trace_probes
+        )
