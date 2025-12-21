@@ -264,6 +264,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         mc_guidance: bool = False,
         guidance_scale: float = 1.0,
         obs_components: Optional[list] = None,
+        use_exact_trace: bool = True,
         trace_estimator: str = 'rademacher',
         num_trace_probes: int = 1,
     ):
@@ -279,6 +280,7 @@ class RectifiedFlowProposal(ProposalDistribution):
             mc_guidance: Whether to use Monte Carlo guidance
             guidance_scale: Scale for guidance
             obs_components: List of observed state indices (needed for guidance)
+            use_exact_trace: Whether to use exact trace or Hutchinson estimator
             trace_estimator: 'gaussian' or 'rademacher' for Hutchinson estimator
             num_trace_probes: Number of probes for Hutchinson estimator
         """
@@ -298,6 +300,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.rf_model.to(device)
         self.device = device
         self.system = system
+        self.use_exact_trace = use_exact_trace
         
         self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
         self.obs_std = obs_std.to(device) if obs_std is not None else None
@@ -433,7 +436,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         
         return self.rf_model.log_prob(
             x_curr, x_prev, y_curr, dt, 
-            use_exact_trace=False, 
+            use_exact_trace=self.use_exact_trace, 
             trace_estimator=self.trace_estimator,
             num_trace_probes=self.num_trace_probes
         )
