@@ -545,7 +545,9 @@ def parse_args():
     parser.add_argument("--rf-checkpoint", type=str, default=None)
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
     parser.add_argument("--rf-sampling-steps", type=int, default=None)
-    parser.add_argument("--device", type=str, default="cpu")
+    parser.add_argument("--rf-trace-estimator", type=str, default="rademacher", choices=["gaussian", "rademacher"], help="Trace estimator type for RF log_prob")
+    parser.add_argument("--rf-num-probes", type=int, default=1, help="Number of probes for Hutchinson trace estimator")
+    parser.add_argument("--device", type=str, default="gpu")
     
     # Guidance configuration
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance during inference")
@@ -988,6 +990,8 @@ def main():
             mc_guidance=args.mc_guidance,
             guidance_scale=args.guidance_scale,
             obs_components=config.obs_components, # Needed to construct observation_fn
+            trace_estimator=args.rf_trace_estimator,
+            num_trace_probes=args.rf_num_probes,
         )
         
         test_rf_log_probs(proposal, system)

@@ -369,6 +369,8 @@ class RFProposal(pl.LightningModule):
         y_curr: Optional[torch.Tensor] = None,
         observation_fn: Optional[callable] = None,
         use_exact_trace: bool = True,
+        trace_estimator: str = 'gaussian',
+        num_trace_probes: int = 1,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample x_t and compute its log probability, optionally with guidance.
@@ -378,6 +380,8 @@ class RFProposal(pl.LightningModule):
             y_curr: Current observation
             observation_fn: Observation function (required for guidance)
             use_exact_trace: Whether to use exact trace or Hutchinson estimator
+            trace_estimator: 'gaussian' or 'rademacher' (only used if use_exact_trace=False)
+            num_trace_probes: Number of probes for Hutchinson estimator (only used if use_exact_trace=False)
             
         Returns:
             Tuple of (sampled_state, log_prob)
@@ -426,11 +430,19 @@ class RFProposal(pl.LightningModule):
                 else:
                     # HUTCHINSON TRACE
                     v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
-                    eps = torch.randn_like(x)
-                    vjp = torch.autograd.grad(
-                        v, x_for_grad, grad_outputs=eps, create_graph=False
-                    )[0]
-                    divergence = torch.sum(vjp * eps, dim=-1)
+                    
+                    divergence_sum = torch.zeros(batch_size, device=self.device)
+                    for _ in range(num_trace_probes):
+                        if trace_estimator == 'rademacher':
+                            eps = torch.randint_like(x, low=0, high=2).float() * 2 - 1
+                        else:
+                            eps = torch.randn_like(x)
+                            
+                        vjp = torch.autograd.grad(
+                            v, x_for_grad, grad_outputs=eps, create_graph=False, retain_graph=True
+                        )[0]
+                        divergence_sum += torch.sum(vjp * eps, dim=-1)
+                    divergence = divergence_sum / num_trace_probes
                 
                 # 2. Compute Guidance & Divergence (if enabled)
                 if self.mc_guidance and observation_fn is not None and y_curr is not None:
@@ -452,17 +464,20 @@ class RFProposal(pl.LightningModule):
                              grad_div += g_k_grad[:, k]
                     else:
                         # Hutchinson
-                        # Reuse eps if available (consistent estimator)
-                        # otherwise sample new eps
-                        if 'eps' not in locals():
-                             eps = torch.randn_like(x)
-                        
-                        grad_jvp = torch.autograd.grad(
-                            grad, x_for_grad,
-                            grad_outputs=eps,
-                            create_graph=False
-                        )[0]
-                        grad_div = torch.sum(grad_jvp * eps, dim=-1)
+                        grad_div_sum = torch.zeros(batch_size, device=self.device)
+                        for _ in range(num_trace_probes):
+                            if trace_estimator == 'rademacher':
+                                eps = torch.randint_like(x, low=0, high=2).float() * 2 - 1
+                            else:
+                                eps = torch.randn_like(x)
+                            
+                            grad_jvp = torch.autograd.grad(
+                                grad, x_for_grad,
+                                grad_outputs=eps,
+                                create_graph=False, retain_graph=True
+                            )[0]
+                            grad_div_sum += torch.sum(grad_jvp * eps, dim=-1)
+                        grad_div = grad_div_sum / num_trace_probes
                         
                     # Update velocity and divergence
                     v = v - self.guidance_scale * grad
@@ -492,6 +507,8 @@ class RFProposal(pl.LightningModule):
         y_curr: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
         use_exact_trace: bool = True,
+        trace_estimator: str = 'gaussian',
+        num_trace_probes: int = 1,
     ) -> torch.Tensor:
         """
         Compute log prob using Euler method.
@@ -503,6 +520,8 @@ class RFProposal(pl.LightningModule):
             dt: Time step (unused, for interface compatibility)
             use_exact_trace: If True, computes exact Jacobian trace (deterministic, O(D^2)).
                              If False, uses Hutchinson trace estimator (stochastic, O(D)).
+            trace_estimator: 'gaussian' or 'rademacher' (only used if use_exact_trace=False)
+            num_trace_probes: Number of probes for Hutchinson estimator (only used if use_exact_trace=False)
         
         Returns:
             Log probability, shape () or (batch,)
@@ -562,13 +581,21 @@ class RFProposal(pl.LightningModule):
                     # HUTCHINSON TRACE ESTIMATOR (Stochastic)
                     v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
                     
-                    eps = torch.randn_like(x)
-                    vjp = torch.autograd.grad(
-                        v, x_for_grad,
-                        grad_outputs=eps,
-                        create_graph=False,
-                    )[0]
-                    divergence = torch.sum(vjp * eps, dim=-1)
+                    divergence_sum = torch.zeros(batch_size, device=self.device)
+                    for _ in range(num_trace_probes):
+                        if trace_estimator == 'rademacher':
+                            eps = torch.randint_like(x, low=0, high=2).float() * 2 - 1
+                        else:
+                            eps = torch.randn_like(x)
+                            
+                        vjp = torch.autograd.grad(
+                            v, x_for_grad,
+                            grad_outputs=eps,
+                            create_graph=False,
+                            retain_graph=True
+                        )[0]
+                        divergence_sum += torch.sum(vjp * eps, dim=-1)
+                    divergence = divergence_sum / num_trace_probes
             
             # Backward Euler step
             x = x - v.detach() * ds
