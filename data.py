@@ -274,7 +274,7 @@ class Lorenz96(DynamicalSystem):
         # F=8 is standard for chaotic behavior
         # dim=40 is standard, but can be scaled up to 1M+ (see arXiv:2309.00983)
         # dt=0.01 is used here, though 0.05 (6 hours) is also common in literature
-        default_params = {"F": 8, "dim": 40}
+        default_params = {"F": 8, "dim": 40, "init_std": 1.0}
         if config.system_params is None:
             config.system_params = default_params
         else:
@@ -292,7 +292,7 @@ class Lorenz96(DynamicalSystem):
         self.dim = config.system_params["dim"]
         
         self.init_mean = torch.zeros(self.dim)
-        self.init_std = 1.0
+        self.init_std = config.system_params["init_std"]
         self.init_cov = (self.init_std ** 2) * torch.eye(self.dim)
 
     def get_state_dim(self) -> int:

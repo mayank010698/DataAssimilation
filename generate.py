@@ -80,6 +80,7 @@ def parse_args():
     # System parameters (Lorenz 96)
     parser.add_argument("--l96-dim", type=int, default=50, help="Dimension for Lorenz 96 system")
     parser.add_argument("--l96-forcing", type=float, default=8.0, help="Forcing parameter F for Lorenz 96")
+    parser.add_argument("--l96-init-std", type=float, default=3.0, help="Initial standard deviation for Lorenz 96")
 
     # Data splits
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -158,6 +159,7 @@ def main():
         system_params = {
             "dim": args.l96_dim,
             "F": args.l96_forcing,
+            "init_std": args.l96_init_std,
         }
         default_obs_components = list(range(args.l96_dim))  # observe all by default
     else:
