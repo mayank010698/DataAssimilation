@@ -943,6 +943,11 @@ def generate_dataset_directory_name(
     # Add process noise to directory name if non-zero
     if config.process_noise_std > 0:
         parts.append(f"pnoise{config.process_noise_std:.3f}".replace(".", "p"))
+
+    # Add init std to directory name if not one
+    init_std = config.system_params.get("init_std", 1.0)
+    if init_std != 1.0:
+        parts.append(f"init{init_std:.3f}".replace(".", "p"))
     
     return "_".join(parts)
 
