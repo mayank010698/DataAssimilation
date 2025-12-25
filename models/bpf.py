@@ -26,10 +26,12 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         obs_dim: int = 1,
         process_noise_std: float = 0.25,
         device: str = "cpu",
+        use_optimal_weight_update: bool = False,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
+        self.use_optimal_weight_update = use_optimal_weight_update
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -157,10 +159,55 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
 
         return log_prob
 
+    def compute_predictive_log_likelihood(
+        self, x_prev: torch.Tensor, observation: torch.Tensor, dt: float
+    ) -> torch.Tensor:
+        """
+        Compute approx log p(y_t | x_{t-1}) using Inflated Noise approximation.
+        1. x_hat = dynamics(x_{t-1}) (deterministic)
+        2. y_hat = obs_op(x_hat)
+        3. cov = obs_noise^2 * I + process_noise^2 * I (approx)
+        """
+        # 1. Deterministic propagation
+        # integration result shape: (N, steps, D) -> get last step
+        integration_result = self.system.integrate(x_prev, 2, dt)
+        x_hat = integration_result[:, 1, :]
+
+        # 2. Observation projection
+        y_hat = self.system.apply_observation_operator(x_hat)
+        
+        # 3. Variance inflation
+        obs_noise_var = self.system.config.obs_noise_std**2
+        process_noise_var = self.process_noise_std**2
+        total_var = obs_noise_var + process_noise_var
+
+        # 4. Compute Gaussian Log-Likelihood
+        # observation: (obs_dim,) -> expand to (1, obs_dim) for broadcasting
+        # y_hat: (N, obs_dim)
+        if observation.dim() == 1:
+            observation = observation.unsqueeze(0)
+            
+        diff = observation - y_hat
+        
+        if self.obs_dim == 1:
+            log_prob = -0.5 * (diff.squeeze()**2) / total_var - 0.5 * np.log(
+                2 * np.pi * total_var
+            )
+        else:
+            # Multivariate independent
+            # log p(y) = sum log p(y_i)
+            log_prob = -0.5 * torch.sum(diff**2, dim=1) / total_var
+            log_prob -= 0.5 * self.obs_dim * np.log(2 * np.pi * total_var)
+            
+        return log_prob
+
     def update_step(self, observation: torch.Tensor) -> None:
         """
         CORRECTED: Update particle weights using IMPORTANCE SAMPLING
         w_t^(i) = w_{t-1}^(i) * [p(y_t | x_t^(i)) * p(x_t^(i) | x_{t-1}^(i))] / q(x_t^(i) | x_{t-1}^(i), y_t)
+        
+        OR (if use_optimal_weight_update=True):
+        w_t^(i) = w_{t-1}^(i) * p(y_t | x_{t-1}^(i))
         """
         if observation.dim() == 0:
             observation = observation.unsqueeze(0)
@@ -204,41 +251,74 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
             # term: (N, D) * (N, D) -> sum dim 1 -> (N,)
             quadratic_form = torch.sum((diff @ inv_cov) * diff, dim=1)
             obs_log_likelihoods = -0.5 * (quadratic_form + log_det_2pi_cov)
-
-        # Compute transition log-probabilities: log p(x_t^(i) | x_{t-1}^(i))
-        transition_log_probs = self.compute_transition_log_prob(
-            self.particles, self.particles_prev, self.system.config.dt
-        )
-
-        # Compute proposal log-probabilities: log q(x_t^(i) | x_{t-1}^(i), y_t)
-        proposal_log_probs = torch.zeros(self.n_particles, device=self.device)
-        for i in range(self.n_particles):
-            prop_log_prob = self.proposal.log_prob(
-                self.particles[i],
-                self.particles_prev[i],
-                observation,
-                self.system.config.dt,
-            )
-            proposal_log_probs[i] = prop_log_prob
-
-        # CORRECTED importance sampling weight update:
-        # log w_t^(i) = log w_{t-1}^(i) + log p(y_t | x_t^(i)) + log p(x_t^(i) | x_{t-1}^(i)) - log q(x_t^(i) | x_{t-1}^(i), y_t)
-        importance_weights = (
-            obs_log_likelihoods + transition_log_probs - proposal_log_probs
-        )
         
-        # --- DEBUGGING ---
-        print(f"Step {self.step_count}:")
-        print(f"  proposal_log_probs (first 5): {proposal_log_probs[:5].detach().cpu().numpy()}")
-        print(f"  obs_log_probs (first 5): {obs_log_likelihoods[:5].detach().cpu().numpy()}")
-        print(f"  transition_log_probs (first 5): {transition_log_probs[:5].detach().cpu().numpy()}")
-        print(f"  log_weights before norm (first 5): {self.log_weights[:5].detach().cpu().numpy()}")
-        print(f"  log_weights stats: min={self.log_weights.min().item():.4f}, max={self.log_weights.max().item():.4f}, std={self.log_weights.std().item():.4f}")
-        # -----------------
-        
-        self.last_proposal_log_probs = proposal_log_probs
+        # Save obs log likelihoods for metrics regardless of update type
         self.last_obs_log_likelihoods = obs_log_likelihoods
 
+        # OPTIMAL WEIGHT UPDATE BRANCH
+        if self.use_optimal_weight_update:
+            # log w_t = log w_{t-1} + log p(y_t | x_{t-1})
+            predictive_log_probs = self.compute_predictive_log_likelihood(
+                self.particles_prev, observation, self.system.config.dt
+            )
+            importance_weights = predictive_log_probs
+            
+            # Compute other terms just for debugging/logging purposes (optional, but good for comparison)
+            # Compute transition log-probabilities: log p(x_t^(i) | x_{t-1}^(i))
+            transition_log_probs = self.compute_transition_log_prob(
+                self.particles, self.particles_prev, self.system.config.dt
+            )
+            # Compute proposal log-probabilities: log q(x_t^(i) | x_{t-1}^(i), y_t)
+            # (Can be expensive, so maybe skip if performance is critical, but good for now)
+            proposal_log_probs = torch.zeros(self.n_particles, device=self.device)
+            for i in range(self.n_particles):
+                prop_log_prob = self.proposal.log_prob(
+                    self.particles[i],
+                    self.particles_prev[i],
+                    observation,
+                    self.system.config.dt,
+                )
+                proposal_log_probs[i] = prop_log_prob
+            
+            self.last_proposal_log_probs = proposal_log_probs
+            
+        else:
+            # STANDARD WEIGHT UPDATE BRANCH
+            # log w_t^(i) = log w_{t-1}^(i) + log p(y_t | x_t^(i)) + log p(x_t^(i) | x_{t-1}^(i)) - log q(x_t^(i) | x_{t-1}^(i), y_t)
+            
+            # Compute transition log-probabilities: log p(x_t^(i) | x_{t-1}^(i))
+            transition_log_probs = self.compute_transition_log_prob(
+                self.particles, self.particles_prev, self.system.config.dt
+            )
+
+            # Compute proposal log-probabilities: log q(x_t^(i) | x_{t-1}^(i), y_t)
+            proposal_log_probs = torch.zeros(self.n_particles, device=self.device)
+            for i in range(self.n_particles):
+                prop_log_prob = self.proposal.log_prob(
+                    self.particles[i],
+                    self.particles_prev[i],
+                    observation,
+                    self.system.config.dt,
+                )
+                proposal_log_probs[i] = prop_log_prob
+
+            importance_weights = (
+                obs_log_likelihoods + transition_log_probs - proposal_log_probs
+            )
+            
+            self.last_proposal_log_probs = proposal_log_probs
+
+        # --- DEBUGGING ---
+        if self.step_count % 10 == 0:  # Reduce spam
+            print(f"Step {self.step_count} [{'Opt' if self.use_optimal_weight_update else 'Std'}]:")
+            if self.last_proposal_log_probs is not None:
+                print(f"  proposal_log_probs (first 5): {self.last_proposal_log_probs[:5].detach().cpu().numpy()}")
+            print(f"  obs_log_probs (first 5): {obs_log_likelihoods[:5].detach().cpu().numpy()}")
+            # print(f"  transition_log_probs (first 5): {transition_log_probs[:5].detach().cpu().numpy()}")
+            print(f"  log_weights before norm (first 5): {self.log_weights[:5].detach().cpu().numpy()}")
+            print(f"  log_weights stats: min={self.log_weights.min().item():.4f}, max={self.log_weights.max().item():.4f}, std={self.log_weights.std().item():.4f}")
+        # -----------------
+        
         self.log_weights += importance_weights
 
         max_ll = torch.max(obs_log_likelihoods).item()
@@ -426,10 +506,12 @@ class BootstrapParticleFilter(FilteringMethod):
         obs_dim: int = 1,
         process_noise_std: float = 0.25,
         device: str = "cpu",
+        use_optimal_weight_update: bool = False,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
+        self.use_optimal_weight_update = use_optimal_weight_update
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -542,6 +624,46 @@ class BootstrapParticleFilter(FilteringMethod):
 
         return log_prob_flat.reshape(batch_size, n_particles)
 
+    def compute_predictive_log_likelihood(
+        self, x_prev: torch.Tensor, observation: torch.Tensor, dt: float
+    ) -> torch.Tensor:
+        """
+        Compute approx log p(y_t | x_{t-1}) using Inflated Noise approximation (Batched).
+        Supports shapes (Batch, N, D)
+        """
+        batch_size, n_particles, _ = x_prev.shape
+        
+        # 1. Deterministic propagation
+        # Flatten for system integration
+        x_prev_flat = x_prev.reshape(-1, self.state_dim)
+        integration_result = self.system.integrate(x_prev_flat, 2, dt)
+        x_hat_flat = integration_result[:, 1, :] # (Batch*N, D)
+        
+        # 2. Observation projection
+        y_hat_flat = self.system.apply_observation_operator(x_hat_flat)
+        y_hat = y_hat_flat.reshape(batch_size, n_particles, self.obs_dim)
+        
+        # 3. Variance inflation
+        obs_noise_var = self.system.config.obs_noise_std**2
+        process_noise_var = self.process_noise_std**2
+        total_var = obs_noise_var + process_noise_var
+
+        # 4. Compute Gaussian Log-Likelihood
+        # observation: (Batch, obs_dim) -> expand to (Batch, 1, obs_dim)
+        obs_expanded = observation.unsqueeze(1)
+        
+        diff = obs_expanded - y_hat # (Batch, N, obs_dim)
+        
+        if self.obs_dim == 1:
+            log_prob = -0.5 * (diff.squeeze(-1)**2) / total_var - 0.5 * np.log(
+                2 * np.pi * total_var
+            )
+        else:
+            log_prob = -0.5 * torch.sum(diff**2, dim=2) / total_var
+            log_prob -= 0.5 * self.obs_dim * np.log(2 * np.pi * total_var)
+            
+        return log_prob # (Batch, N)
+
     def update_step(self, observation: torch.Tensor) -> None:
         """
         Update particle weights using IMPORTANCE SAMPLING (Batched)
@@ -572,42 +694,73 @@ class BootstrapParticleFilter(FilteringMethod):
             obs_log_likelihoods = -0.5 * torch.sum(diff**2, dim=2) / obs_noise_var
             obs_log_likelihoods -= 0.5 * (self.obs_dim * np.log(2 * np.pi * obs_noise_var))
 
-        # Compute transition log-probabilities: log p(x_t | x_{t-1})
-        transition_log_probs = self.compute_transition_log_prob(
-            self.particles, self.particles_prev, self.system.config.dt
-        )
+        self.last_obs_log_likelihoods = obs_log_likelihoods
 
-        # Compute proposal log-probabilities: log q(x_t | x_{t-1}, y_t)
-        particles_flat = self.particles.reshape(-1, self.state_dim)
-        particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
-        
-        # Expand observation for proposal: (Batch, Obs_dim) -> (Batch, N, Obs_dim) -> (Batch*N, Obs_dim)
-        obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
-        
-        proposal_log_probs_flat = self.proposal.log_prob(
-            particles_flat,
-            particles_prev_flat,
-            obs_flat,
-            self.system.config.dt,
-        )
-        proposal_log_probs = proposal_log_probs_flat.reshape(batch_size, self.n_particles)
+        # OPTIMAL WEIGHT UPDATE BRANCH
+        if self.use_optimal_weight_update:
+            # log w_t = log w_{t-1} + log p(y_t | x_{t-1})
+            predictive_log_probs = self.compute_predictive_log_likelihood(
+                self.particles_prev, observation, self.system.config.dt
+            )
+            importance_weights = predictive_log_probs
 
-        # Update weights: log w_t = log w_{t-1} + log p(y|x) + log p(x|x_prev) - log q(x|x_prev, y)
-        importance_weights = (
-            obs_log_likelihoods + transition_log_probs - proposal_log_probs
-        )
-        
+            # Compute other terms for logging (optional)
+            transition_log_probs = self.compute_transition_log_prob(
+                self.particles, self.particles_prev, self.system.config.dt
+            )
+            
+            # Proposal log probs
+            particles_flat = self.particles.reshape(-1, self.state_dim)
+            particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            
+            proposal_log_probs_flat = self.proposal.log_prob(
+                particles_flat,
+                particles_prev_flat,
+                obs_flat,
+                self.system.config.dt,
+            )
+            proposal_log_probs = proposal_log_probs_flat.reshape(batch_size, self.n_particles)
+            self.last_proposal_log_probs = proposal_log_probs
+            
+        else:
+            # STANDARD WEIGHT UPDATE BRANCH
+            
+            # Compute transition log-probabilities: log p(x_t | x_{t-1})
+            transition_log_probs = self.compute_transition_log_prob(
+                self.particles, self.particles_prev, self.system.config.dt
+            )
+
+            # Compute proposal log-probabilities: log q(x_t | x_{t-1}, y_t)
+            particles_flat = self.particles.reshape(-1, self.state_dim)
+            particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
+            
+            # Expand observation for proposal: (Batch, Obs_dim) -> (Batch, N, Obs_dim) -> (Batch*N, Obs_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            
+            proposal_log_probs_flat = self.proposal.log_prob(
+                particles_flat,
+                particles_prev_flat,
+                obs_flat,
+                self.system.config.dt,
+            )
+            proposal_log_probs = proposal_log_probs_flat.reshape(batch_size, self.n_particles)
+
+            # Update weights: log w_t = log w_{t-1} + log p(y|x) + log p(x|x_prev) - log q(x|x_prev, y)
+            importance_weights = (
+                obs_log_likelihoods + transition_log_probs - proposal_log_probs
+            )
+            
+            self.last_proposal_log_probs = proposal_log_probs
+
         # --- DEBUGGING ---
-        print(f"Step {self.step_count} (Batch 0):")
+        print(f"Step {self.step_count} (Batch 0) [{'Opt' if self.use_optimal_weight_update else 'Std'}]:")
         print(f"  proposal_log_probs (first 5): {proposal_log_probs[0, :5].detach().cpu().numpy()}")
         print(f"  obs_log_probs (first 5): {obs_log_likelihoods[0, :5].detach().cpu().numpy()}")
         print(f"  transition_log_probs (first 5): {transition_log_probs[0, :5].detach().cpu().numpy()}")
         print(f"  log_weights before norm (first 5): {self.log_weights[0, :5].detach().cpu().numpy()}")
         # -----------------
         
-        self.last_proposal_log_probs = proposal_log_probs
-        self.last_obs_log_likelihoods = obs_log_likelihoods
-
         self.log_weights += importance_weights
 
     def resample(self) -> Tuple[List[bool], torch.Tensor]:

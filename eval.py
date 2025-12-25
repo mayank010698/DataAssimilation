@@ -553,6 +553,7 @@ def parse_args():
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance during inference")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
+    parser.add_argument("--use-opt-weight-update", action="store_true", help="Use optimal weight update approximation")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -578,6 +579,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         obs_dim=obs_dim,
         process_noise_std=args.process_noise_std,
         device=args.device,
+        use_optimal_weight_update=args.use_opt_weight_update,
     )
     
     if wandb_run:
@@ -722,6 +724,7 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         obs_dim=obs_dim,
         process_noise_std=args.process_noise_std,
         device=args.device,
+        use_optimal_weight_update=args.use_opt_weight_update,
     )
     
     if wandb_run:

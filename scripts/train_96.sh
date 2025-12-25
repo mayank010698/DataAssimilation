@@ -31,8 +31,10 @@ KERNEL_SIZE=5
 COND_EMBED_DIM=128
 
 # Dataset paths
-DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan"
-DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100"
+# DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan"
+# DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100"
+DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_init3p000"
+DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100_init3p000"
 
 # Indices strings
 INDICES_50="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49"
