@@ -500,6 +500,7 @@ def log_config_to_wandb(
         "proposal_type": type(pf.proposal).__name__,
         "state_dim": pf.state_dim,
         "obs_dim": pf.obs_dim,
+        "resampling_threshold": args.resampling_threshold,
         
         # Proposal configuration
         "proposal_name": args.proposal_type,
@@ -554,6 +555,7 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
     parser.add_argument("--use-opt-weight-update", action="store_true", help="Use optimal weight update approximation")
+    parser.add_argument("--resampling-threshold", type=float, default=0.5, help="Resampling threshold ratio (default: 0.5)")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -580,6 +582,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         process_noise_std=args.process_noise_std,
         device=args.device,
         use_optimal_weight_update=args.use_opt_weight_update,
+        resampling_threshold_ratio=args.resampling_threshold,
     )
     
     if wandb_run:
@@ -725,6 +728,7 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         process_noise_std=args.process_noise_std,
         device=args.device,
         use_optimal_weight_update=args.use_opt_weight_update,
+        resampling_threshold_ratio=args.resampling_threshold,
     )
     
     if wandb_run:

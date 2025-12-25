@@ -27,11 +27,13 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         process_noise_std: float = 0.25,
         device: str = "cpu",
         use_optimal_weight_update: bool = False,
+        resampling_threshold_ratio: float = 0.5,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
         self.use_optimal_weight_update = use_optimal_weight_update
+        self.resampling_threshold_ratio = resampling_threshold_ratio
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -350,7 +352,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
 
         self.weights = weights_unnormalized / weight_sum
         ess = (1.0 / torch.sum(self.weights**2)).item()
-        resample_threshold = self.n_particles / 3
+        resample_threshold = self.n_particles * self.resampling_threshold_ratio
 
         if ess < resample_threshold:
             cumsum = torch.cumsum(self.weights, dim=0)
@@ -507,11 +509,13 @@ class BootstrapParticleFilter(FilteringMethod):
         process_noise_std: float = 0.25,
         device: str = "cpu",
         use_optimal_weight_update: bool = False,
+        resampling_threshold_ratio: float = 0.5,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
         self.use_optimal_weight_update = use_optimal_weight_update
+        self.resampling_threshold_ratio = resampling_threshold_ratio
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -789,7 +793,7 @@ class BootstrapParticleFilter(FilteringMethod):
         
         # Calculate ESS
         ess = 1.0 / torch.sum(self.weights**2, dim=1)
-        resample_threshold = self.n_particles / 3
+        resample_threshold = self.n_particles * self.resampling_threshold_ratio
         
         # Identify which batches need resampling
         needs_resample = ess < resample_threshold
