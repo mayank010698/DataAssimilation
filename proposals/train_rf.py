@@ -333,6 +333,9 @@ def main():
     parser.add_argument('--obs_indices', type=str, default=None,
                         help='Comma-separated indices of observed variables (e.g. "0,2,4")')
     
+    parser.add_argument('--seed', type=int, default=None,
+                        help='Random seed for reproducibility')
+
     args = parser.parse_args()
     
     # Set default output directory
@@ -347,6 +350,10 @@ def main():
             obs_indices = [int(i) for i in args.obs_indices.split(',') if i.strip()]
         except ValueError:
             raise ValueError(f"Invalid format for --obs-indices: {args.obs_indices}. Expected comma-separated integers.")
+    
+    # Set seed if provided
+    if args.seed is not None:
+        pl.seed_everything(args.seed, workers=True)
     
     # Train model
     wandb_logger = None
