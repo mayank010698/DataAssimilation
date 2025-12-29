@@ -12,6 +12,7 @@ __pycache__/
 # other
 datasets/
 rf_runs/
+runs_flowdas/
 logs/
 wandb/
 flowdas-lorenz/
