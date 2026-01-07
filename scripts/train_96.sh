@@ -31,15 +31,13 @@ KERNEL_SIZE=5
 COND_EMBED_DIM=128
 
 # Dataset paths
-# DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan"
-# DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100"
-DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_init3p000"
-DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp50of50_arctan_pnoise0p100_init3p000"
+DATA_DIR_NO_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p200_freq1_comp50of50_arctan_init3p000"
+DATA_DIR_WITH_NOISE="datasets/lorenz96_n2048_len200_dt0p0100_obs0p200_freq1_comp50of50_arctan_pnoise0p100_init3p000"
 
 # Indices strings
-INDICES_50="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49"
-INDICES_25="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24"
-INDICES_10="0,1,2,3,4,5,6,7,8,9"
+COMPONENTS_50="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49"
+COMPONENTS_25="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24"
+COMPONENTS_10="0,1,2,3,4,5,6,7,8,9"
 
 # --- GROUP 1: NO PROCESS NOISE (GPU 0-3) ---
 
@@ -47,10 +45,9 @@ INDICES_10="0,1,2,3,4,5,6,7,8,9"
 echo "Starting Exp 1: No Noise, Full Obs (50) (GPU 0)..."
 CUDA_VISIBLE_DEVICES=0 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_NO_NOISE" \
-    --output_dir "rf_runs/l96_nonoise_full" \
+    --output_dir "rf_runs/l96_nonoise_full_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 50 \
-    --obs_indices "$INDICES_50" \
+    --obs_components "$COMPONENTS_50" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -71,10 +68,9 @@ echo "Started PID $PID1"
 echo "Starting Exp 2: No Noise, Half Obs (25) (GPU 1)..."
 CUDA_VISIBLE_DEVICES=1 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_NO_NOISE" \
-    --output_dir "rf_runs/l96_nonoise_half" \
+    --output_dir "rf_runs/l96_nonoise_half_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 25 \
-    --obs_indices "$INDICES_25" \
+    --obs_components "$COMPONENTS_25" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -95,10 +91,9 @@ echo "Started PID $PID2"
 echo "Starting Exp 3: No Noise, 1/5 Obs (10) (GPU 2)..."
 CUDA_VISIBLE_DEVICES=2 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_NO_NOISE" \
-    --output_dir "rf_runs/l96_nonoise_tenth" \
+    --output_dir "rf_runs/l96_nonoise_tenth_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 10 \
-    --obs_indices "$INDICES_10" \
+    --obs_components "$COMPONENTS_10" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -119,9 +114,8 @@ echo "Started PID $PID3"
 echo "Starting Exp 4: No Noise, No Obs (GPU 3)..."
 CUDA_VISIBLE_DEVICES=3 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_NO_NOISE" \
-    --output_dir "rf_runs/l96_nonoise_no_obs" \
+    --output_dir "rf_runs/l96_nonoise_no_obs_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 0 \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -143,10 +137,9 @@ echo "Started PID $PID4"
 echo "Starting Exp 5: Noise 0.1, Full Obs (50) (GPU 4)..."
 CUDA_VISIBLE_DEVICES=4 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_WITH_NOISE" \
-    --output_dir "rf_runs/l96_noise0p1_full" \
+    --output_dir "rf_runs/l96_noise0p1_full_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 50 \
-    --obs_indices "$INDICES_50" \
+    --obs_components "$COMPONENTS_50" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -167,10 +160,9 @@ echo "Started PID $PID5"
 echo "Starting Exp 6: Noise 0.1, Half Obs (25) (GPU 5)..."
 CUDA_VISIBLE_DEVICES=5 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_WITH_NOISE" \
-    --output_dir "rf_runs/l96_noise0p1_half" \
+    --output_dir "rf_runs/l96_noise0p1_half_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 25 \
-    --obs_indices "$INDICES_25" \
+    --obs_components "$COMPONENTS_25" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -191,10 +183,9 @@ echo "Started PID $PID6"
 echo "Starting Exp 7: Noise 0.1, 1/5 Obs (10) (GPU 6)..."
 CUDA_VISIBLE_DEVICES=6 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_WITH_NOISE" \
-    --output_dir "rf_runs/l96_noise0p1_tenth" \
+    --output_dir "rf_runs/l96_noise0p1_tenth_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 10 \
-    --obs_indices "$INDICES_10" \
+    --obs_components "$COMPONENTS_10" \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \
@@ -215,9 +206,8 @@ echo "Started PID $PID7"
 echo "Starting Exp 8: Noise 0.1, No Obs (GPU 7)..."
 CUDA_VISIBLE_DEVICES=7 nohup python proposals/train_rf.py \
     --data_dir "$DATA_DIR_WITH_NOISE" \
-    --output_dir "rf_runs/l96_noise0p1_no_obs" \
+    --output_dir "rf_runs/l96_noise0p1_no_obs_1230" \
     --state_dim $STATE_DIM \
-    --obs_dim 0 \
     --architecture resnet1d \
     --channels $CHANNELS \
     --num_blocks $NUM_BLOCKS \

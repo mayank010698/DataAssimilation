@@ -27,11 +27,13 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         process_noise_std: float = 0.25,
         device: str = "cpu",
         use_optimal_weight_update: bool = False,
+        resampling_threshold_ratio: float = 0.5,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
         self.use_optimal_weight_update = use_optimal_weight_update
+        self.resampling_threshold_ratio = resampling_threshold_ratio
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -350,7 +352,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
 
         self.weights = weights_unnormalized / weight_sum
         ess = (1.0 / torch.sum(self.weights**2)).item()
-        resample_threshold = self.n_particles / 3
+        resample_threshold = self.n_particles * self.resampling_threshold_ratio
 
         if ess < resample_threshold:
             cumsum = torch.cumsum(self.weights, dim=0)
@@ -507,11 +509,13 @@ class BootstrapParticleFilter(FilteringMethod):
         process_noise_std: float = 0.25,
         device: str = "cpu",
         use_optimal_weight_update: bool = False,
+        resampling_threshold_ratio: float = 0.5,
     ):
         super().__init__(system, state_dim, obs_dim, device)
         self.n_particles = n_particles
         self.process_noise_std = process_noise_std
         self.use_optimal_weight_update = use_optimal_weight_update
+        self.resampling_threshold_ratio = resampling_threshold_ratio
 
         if proposal_distribution is None:
             self.proposal = TransitionProposal(system, process_noise_std)
@@ -583,7 +587,8 @@ class BootstrapParticleFilter(FilteringMethod):
         y_curr_flat = None
         if y_curr is not None:
              y_curr_expanded = y_curr.unsqueeze(1).expand(batch_size, self.n_particles, -1)
-             y_curr_flat = y_curr_expanded.reshape(-1, y_curr.shape[-1])
+             # Explicitly specify first dimension to avoid ambiguity with 0-dim observations
+             y_curr_flat = y_curr_expanded.reshape(batch_size * self.n_particles, y_curr.shape[-1])
 
         # Sample new particles
         # proposal.sample should handle the flat batch of particles
@@ -712,7 +717,7 @@ class BootstrapParticleFilter(FilteringMethod):
             # Proposal log probs
             particles_flat = self.particles.reshape(-1, self.state_dim)
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
-            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
             
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
@@ -736,7 +741,7 @@ class BootstrapParticleFilter(FilteringMethod):
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
             
             # Expand observation for proposal: (Batch, Obs_dim) -> (Batch, N, Obs_dim) -> (Batch*N, Obs_dim)
-            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
             
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
@@ -789,7 +794,7 @@ class BootstrapParticleFilter(FilteringMethod):
         
         # Calculate ESS
         ess = 1.0 / torch.sum(self.weights**2, dim=1)
-        resample_threshold = self.n_particles / 3
+        resample_threshold = self.n_particles * self.resampling_threshold_ratio
         
         # Identify which batches need resampling
         needs_resample = ess < resample_threshold

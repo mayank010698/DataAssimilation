@@ -615,7 +615,12 @@ if __name__ == "__main__":
             run_name = args.run_name
         else:
             run_name = _derive_eval_run_name(args.checkpoint, args.mc_guidance)
-        run = wandb.init(project="rf-proposal-eval", name=run_name, entity="ml-climate")
+        
+        # Ensure wandb dir exists
+        wandb_dir = Path("/data/da_outputs/wandb")
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
+        run = wandb.init(project="rf-proposal-eval", name=run_name, entity="ml-climate", dir=str(wandb_dir))
         
     run_proposal_eval(
         checkpoint_path=args.checkpoint,

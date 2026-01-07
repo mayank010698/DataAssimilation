@@ -20,7 +20,6 @@ from data import (
     Lorenz63,
     Lorenz96,
     TimeAlignedBatchSampler,
-    create_projection_matrix,
     load_config_yaml,
 )
 from models.base_pf import FilteringMethod
@@ -473,7 +472,7 @@ def log_config_to_wandb(
     rf_checkpoint: Optional[str],
 ):
     """Log configuration settings to wandb"""
-    obs_op_type = "linear_projection" if isinstance(config.observation_operator, (np.ndarray, torch.Tensor)) else "arctan"
+    obs_op_type = config.obs_nonlinearity
     
     wandb_config = {
         # Data configuration
@@ -500,6 +499,7 @@ def log_config_to_wandb(
         "proposal_type": type(pf.proposal).__name__,
         "state_dim": pf.state_dim,
         "obs_dim": pf.obs_dim,
+        "resampling_threshold": args.resampling_threshold,
         
         # Proposal configuration
         "proposal_name": args.proposal_type,
@@ -533,6 +533,7 @@ def parse_args():
     )
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation. >1 uses batched evaluation.")
     parser.add_argument("--obs-dim", type=int, default=None)
+    parser.add_argument("--obs-components", type=str, default=None, help="Comma-separated list of observed components (overrides config)")
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
@@ -554,6 +555,7 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
     parser.add_argument("--use-opt-weight-update", action="store_true", help="Use optimal weight update approximation")
+    parser.add_argument("--resampling-threshold", type=float, default=0.33, help="Resampling threshold ratio (default: 0.5)")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -580,6 +582,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         process_noise_std=args.process_noise_std,
         device=args.device,
         use_optimal_weight_update=args.use_opt_weight_update,
+        resampling_threshold_ratio=args.resampling_threshold,
     )
     
     if wandb_run:
@@ -725,6 +728,7 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         process_noise_std=args.process_noise_std,
         device=args.device,
         use_optimal_weight_update=args.use_opt_weight_update,
+        resampling_threshold_ratio=args.resampling_threshold,
     )
     
     if wandb_run:
@@ -900,12 +904,16 @@ def main():
         config.obs_noise_std = args.obs_noise_std
         print(f"Overriding obs_noise_std to {config.obs_noise_std}")
 
+    if args.obs_components is not None:
+        config.obs_components = [int(x) for x in args.obs_components.split(',') if x.strip()]
+        print(f"Overriding obs_components to {config.obs_components}")
+
     # Print config details
     print("\nDataset Configuration:")
     print(f"  num_trajectories: {config.num_trajectories}")
     print(f"  len_trajectory: {config.len_trajectory}")
     print(f"  dt: {config.dt}")
-    obs_op_type = "linear_projection" if isinstance(config.observation_operator, (np.ndarray, torch.Tensor)) else "arctan"
+    obs_op_type = config.obs_nonlinearity
     print(f"  observation_operator: {obs_op_type}")
 
     # Determine observation dimension
@@ -1011,7 +1019,7 @@ def main():
     # Setup Weights & Biases
     wandb_run = None
     if not args.disable_wandb:
-        obs_op_type = "linear_projection" if isinstance(config.observation_operator, (np.ndarray, torch.Tensor)) else "arctan"
+        obs_op_type = config.obs_nonlinearity
         safe_name = (
             args.run_name
             or f"{args.experiment_label}_{obs_op_type}_{args.proposal_type}"
@@ -1021,12 +1029,17 @@ def main():
         if args.batch_size > 1:
             tags.append("batched")
             
+        # Ensure wandb dir exists
+        wandb_dir = Path("/data/da_outputs/wandb")
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+
         wandb_run = wandb.init(
             project=args.wandb_project,
             entity=args.wandb_entity,
             name=safe_name,
             tags=list(dict.fromkeys(tags)),
             reinit=True,
+            dir=str(wandb_dir),
         )
         # Define x-axis for time-series plots
         wandb.define_metric("time_step")

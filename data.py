@@ -11,6 +11,39 @@ import logging
 import yaml
 
 
+class ObservationOperator:
+    """Observation operator y = phi(Hx)"""
+    def __init__(self, obs_components: List[int], nonlinearity: str = "arctan"):
+        self.obs_components = obs_components
+        self.nonlinearity = nonlinearity
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        # Ensure input is tensor
+        if isinstance(x, np.ndarray):
+            x = torch.from_numpy(x).float()
+
+        # 1. Selection (H)
+        # Select components
+        if x.ndim == 1:
+            observed = x[self.obs_components]
+        else:
+            observed = x[..., self.obs_components]
+        
+        # 2. Nonlinearity (phi)
+        if self.nonlinearity == "arctan":
+            return torch.arctan(observed)
+        elif self.nonlinearity in ["linear_projection", "identity", "none"]:
+            return observed
+        elif hasattr(torch, self.nonlinearity):
+            # Allow other torch functions if they exist (e.g. 'tanh', 'sigmoid')
+            func = getattr(torch, self.nonlinearity)
+            return func(observed)
+        else:
+            # Check for numpy equivalents if tensor check failed or if we want generic support
+            # But x is converted to tensor above.
+            raise ValueError(f"Unknown nonlinearity: {self.nonlinearity}")
+
+
 @dataclass
 class DataAssimilationConfig:
     """Configuration for data assimilation experiments"""
@@ -25,8 +58,8 @@ class DataAssimilationConfig:
     obs_noise_std: float = 0.1
     obs_frequency: int = 1
     obs_components: list = None
-    observation_operator: Union[Callable, np.ndarray, torch.Tensor, None] = None
-
+    obs_nonlinearity: str = "arctan"
+    
     # Process noise (for stochastic trajectory generation)
     process_noise_std: float = 0.0  # 0.0 = deterministic dynamics
 
@@ -42,8 +75,6 @@ class DataAssimilationConfig:
         # Note: obs_components default is set by each DynamicalSystem subclass
         if self.system_params is None:
             self.system_params = {}
-        if self.observation_operator is None:
-            self.observation_operator = torch.arctan
 
 
 class DynamicalSystem(ABC):
@@ -52,15 +83,16 @@ class DynamicalSystem(ABC):
     def __init__(self, config: DataAssimilationConfig):
         self.config = config
         self.state_dim = self.get_state_dim()
-        self.obs_dim = len(config.obs_components)
         
-        # Pre-process observation operator for torch
-        self.obs_matrix = None
-        if isinstance(self.config.observation_operator, (np.ndarray, torch.Tensor)):
-            if isinstance(self.config.observation_operator, np.ndarray):
-                self.obs_matrix = torch.from_numpy(self.config.observation_operator).float()
-            else:
-                self.obs_matrix = self.config.observation_operator.float()
+        # Observation operator
+        if config.obs_components is None:
+             # Should be set by subclass, but safety fallback
+             config.obs_components = [0]
+             
+        self.obs_dim = len(config.obs_components)
+        self.observation_operator = ObservationOperator(
+            config.obs_components, config.obs_nonlinearity
+        )
 
     @abstractmethod
     def get_state_dim(self) -> int:
@@ -139,33 +171,7 @@ class DynamicalSystem(ABC):
 
     def apply_observation_operator(self, x: torch.Tensor) -> torch.Tensor:
         """Apply the observation operator h(x)"""
-        # Ensure input is tensor
-        if isinstance(x, np.ndarray):
-            x = torch.from_numpy(x).float()
-
-        if self.obs_matrix is not None:
-            # Linear operator (matrix)
-            H = self.obs_matrix.to(x.device)
-            if x.ndim == 1:
-                return H @ x
-            else:
-                return x @ H.T
-
-        elif callable(self.config.observation_operator):
-            # Handle specific known operators or generic callable
-            if self.config.observation_operator in [torch.arctan, np.arctan, arctan_operator]:
-                 # Use torch.arctan specifically
-                 op = torch.arctan
-            else:
-                 op = self.config.observation_operator
-
-            if x.ndim == 1:
-                observed = x[self.config.obs_components]
-            else:
-                observed = x[..., self.config.obs_components]
-            return op(observed)
-        else:
-            raise TypeError("observation_operator must be callable, numpy array, or torch Tensor")
+        return self.observation_operator(x)
 
     def observe(self, x: torch.Tensor, add_noise: bool = True) -> torch.Tensor:
         """Apply observation operator h(x) + noise"""
@@ -355,16 +361,19 @@ class DataAssimilationDataset(Dataset):
         trajectories_scaled: Optional[np.ndarray] = None,
         observations_scaled: Optional[np.ndarray] = None,
         mode: str = "inference",
+        obs_components: Optional[List[int]] = None,
     ):
         """
         Args:
             system: DynamicalSystem instance
             trajectories: Shape (n_trajectories, n_steps, state_dim)
-            observations: Shape (n_trajectories, n_obs_steps, obs_dim)
+            observations: Shape (n_trajectories, n_obs_steps, full_obs_dim)
             obs_mask: Shape (n_steps,) - boolean mask where True indicates observation available
             trajectories_scaled: Scaled trajectories (optional)
             observations_scaled: Scaled observations (optional)
             mode: 'train', 'inference'
+            obs_components: List of component indices to observe. If None, uses system.config.obs_components.
+                            This allows loading dense observations from disk but only exposing a subset.
         """
         self.system = system
         self.trajectories = trajectories
@@ -373,9 +382,15 @@ class DataAssimilationDataset(Dataset):
         self.trajectories_scaled = trajectories_scaled
         self.observations_scaled = observations_scaled
         self.mode = mode
-
+        
+        # Determine which components to return
+        if obs_components is not None:
+            self.obs_components = obs_components
+        else:
+            self.obs_components = system.config.obs_components
+            
         self.n_trajectories, self.n_steps, self.state_dim = trajectories.shape
-        self.obs_dim = observations.shape[-1]
+        self.obs_dim = len(self.obs_components) # Dimension of *observed* part
 
         self.obs_time_indices = np.where(obs_mask)[0]
 
@@ -397,6 +412,12 @@ class DataAssimilationDataset(Dataset):
             return self._get_inference_item(idx)
         else:
             return self._get_training_item(idx)
+            
+    def _slice_obs(self, obs_tensor):
+        """Slice observations to select only requested components"""
+        if self.obs_components is None:
+            return obs_tensor
+        return obs_tensor[..., self.obs_components]
 
     def _get_inference_item(self, idx):
         """Get single time step for inference"""
@@ -416,9 +437,14 @@ class DataAssimilationDataset(Dataset):
         has_observation = self.obs_mask[time_idx]
         if has_observation:
             obs_idx = np.where(self.obs_time_indices == time_idx)[0][0]
+            
+            # Slice observations here
             y_curr = self.observations[trajectory_idx, obs_idx]
+            y_curr = y_curr[self.obs_components] # Apply sparsity
+            
             if self.observations_scaled is not None:
                 y_curr_scaled = self.observations_scaled[trajectory_idx, obs_idx]
+                y_curr_scaled = y_curr_scaled[self.obs_components] # Apply sparsity
             else:
                 y_curr_scaled = np.zeros_like(y_curr)
         else:
@@ -440,10 +466,13 @@ class DataAssimilationDataset(Dataset):
 
     def _get_training_item(self, idx):
         """Get full trajectory for training"""
+        obs = self.observations[idx]
+        obs = obs[..., self.obs_components] # Apply sparsity
+        
         item = {
             "trajectory_idx": torch.LongTensor([idx]),
             "trajectories": torch.as_tensor(self.trajectories[idx], dtype=torch.float32),
-            "observations": torch.as_tensor(self.observations[idx], dtype=torch.float32),
+            "observations": torch.as_tensor(obs, dtype=torch.float32),
             "obs_mask": torch.as_tensor(self.obs_mask, dtype=torch.bool),
         }
         
@@ -452,8 +481,10 @@ class DataAssimilationDataset(Dataset):
                 self.trajectories_scaled[idx], dtype=torch.float32
             )
         if self.observations_scaled is not None:
+            obs_s = self.observations_scaled[idx]
+            obs_s = obs_s[..., self.obs_components] # Apply sparsity
             item["observations_scaled"] = torch.as_tensor(
-                self.observations_scaled[idx], dtype=torch.float32
+                obs_s, dtype=torch.float32
             )
             
         return item
@@ -463,16 +494,6 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
     """
     Sampler that yields batches of indices corresponding to the same time step
     across multiple trajectories.
-    
-    Given N trajectories of length T, and batch size B:
-    Batch 0: [Traj_0_t0, Traj_1_t0, ..., Traj_B-1_t0]
-    Batch 1: [Traj_0_t1, Traj_1_t1, ..., Traj_B-1_t1]
-    ...
-    Batch T-1: [Traj_0_tT-1, Traj_1_tT-1, ..., Traj_B-1_tT-1]
-    Batch T: [Traj_B_t0, Traj_B+1_t0, ..., Traj_2B-1_t0]
-    
-    This ensures that a single batch processed by the model corresponds to 
-    multiple independent trajectories evolving in parallel.
     """
     
     def __init__(self, 
@@ -481,23 +502,12 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
                  traj_len: int, 
                  batch_size: int,
                  shuffle: bool = False):
-        """
-        Args:
-            data_source_len: Total length of dataset (should be num_trajectories * traj_len)
-            num_trajectories: Total number of trajectories
-            traj_len: Length of each trajectory (number of time steps)
-            batch_size: Number of trajectories to process in parallel
-            shuffle: Whether to shuffle the order of trajectory groups (not time steps within groups)
-        """
         self.data_source_len = data_source_len
         self.num_trajectories = num_trajectories
         self.traj_len = traj_len
         self.batch_size = batch_size
         self.shuffle = shuffle
         
-        if data_source_len != num_trajectories * traj_len:
-             pass
-
         # Calculate number of trajectory groups
         self.num_traj_groups = (num_trajectories + batch_size - 1) // batch_size
 
@@ -517,11 +527,6 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
             
             # Iterate through time steps for this group of trajectories
             for t in range(self.traj_len):
-                # Calculate dataset indices
-                # Assuming dataset is ordered as: 
-                # [Traj0_t0, Traj0_t1..., Traj1_t0, Traj1_t1...]
-                # Index = traj_idx * traj_len + time_idx
-                
                 batch_indices = [
                     traj_idx * self.traj_len + t 
                     for traj_idx in current_batch_trajs
@@ -597,6 +602,8 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                 )
             
             x0 = self.system.sample_initial_state(n_samples)
+            if n_samples == 1 and x0.ndim == 1:
+                x0 = x0.unsqueeze(0)
             noise_std = process_noise_std if use_process_noise else 0.0
             trajectories = self.system.integrate(x0, total_steps, self.config.dt, process_noise_std=noise_std)
             
@@ -715,9 +722,6 @@ class DataAssimilationDataModule(pl.LightningDataModule):
             self._generate_data()
 
         # Open both files
-        # We need to keep them open or read into memory. 
-        # For simplicity/performance with small datasets (Lorenz63), reading into memory is fine.
-        
         with h5py.File(data_file, "r") as f, h5py.File(data_scaled_file, "r") as f_scaled:
             obs_mask = f["obs_mask"][:]
             
@@ -752,7 +756,8 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                     obs_mask, 
                     trajectories_scaled=train_traj_scaled,
                     observations_scaled=train_obs_scaled,
-                    mode="train"
+                    mode="train",
+                    obs_components=self.config.obs_components
                 )
 
                 val_traj = f["val/trajectories"][:]
@@ -767,7 +772,8 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                     obs_mask, 
                     trajectories_scaled=val_traj_scaled,
                     observations_scaled=val_obs_scaled,
-                    mode="train"
+                    mode="train",
+                    obs_components=self.config.obs_components
                 )
 
             if stage == "test" or stage is None:
@@ -783,7 +789,8 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                     obs_mask, 
                     trajectories_scaled=test_traj_scaled,
                     observations_scaled=test_obs_scaled,
-                    mode="inference"
+                    mode="inference",
+                    obs_components=self.config.obs_components
                 )
 
     def train_dataloader(self):
@@ -821,36 +828,13 @@ class DataAssimilationDataModule(pl.LightningDataModule):
 
 
 # Config serialization utilities
-def _get_observation_operator_type(observation_operator) -> str:
-    """Get string identifier for observation operator"""
-    if isinstance(observation_operator, (np.ndarray, torch.Tensor)):
-        return "linear_projection"
-    elif callable(observation_operator):
-        if observation_operator in [np.arctan, torch.arctan, arctan_operator]:
-            return "arctan"
-        else:
-            return "custom_callable"
-    else:
-        return "unknown"
-
 
 def config_to_dict(config: DataAssimilationConfig) -> Dict[str, Any]:
     """Convert DataAssimilationConfig to serializable dictionary"""
     config_dict = asdict(config)
     
-    # Convert observation_operator to string identifier
-    obs_op_type = _get_observation_operator_type(config.observation_operator)
-    config_dict["observation_operator_type"] = obs_op_type
-    
-    # If it's a linear projection, save the matrix
-    if isinstance(config.observation_operator, (np.ndarray, torch.Tensor)):
-        if isinstance(config.observation_operator, torch.Tensor):
-            config_dict["observation_operator_matrix"] = config.observation_operator.cpu().numpy().tolist()
-        else:
-            config_dict["observation_operator_matrix"] = config.observation_operator.tolist()
-    
-    # Remove the non-serializable observation_operator
-    config_dict.pop("observation_operator", None)
+    # Remove complex objects if any (none currently, but good practice)
+    # config_dict.pop("observation_operator", None) # Removed from class
     
     # Convert numpy arrays in system_params to lists
     if config_dict.get("system_params"):
@@ -874,36 +858,18 @@ def dict_to_config(config_dict: Dict[str, Any]) -> DataAssimilationConfig:
     config_dict = config_dict.copy()
     
     # Ensure obs_components has a default for backward compatibility with old configs
-    # (New configs will have obs_components saved; this handles edge cases)
     if config_dict.get("obs_components") is None:
         config_dict["obs_components"] = [0]
-    
-    # Reconstruct observation_operator
-    obs_op_type = config_dict.pop("observation_operator_type", "arctan")
-    obs_components = config_dict.get("obs_components", [0])
-    
-    if obs_op_type == "linear_projection":
-        if "observation_operator_matrix" in config_dict:
-            observation_operator = np.array(config_dict.pop("observation_operator_matrix"))
-            # NOTE: We keep it as numpy in config, converted to torch in DynamicalSystem.__init__
-        else:
-            # Reconstruct from obs_components
-            state_dim = 3  # Default for Lorenz63, could be made configurable
-            observation_operator = create_projection_matrix(state_dim, obs_components)
-    elif obs_op_type == "arctan":
-        observation_operator = torch.arctan # Use torch.arctan
-    else:
-        # Default to arctan if unknown
-        observation_operator = torch.arctan
-    
-    config_dict["observation_operator"] = observation_operator
     
     # Backward compatibility: default process_noise_std if not present
     if "process_noise_std" not in config_dict:
         config_dict["process_noise_std"] = 0.0
+        
+    # Backward compatibility: handle old keys if present
+    config_dict.pop("observation_operator_type", None)
+    config_dict.pop("observation_operator_matrix", None)
     
-    # Convert system_params lists back to numpy arrays if needed (or just leave as lists/values)
-    # DynamicalSystem can handle them. But preserving original behavior is good.
+    # Convert system_params lists back to numpy arrays if needed
     if config_dict.get("system_params"):
         system_params = {}
         for k, v in config_dict["system_params"].items():
@@ -920,8 +886,6 @@ def generate_dataset_directory_name(
     config: DataAssimilationConfig, system_name: str = "lorenz63"
 ) -> str:
     """Generate comprehensive directory name from config parameters"""
-    obs_op_type = _get_observation_operator_type(config.observation_operator)
-    
     # For many obs_components (like Lorenz96), just indicate count
     if len(config.obs_components) > 5:
         obs_comp_str = f"{len(config.obs_components)}of{config.system_params.get('dim', len(config.obs_components))}"
@@ -937,7 +901,7 @@ def generate_dataset_directory_name(
         f"obs{config.obs_noise_std:.3f}".replace(".", "p"),
         f"freq{config.obs_frequency}",
         f"comp{obs_comp_str}",
-        obs_op_type,
+        config.obs_nonlinearity,
     ]
     
     # Add process noise to directory name if non-zero
@@ -966,37 +930,12 @@ def load_config_yaml(path: Path) -> DataAssimilationConfig:
     return dict_to_config(config_dict)
 
 
-# Helper functions for creating observation operators
-def create_projection_matrix(state_dim, obs_components):
-    """Create projection matrix to select specific state components"""
-    obs_dim = len(obs_components)
-    H = np.zeros((obs_dim, state_dim))
-    for i, comp in enumerate(obs_components):
-        H[i, comp] = 1.0
-    return H
-
-
-def identity_operator(x):
-    """Identity observation operator: h(x) = x"""
-    return x
-
-
-def arctan_operator(x):
-    """Arctan observation operator: h(x) = arctan(x)"""
-    if isinstance(x, torch.Tensor):
-        return torch.arctan(x)
-    return np.arctan(x)
-
-
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     print("Testing observation operators...")
 
-    print("\n1. Linear projection matrix [0, 2]:")
-    H = create_projection_matrix(3, [0, 2])
-    print(f"Projection matrix:\n{H}")
-
+    print("\n1. Linear projection (Identity nonlinearity):")
     config_linear = DataAssimilationConfig(
         num_trajectories=10,
         len_trajectory=50,
@@ -1005,7 +944,7 @@ if __name__ == "__main__":
         obs_noise_std=0.1,
         obs_frequency=5,
         obs_components=[0, 2],
-        observation_operator=H,
+        obs_nonlinearity="identity",
         system_params={"sigma": 10.0, "rho": 28.0, "beta": 8.0 / 3.0},
     )
 
@@ -1019,7 +958,7 @@ if __name__ == "__main__":
     print("\n2. Nonlinear arctan:")
     config_arctan = DataAssimilationConfig(
         obs_components=[0],
-        observation_operator=torch.arctan,
+        obs_nonlinearity="arctan",
     )
     system_arctan = Lorenz63(config_arctan)
     result_arctan = system_arctan.apply_observation_operator(test_state)
@@ -1037,7 +976,7 @@ if __name__ == "__main__":
     print("\n4. Testing Lorenz 96 (High-dim + Nonlinear Obs)")
     config_l96 = DataAssimilationConfig(
         obs_components=[0, 1, 2],
-        observation_operator=torch.arctan,
+        obs_nonlinearity="arctan",
         system_params={"dim": 100, "F": 8}
     )
     system_l96 = Lorenz96(config_l96)
