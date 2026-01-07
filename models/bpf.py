@@ -587,7 +587,8 @@ class BootstrapParticleFilter(FilteringMethod):
         y_curr_flat = None
         if y_curr is not None:
              y_curr_expanded = y_curr.unsqueeze(1).expand(batch_size, self.n_particles, -1)
-             y_curr_flat = y_curr_expanded.reshape(-1, y_curr.shape[-1])
+             # Explicitly specify first dimension to avoid ambiguity with 0-dim observations
+             y_curr_flat = y_curr_expanded.reshape(batch_size * self.n_particles, y_curr.shape[-1])
 
         # Sample new particles
         # proposal.sample should handle the flat batch of particles
@@ -716,7 +717,7 @@ class BootstrapParticleFilter(FilteringMethod):
             # Proposal log probs
             particles_flat = self.particles.reshape(-1, self.state_dim)
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
-            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
             
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
@@ -740,7 +741,7 @@ class BootstrapParticleFilter(FilteringMethod):
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
             
             # Expand observation for proposal: (Batch, Obs_dim) -> (Batch, N, Obs_dim) -> (Batch*N, Obs_dim)
-            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(-1, self.obs_dim)
+            obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
             
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
