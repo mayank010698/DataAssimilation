@@ -223,7 +223,15 @@ def evaluate(args):
     depth = train_config.get('depth', 2)
     use_bn = train_config.get('use_bn', False)
     
+    # ResNet1D params if available
+    channels = train_config.get('channels', 64)
+    num_blocks = train_config.get('num_blocks', 6)
+    kernel_size = train_config.get('kernel_size', 5)
+    obs_components = train_config.get('obs_components', None)
+    
     logging.info(f"Model Architecture: {architecture}, Width: {width}, Depth: {depth}")
+    if architecture == 'resnet1d':
+        logging.info(f"ResNet Params: Channels: {channels}, Num Blocks: {num_blocks}, Kernel: {kernel_size}")
     
     model = ScoreNet(
         marginal_prob_std=None,
@@ -232,9 +240,27 @@ def evaluate(args):
         hidden_depth=depth,
         embed_dim=width,
         use_bn=use_bn,
-        architecture=architecture
+        architecture=architecture,
+        # ResNet1D params
+        channels=channels,
+        num_blocks=num_blocks,
+        kernel_size=kernel_size,
+        # Eval usually assumes no obs conditioning in the score model itself if trained without
+        # But we pass what's in config
+        # Note: obs_dim depends on use_observations in training
+        obs_dim=0, # Assuming no_obs for these experiments, or we should infer?
+        # Ideally we infer obs_dim from config 'use_observations'
+        # But here we hardcode 0 if not present, or try to respect training config?
+        # The 'no_obs' models were trained with use_observations=False
     ).to(args.device)
     
+    # Correct obs_dim/indices if trained with observations
+    if train_config.get('use_observations', False):
+        # We need to reconstruct obs_dim and indices
+        # This requires the training da_config usually, or just what's in train_config
+        # train_config saves all args, including obs_components string
+        pass # Not handling reconstruction of obs conditioning for now as we focus on no_obs models
+        
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
@@ -248,8 +274,16 @@ def evaluate(args):
     
     # WandB setup
     if args.use_wandb and wandb is not None:
-        run_name = f"flowdas_eval_{system_class.__name__}_{args.num_steps}steps"
-        wandb.init(project="FlowDAS-Eval", config=args.__dict__, name=run_name, entity=args.wandb_entity)
+        if args.run_name:
+            run_name = args.run_name
+        else:
+            run_name = f"flowdas_eval_{system_class.__name__}_{args.num_steps}steps"
+        
+        # Ensure wandb dir exists
+        wandb_dir = Path("/data/da_outputs/wandb")
+        wandb_dir.mkdir(parents=True, exist_ok=True)
+        
+        wandb.init(project="FlowDAS-Eval", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
         
     # Data structure to hold detailed results for plotting
     trajectory_results = {}
@@ -270,6 +304,7 @@ def evaluate(args):
             
             # Init results for this traj
             trajectory_results[i] = {
+                "trajectory_idx": i,
                 "trajectory_data": [],
                 "rmse_sum": 0.0,
                 "count": 0
@@ -416,7 +451,7 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
     parser.add_argument("--config", type=str, help="Path to data config (optional, inferred from checkpoint)")
     parser.add_argument("--data_dir", type=str, help="Path to dataset (optional, inferred from checkpoint)")
-    parser.add_argument("--results_dir", type=str, default="results/flowdas_eval", help="Directory to save results")
+    parser.add_argument("--results_dir", type=str, default="/data/da_outputs/results/flowdas_eval", help="Directory to save results")
     parser.add_argument("--device", type=str, default="cuda", help="Device")
     
     parser.add_argument("--num_trajs", type=int, default=-1, help="Number of trajectories to evaluate")
@@ -428,6 +463,7 @@ def parse_args():
     
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
     parser.add_argument("--wandb_entity", type=str, default="ml-climate", help="WandB entity")
+    parser.add_argument("--run_name", type=str, default=None, help="WandB run name")
     
     return parser.parse_args()
 
