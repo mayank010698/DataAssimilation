@@ -111,7 +111,7 @@ class ScoreNet(nn.Module):
                 **kwargs
             )
 
-    def forward(self, x, t, extra_elements=None):
+    def forward(self, x, t, extra_elements=None, y=None):
         if self.architecture == 'mlp':
             # Combine time t and extra elements
             if extra_elements is not None:
@@ -146,7 +146,7 @@ class ScoreNet(nn.Module):
             # t needs to be (batch, 1)
             if t.dim() == 1:
                 t = t.unsqueeze(-1)
-            return self.net(x, t, x_prev=extra_elements)
+            return self.net(x, t, x_prev=extra_elements, y=y)
 
 # =============================================================================
 # Loss Function (Stochastic Interpolant)
@@ -160,7 +160,10 @@ def loss_fn(model, x):
     cond_squeezed = x['cond']
     target = x['drift_target']
     
-    score = model(zt_squeezed, x['t'], extra_elements=cond_squeezed)
+    # Check for observations in batch (passed from prepare_batch)
+    y = x.get('y', None)
+    
+    score = model(zt_squeezed, x['t'], extra_elements=cond_squeezed, y=y)
     loss = (score - target).pow(2).sum(-1).mean() # Mean Squared Error
 
     return loss, score.shape[0]
@@ -175,15 +178,22 @@ def prepare_batch(batch, device='cuda:0', config=None):
     batch is dict with 'x_prev', 'x_curr', 'x_prev_scaled', 'x_curr_scaled'
     """
     # Check if batch is dict (from new dataloader) or tensor (legacy)
+    y_curr = None
     if isinstance(batch, dict) and 'x_prev' in batch:
         # Using new DataAssimilationDataset
         # We prefer scaled data for training if available
         if 'x_prev_scaled' in batch and batch['x_prev_scaled'] is not None:
             z0 = batch['x_prev_scaled'].to(device)
             z1 = batch['x_curr_scaled'].to(device)
+            
+            # Extract observations (scaled) if present and requested
+            if 'y_curr_scaled' in batch:
+                y_curr = batch['y_curr_scaled'].to(device)
         else:
             z0 = batch['x_prev'].to(device)
             z1 = batch['x_curr'].to(device)
+            if 'y_curr' in batch:
+                y_curr = batch['y_curr'].to(device)
         
         N = z0.shape[0]
         # Ensure shapes are flat (N, D)
@@ -211,6 +221,9 @@ def prepare_batch(batch, device='cuda:0', config=None):
         'z1': z1, 
         'N': N
     }
+    
+    if y_curr is not None:
+        D['y'] = y_curr
 
     # Interpolant functions
     def wide(t):
