@@ -146,7 +146,7 @@ def train_rectified_flow(
         num_workers=num_workers,
         window=1,
         use_observations=use_observations,
-        obs_indices=obs_indices,
+        obs_components=obs_indices,
     )
     
     # Create model
@@ -330,7 +330,7 @@ def main():
     parser.add_argument('--guidance-scale', type=float, default=1.0,
                         help='Default scale for Monte Carlo guidance')
 
-    parser.add_argument('--obs_indices', type=str, default=None,
+    parser.add_argument('--obs_components', type=str, default=None,
                         help='Comma-separated indices of observed variables (e.g. "0,2,4")')
     
     parser.add_argument('--seed', type=int, default=None,
@@ -341,15 +341,30 @@ def main():
     # Set default output directory
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = f"./rf_runs/run_{timestamp}"
+        args.output_dir = f"/data/da_outputs/rf_runs/run_{timestamp}"
     
-    # Parse obs_indices
-    obs_indices = None
-    if args.obs_indices is not None:
+    # Parse obs_components
+    obs_components = None
+    if args.obs_components is not None:
         try:
-            obs_indices = [int(i) for i in args.obs_indices.split(',') if i.strip()]
+            obs_components = [int(i) for i in args.obs_components.split(',') if i.strip()]
         except ValueError:
-            raise ValueError(f"Invalid format for --obs-indices: {args.obs_indices}. Expected comma-separated integers.")
+            raise ValueError(f"Invalid format for --obs-components: {args.obs_components}. Expected comma-separated integers.")
+    else:
+        # Try to load from config.yaml to get default components
+        config_path = Path(args.data_dir) / "config.yaml"
+        if config_path.exists():
+             try:
+                 from data import load_config_yaml
+                 config = load_config_yaml(config_path)
+                 obs_components = config.obs_components
+                 print(f"Loaded obs_components from config.yaml: {obs_components}")
+             except Exception as e:
+                 print(f"Could not load obs_components from config.yaml: {e}")
+
+    # Infer obs_dim from obs_components if provided
+    if obs_components is not None:
+        args.obs_dim = len(obs_components)
     
     # Set seed if provided
     if args.seed is not None:
@@ -382,7 +397,7 @@ def main():
             time_embed_dim=args.time_embed_dim,
             mc_guidance=args.mc_guidance,
             guidance_scale=args.guidance_scale,
-            obs_indices=obs_indices,
+            obs_indices=obs_components,
         )
         checkpoint_to_eval = best_checkpoint
     else:

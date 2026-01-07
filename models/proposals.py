@@ -305,6 +305,15 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
         self.obs_std = obs_std.to(device) if obs_std is not None else None
         
+        # Slice observation scalers if specific components requested
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                # obs_mean is from data_scaled.h5, which is DENSE
+                # obs_components are indices into that dense vector
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+        
         # Override steps if provided
         if num_likelihood_steps is not None:
             self.rf_model.num_likelihood_steps = num_likelihood_steps
@@ -323,18 +332,35 @@ class RectifiedFlowProposal(ProposalDistribution):
             
         # Construct observation_fn for guidance if enabled
         self.observation_fn = None
-        if self.rf_model.mc_guidance and obs_components is not None:
-            self.obs_components = obs_components
-            
-            # NOTE: guidance is computed in SCALED space.
-            # So observation_fn needs to act on scaled x.
-            # But obs_components indices are valid for state vector regardless of scaling
-            # (assuming scaling is component-wise or linear).
-            def obs_fn(x):
-                # x is (..., state_dim)
-                return x[..., self.obs_components]
-            
-            self.observation_fn = obs_fn
+        
+        if self.rf_model.mc_guidance:
+            if self.system is not None:
+                # Robust observation function that handles scaling and nonlinearity
+                def obs_fn(x_scaled):
+                    # x_scaled is in scaled space
+                    # 1. Unscale x
+                    x_unscaled = self.system.postprocess(x_scaled)
+                    
+                    # 2. Apply full observation operator (selection + nonlinearity)
+                    y_pred = self.system.apply_observation_operator(x_unscaled)
+                    
+                    # 3. Scale y (to match the space where guidance is computed)
+                    if self.obs_mean is not None and self.obs_std is not None:
+                         y_pred_scaled = (y_pred - self.obs_mean) / self.obs_std
+                         return y_pred_scaled
+                    return y_pred
+                
+                self.observation_fn = obs_fn
+                
+            elif obs_components is not None:
+                # Fallback to simple slicing if system is not available
+                self.obs_components = obs_components
+                
+                def obs_fn_simple(x):
+                    # x is (..., state_dim)
+                    return x[..., self.obs_components]
+                
+                self.observation_fn = obs_fn_simple
             
         # Get state_dim from model
         self.state_dim = self.rf_model.state_dim

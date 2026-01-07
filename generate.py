@@ -15,7 +15,6 @@ from data import (
     DataAssimilationDataModule,
     Lorenz63,
     Lorenz96,
-    create_projection_matrix,
     generate_dataset_directory_name,
     save_config_yaml,
 )
@@ -58,17 +57,19 @@ def parse_args():
     # Observation configuration
     parser.add_argument("--obs-noise-std", type=float, default=0.25)
     parser.add_argument("--obs-frequency", type=int, default=2)
+    # obs-components is ignored for generation (always dense) but kept for compatibility/future use
     parser.add_argument(
         "--obs-components",
         type=str,
         default=None,
-        help="Comma-separated list of observed components (default: all for L96, [0] for L63)",
+        help="Ignored for generation (always dense). Use during evaluation/training.",
     )
     parser.add_argument(
         "--observation-operator",
         type=str,
-        choices=["linear_projection", "arctan"],
+        choices=["linear_projection", "arctan", "identity"],
         default="arctan",
+        help="Observation nonlinearity type"
     )
     parser.add_argument("--state-dim", type=int, default=None, help="State dimension (auto-detected from system)")
 
@@ -151,7 +152,6 @@ def main():
             "rho": args.system_rho,
             "beta": args.system_beta,
         }
-        default_obs_components = [0]
     elif args.system == "lorenz96":
         system_class = Lorenz96
         system_name = "lorenz96"
@@ -161,7 +161,6 @@ def main():
             "F": args.l96_forcing,
             "init_std": args.l96_init_std,
         }
-        default_obs_components = list(range(args.l96_dim))  # observe all by default
     else:
         raise ValueError(f"Unknown system: {args.system}")
 
@@ -169,18 +168,9 @@ def main():
     if args.state_dim is not None:
         state_dim = args.state_dim
 
-    # Parse observation components
-    if args.obs_components is not None:
-        obs_components = parse_int_list(args.obs_components)
-        if not obs_components:
-            raise ValueError("At least one observation component must be specified.")
-    else:
-        obs_components = default_obs_components
-
-    if args.observation_operator == "linear_projection":
-        observation_operator = create_projection_matrix(state_dim, obs_components)
-    else:
-        observation_operator = np.arctan
+    # FORCE DENSE OBSERVATIONS
+    obs_components = list(range(state_dim))
+    print(f"Generating DENSE observations for all {state_dim} components.")
 
     config = DataAssimilationConfig(
         num_trajectories=args.num_trajectories,
@@ -190,7 +180,7 @@ def main():
         obs_noise_std=args.obs_noise_std,
         obs_frequency=args.obs_frequency,
         obs_components=obs_components,
-        observation_operator=observation_operator,
+        obs_nonlinearity=args.observation_operator,
         process_noise_std=args.process_noise_std,
         system_params=system_params,
         train_ratio=args.train_ratio,
@@ -218,8 +208,8 @@ def main():
     print(f"  dt: {config.dt}")
     print(f"  obs_noise_std: {config.obs_noise_std}")
     print(f"  obs_frequency: {config.obs_frequency}")
-    print(f"  obs_components: {len(obs_components)} components")
-    print(f"  observation_operator: {args.observation_operator}")
+    print(f"  obs_components: All {len(obs_components)} (Dense)")
+    print(f"  obs_nonlinearity: {config.obs_nonlinearity}")
     print(f"  process_noise_std: {config.process_noise_std}" + (" (training only)" if config.process_noise_std > 0 else ""))
     print(f"  system_params: {config.system_params}")
 
@@ -265,4 +255,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

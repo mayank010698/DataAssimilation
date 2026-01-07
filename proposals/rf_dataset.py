@@ -93,7 +93,7 @@ class RFDataModule(pl.LightningDataModule):
         num_workers: int = 4,
         window: int = 1,
         use_observations: bool = False,
-        obs_indices: Optional[list] = None,
+        obs_components: Optional[list] = None,
     ):
         super().__init__()
         self.data_dir = Path(data_dir)
@@ -101,7 +101,7 @@ class RFDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.window = window
         self.use_observations = use_observations
-        self.obs_indices = obs_indices
+        self.obs_components = obs_components
         
         self.train_dataset = None
         self.val_dataset = None
@@ -135,16 +135,16 @@ class RFDataModule(pl.LightningDataModule):
                     val_obs = f["val/observations"][:]
                     
                     logging.info(f"Original obs shape: {train_obs.shape}")
-                    logging.info(f"obs_indices in DataModule: {self.obs_indices}")
+                    logging.info(f"obs_components in DataModule: {self.obs_components}")
 
                     # Filter observations if indices are provided
-                    if self.obs_indices is not None:
-                        # obs_indices is a list of integers
+                    if self.obs_components is not None:
+                        # obs_components is a list of integers
                         # We need to slice the last dimension
-                        train_obs = train_obs[..., self.obs_indices]
-                        val_obs = val_obs[..., self.obs_indices]
+                        train_obs = train_obs[..., self.obs_components]
+                        val_obs = val_obs[..., self.obs_components]
                         
-                        logging.info(f"Filtered observations to {len(self.obs_indices)} indices")
+                        logging.info(f"Filtered observations to {len(self.obs_components)} components")
                         logging.info(f"New obs shape: {train_obs.shape}")
                 
                 self.train_dataset = RFTransitionDataset(
@@ -168,8 +168,8 @@ class RFDataModule(pl.LightningDataModule):
                 if self.use_observations:
                     test_obs = f["test/observations"][:]
                     
-                    if self.obs_indices is not None:
-                        test_obs = test_obs[..., self.obs_indices]
+                    if self.obs_components is not None:
+                        test_obs = test_obs[..., self.obs_components]
                 
                 self.test_dataset = RFTransitionDataset(
                     test_traj,
