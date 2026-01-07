@@ -349,6 +349,236 @@ class Lorenz96(DynamicalSystem):
         init_std = self.init_std.to(device) if isinstance(self.init_std, torch.Tensor) else torch.as_tensor(self.init_std, device=device)
         return init_mean + init_std * x
 
+
+def generate_dataset_splits(system: DynamicalSystem, config: DataAssimilationConfig, initial_states: Optional[Dict[str, torch.Tensor]] = None, precomputed_splits: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None) -> Tuple[Dict[str, Dict[str, np.ndarray]], np.ndarray]:
+    """
+    Generate trajectory data (splits).
+    
+    Args:
+        system: DynamicalSystem instance
+        config: DataAssimilationConfig instance
+        initial_states: Optional dictionary with keys 'train', 'val', 'test' containing initial states (tensors).
+                       If provided, these are used instead of sampling new ones.
+        precomputed_splits: Optional dictionary with keys 'train', 'val', 'test' containing tuples (trajectories, observations).
+                            If provided, these are used directly instead of generating new data.
+                       
+    Returns:
+        splits_unscaled: Dictionary containing train/val/test splits, each with 'trajectories' and 'observations'
+        obs_mask: Boolean mask indicating which time steps are observed
+    """
+    total_steps = config.warmup_steps + config.len_trajectory
+    
+    # Calculate split sizes
+    n_train = int(config.train_ratio * config.num_trajectories)
+    n_val = int(config.val_ratio * config.num_trajectories)
+    n_test = config.num_trajectories - n_train - n_val
+    
+    process_noise_std = config.process_noise_std
+    if process_noise_std > 0:
+        logging.info(f"Generating training data with process noise std={process_noise_std}")
+    
+    # Generate observations mask (same for all splits)
+    obs_mask = np.zeros(config.len_trajectory, dtype=bool)
+    obs_mask[:: config.obs_frequency] = True
+    obs_time_indices = np.where(obs_mask)[0]
+    
+    def generate_split(n_samples: int, use_process_noise: bool, x0_given: Optional[torch.Tensor] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Generate trajectories and observations for a split."""
+        if n_samples == 0:
+            state_dim = system.state_dim
+            obs_dim = system.obs_dim
+            return (
+                np.zeros((0, config.len_trajectory, state_dim)),
+                np.zeros((0, len(obs_time_indices), obs_dim)),
+            )
+        
+        if x0_given is not None:
+            x0 = x0_given
+            # Check if x0 size matches n_samples (allow mismatch if we just want to use provided x0 regardless of n_samples? 
+            # Better to be strict or allow slicing if x0 is larger)
+            if len(x0) != n_samples:
+                 # If provided x0 is larger, slice it?
+                 if len(x0) > n_samples:
+                     x0 = x0[:n_samples]
+                 else:
+                     raise ValueError(f"Provided initial states size {len(x0)} is smaller than split size {n_samples}")
+        else:
+            x0 = system.sample_initial_state(n_samples)
+            
+        if n_samples == 1 and x0.ndim == 1:
+            x0 = x0.unsqueeze(0)
+
+        noise_std = process_noise_std if use_process_noise else 0.0
+        trajectories = system.integrate(x0, total_steps, config.dt, process_noise_std=noise_std)
+        
+        # Remove warmup steps
+        trajectories = trajectories[:, config.warmup_steps:, :]
+        
+        # Generate observations
+        observations = []
+        for t in obs_time_indices:
+            obs_t = system.observe(trajectories[:, t, :], add_noise=True)
+            observations.append(obs_t)
+        observations = torch.stack(observations, dim=1)
+        
+        return trajectories.cpu().numpy(), observations.cpu().numpy()
+    
+    # Get initial states if provided
+    x0_train = initial_states.get("train") if initial_states else None
+    x0_val = initial_states.get("val") if initial_states else None
+    x0_test = initial_states.get("test") if initial_states else None
+
+    # Generate each split separately
+    
+    # Training data: with process noise (if configured)
+    if precomputed_splits and "train" in precomputed_splits:
+        train_traj, train_obs = precomputed_splits["train"]
+    else:
+        train_traj, train_obs = generate_split(n_train, use_process_noise=True, x0_given=x0_train)
+        
+    # Validation and test data: always deterministic
+    if precomputed_splits and "val" in precomputed_splits:
+        val_traj, val_obs = precomputed_splits["val"]
+    else:
+        val_traj, val_obs = generate_split(n_val, use_process_noise=False, x0_given=x0_val)
+        
+    if precomputed_splits and "test" in precomputed_splits:
+        test_traj, test_obs = precomputed_splits["test"]
+    else:
+        test_traj, test_obs = generate_split(n_test, use_process_noise=False, x0_given=x0_test)
+    
+    splits_unscaled = {
+        "train": {"trajectories": train_traj, "observations": train_obs},
+        "val": {"trajectories": val_traj, "observations": val_obs},
+        "test": {"trajectories": test_traj, "observations": test_obs},
+    }
+    
+    return splits_unscaled, obs_mask
+
+
+def save_generated_data(data_dir: Path, splits_unscaled: Dict, obs_mask: np.ndarray):
+    """
+    Calculate scalers and save data to disk.
+    
+    Args:
+        data_dir: Directory to save data to
+        splits_unscaled: Dictionary containing train/val/test splits (from generate_dataset_splits)
+        obs_mask: Boolean mask indicating which time steps are observed
+    """
+    if not data_dir.exists():
+        data_dir.mkdir(parents=True)
+        
+    # Get state dim from first non-empty split for scaler computation
+    n_train = len(splits_unscaled["train"]["trajectories"])
+    train_traj = splits_unscaled["train"]["trajectories"]
+    train_obs = splits_unscaled["train"]["observations"]
+    
+    if n_train > 0:
+        state_dim = train_traj.shape[-1]
+        obs_dim = train_obs.shape[-1]
+    else:
+        # Fallback to val or test
+        if len(splits_unscaled["val"]["trajectories"]) > 0:
+            state_dim = splits_unscaled["val"]["trajectories"].shape[-1]
+            obs_dim = splits_unscaled["val"]["observations"].shape[-1]
+        elif len(splits_unscaled["test"]["trajectories"]) > 0:
+            state_dim = splits_unscaled["test"]["trajectories"].shape[-1]
+            obs_dim = splits_unscaled["test"]["observations"].shape[-1]
+        else:
+             # Empty dataset?
+             state_dim = 1
+             obs_dim = 1
+
+    # Fit scaler on train trajectories
+    if n_train > 0:
+        train_traj_flat = train_traj.reshape(-1, state_dim)
+        scaler_mean = np.mean(train_traj_flat, axis=0)
+        scaler_std = np.std(train_traj_flat, axis=0)
+        
+        train_obs_flat = train_obs.reshape(-1, obs_dim)
+        obs_scaler_mean = np.mean(train_obs_flat, axis=0)
+        obs_scaler_std = np.std(train_obs_flat, axis=0)
+    else:
+        # Use defaults if no training data
+        scaler_mean = np.zeros(state_dim)
+        scaler_std = np.ones(state_dim)
+        obs_scaler_mean = np.zeros(obs_dim)
+        obs_scaler_std = np.ones(obs_dim)
+        
+    # Avoid division by zero
+    scaler_std = np.where(scaler_std < 1e-8, 1.0, scaler_std)
+    obs_scaler_std = np.where(obs_scaler_std < 1e-8, 1.0, obs_scaler_std)
+
+    # Apply scaler to all splits
+    splits_scaled = {}
+    for split_name, split_data in splits_unscaled.items():
+        traj = split_data["trajectories"]
+        obs = split_data["observations"]
+        
+        if len(traj) == 0:
+             splits_scaled[split_name] = {
+                "trajectories": traj,
+                "observations": obs,
+            }
+             continue
+        
+        # Scale trajectories
+        traj_flat = traj.reshape(-1, traj.shape[-1])
+        traj_scaled_flat = (traj_flat - scaler_mean) / scaler_std
+        traj_scaled = traj_scaled_flat.reshape(traj.shape)
+        
+        # Scale observations
+        obs_flat = obs.reshape(-1, obs.shape[-1])
+        obs_scaled_flat = (obs_flat - obs_scaler_mean) / obs_scaler_std
+        obs_scaled = obs_scaled_flat.reshape(obs.shape)
+        
+        splits_scaled[split_name] = {
+            "trajectories": traj_scaled,
+            "observations": obs_scaled,
+        }
+
+    # Save unscaled data
+    data_file = data_dir / "data.h5"
+    with h5py.File(data_file, "w") as f:
+        f.create_dataset("obs_mask", data=obs_mask)
+        # Save trajectory scalers for reference even in unscaled file
+        f.create_dataset("scaler_mean", data=scaler_mean)
+        f.create_dataset("scaler_std", data=scaler_std)
+        # Save observation scalers
+        f.create_dataset("obs_scaler_mean", data=obs_scaler_mean)
+        f.create_dataset("obs_scaler_std", data=obs_scaler_std)
+
+        for split_name, split_data in splits_unscaled.items():
+            group = f.create_group(split_name)
+            group.create_dataset("trajectories", data=split_data["trajectories"])
+            group.create_dataset("observations", data=split_data["observations"])
+
+    logging.info(f"Unscaled data saved to {data_file}")
+
+    # Save scaled data
+    data_scaled_file = data_dir / "data_scaled.h5"
+    with h5py.File(data_scaled_file, "w") as f:
+        f.create_dataset("obs_mask", data=obs_mask)
+        f.create_dataset("scaler_mean", data=scaler_mean)
+        f.create_dataset("scaler_std", data=scaler_std)
+        f.create_dataset("obs_scaler_mean", data=obs_scaler_mean)
+        f.create_dataset("obs_scaler_std", data=obs_scaler_std)
+
+        for split_name, split_data in splits_scaled.items():
+            group = f.create_group(split_name)
+            group.create_dataset("trajectories", data=split_data["trajectories"])
+            group.create_dataset("observations", data=split_data["observations"])
+
+    logging.info(f"Scaled data saved to {data_scaled_file}")
+    
+    for split_name in ["train", "val", "test"]:
+        traj_shape = splits_unscaled[split_name]["trajectories"].shape
+        obs_shape = splits_unscaled[split_name]["observations"].shape
+        logging.info(
+            f"{split_name}: trajectories {traj_shape}, observations {obs_shape}"
+        )
+
+
 class DataAssimilationDataset(Dataset):
     """Dataset for data assimilation experiments"""
 
@@ -575,142 +805,8 @@ class DataAssimilationDataModule(pl.LightningDataModule):
 
     def _generate_data(self):
         """Generate trajectory data (both unscaled and scaled versions)"""
-        total_steps = self.config.warmup_steps + self.config.len_trajectory
-        
-        # Calculate split sizes
-        n_train = int(self.config.train_ratio * self.config.num_trajectories)
-        n_val = int(self.config.val_ratio * self.config.num_trajectories)
-        n_test = self.config.num_trajectories - n_train - n_val
-        
-        process_noise_std = self.config.process_noise_std
-        if process_noise_std > 0:
-            logging.info(f"Generating training data with process noise std={process_noise_std}")
-        
-        # Generate observations mask (same for all splits)
-        obs_mask = np.zeros(self.config.len_trajectory, dtype=bool)
-        obs_mask[:: self.config.obs_frequency] = True
-        obs_time_indices = np.where(obs_mask)[0]
-        
-        def generate_split(n_samples: int, use_process_noise: bool) -> Tuple[np.ndarray, np.ndarray]:
-            """Generate trajectories and observations for a split."""
-            if n_samples == 0:
-                state_dim = self.system.state_dim
-                obs_dim = self.system.obs_dim
-                return (
-                    np.zeros((0, self.config.len_trajectory, state_dim)),
-                    np.zeros((0, len(obs_time_indices), obs_dim)),
-                )
-            
-            x0 = self.system.sample_initial_state(n_samples)
-            if n_samples == 1 and x0.ndim == 1:
-                x0 = x0.unsqueeze(0)
-            noise_std = process_noise_std if use_process_noise else 0.0
-            trajectories = self.system.integrate(x0, total_steps, self.config.dt, process_noise_std=noise_std)
-            
-            # Remove warmup steps
-            trajectories = trajectories[:, self.config.warmup_steps:, :]
-            
-            # Generate observations
-            observations = []
-            for t in obs_time_indices:
-                obs_t = self.system.observe(trajectories[:, t, :], add_noise=True)
-                observations.append(obs_t)
-            observations = torch.stack(observations, dim=1)
-            
-            return trajectories.cpu().numpy(), observations.cpu().numpy()
-        
-        # Generate each split separately
-        # Training data: with process noise (if configured)
-        train_traj, train_obs = generate_split(n_train, use_process_noise=True)
-        # Validation and test data: always deterministic
-        val_traj, val_obs = generate_split(n_val, use_process_noise=False)
-        test_traj, test_obs = generate_split(n_test, use_process_noise=False)
-        
-        splits_unscaled = {
-            "train": {"trajectories": train_traj, "observations": train_obs},
-            "val": {"trajectories": val_traj, "observations": val_obs},
-            "test": {"trajectories": test_traj, "observations": test_obs},
-        }
-        
-        # Get state dim from first non-empty split for scaler computation
-        state_dim = train_traj.shape[-1] if n_train > 0 else val_traj.shape[-1]
-        obs_dim = train_obs.shape[-1] if n_train > 0 else val_obs.shape[-1]
-
-        # Fit scaler on train trajectories
-        train_traj_flat = splits_unscaled["train"]["trajectories"].reshape(-1, state_dim)
-        scaler_mean = np.mean(train_traj_flat, axis=0)
-        scaler_std = np.std(train_traj_flat, axis=0)
-        # Avoid division by zero
-        scaler_std = np.where(scaler_std < 1e-8, 1.0, scaler_std)
-
-        # Fit scaler on train observations
-        train_obs_flat = splits_unscaled["train"]["observations"].reshape(-1, obs_dim)
-        obs_scaler_mean = np.mean(train_obs_flat, axis=0)
-        obs_scaler_std = np.std(train_obs_flat, axis=0)
-        # Avoid division by zero
-        obs_scaler_std = np.where(obs_scaler_std < 1e-8, 1.0, obs_scaler_std)
-
-        # Apply scaler to all splits
-        splits_scaled = {}
-        for split_name, split_data in splits_unscaled.items():
-            traj = split_data["trajectories"]
-            obs = split_data["observations"]
-            
-            # Scale trajectories
-            traj_flat = traj.reshape(-1, traj.shape[-1])
-            traj_scaled_flat = (traj_flat - scaler_mean) / scaler_std
-            traj_scaled = traj_scaled_flat.reshape(traj.shape)
-            
-            # Scale observations
-            obs_flat = obs.reshape(-1, obs.shape[-1])
-            obs_scaled_flat = (obs_flat - obs_scaler_mean) / obs_scaler_std
-            obs_scaled = obs_scaled_flat.reshape(obs.shape)
-            
-            splits_scaled[split_name] = {
-                "trajectories": traj_scaled,
-                "observations": obs_scaled,
-            }
-
-        # Save unscaled data
-        data_file = self.data_dir / "data.h5"
-        with h5py.File(data_file, "w") as f:
-            f.create_dataset("obs_mask", data=obs_mask)
-            # Save trajectory scalers for reference even in unscaled file
-            f.create_dataset("scaler_mean", data=scaler_mean)
-            f.create_dataset("scaler_std", data=scaler_std)
-            # Save observation scalers
-            f.create_dataset("obs_scaler_mean", data=obs_scaler_mean)
-            f.create_dataset("obs_scaler_std", data=obs_scaler_std)
-
-            for split_name, split_data in splits_unscaled.items():
-                group = f.create_group(split_name)
-                group.create_dataset("trajectories", data=split_data["trajectories"])
-                group.create_dataset("observations", data=split_data["observations"])
-
-        logging.info(f"Unscaled data saved to {data_file}")
-
-        # Save scaled data
-        data_scaled_file = self.data_dir / "data_scaled.h5"
-        with h5py.File(data_scaled_file, "w") as f:
-            f.create_dataset("obs_mask", data=obs_mask)
-            f.create_dataset("scaler_mean", data=scaler_mean)
-            f.create_dataset("scaler_std", data=scaler_std)
-            f.create_dataset("obs_scaler_mean", data=obs_scaler_mean)
-            f.create_dataset("obs_scaler_std", data=obs_scaler_std)
-
-            for split_name, split_data in splits_scaled.items():
-                group = f.create_group(split_name)
-                group.create_dataset("trajectories", data=split_data["trajectories"])
-                group.create_dataset("observations", data=split_data["observations"])
-
-        logging.info(f"Scaled data saved to {data_scaled_file}")
-        
-        for split_name in ["train", "val", "test"]:
-            traj_shape = splits_unscaled[split_name]["trajectories"].shape
-            obs_shape = splits_unscaled[split_name]["observations"].shape
-            logging.info(
-                f"{split_name}: trajectories {traj_shape}, observations {obs_shape}"
-            )
+        splits_unscaled, obs_mask = generate_dataset_splits(self.system, self.config)
+        save_generated_data(self.data_dir, splits_unscaled, obs_mask)
 
     def setup(self, stage: Optional[str] = None):
         """Load data and create datasets"""
@@ -887,7 +983,7 @@ def generate_dataset_directory_name(
 ) -> str:
     """Generate comprehensive directory name from config parameters"""
     # For many obs_components (like Lorenz96), just indicate count
-    if len(config.obs_components) > 5:
+    if len(config.obs_components) > 4:
         obs_comp_str = f"{len(config.obs_components)}of{config.system_params.get('dim', len(config.obs_components))}"
     else:
         obs_comp_str = ",".join(map(str, config.obs_components))

@@ -17,13 +17,15 @@ from data import (
     Lorenz96,
     generate_dataset_directory_name,
     save_config_yaml,
+    generate_dataset_splits,
+    save_generated_data,
 )
 
 
-def parse_int_list(value: str) -> list:
+def parse_float_list(value: str) -> list:
     if value is None or value.strip() == "":
         return []
-    return [int(v) for v in value.split(",") if v.strip() != ""]
+    return [float(v) for v in value.split(",") if v.strip() != ""]
 
 
 def parse_args():
@@ -52,6 +54,13 @@ def parse_args():
         type=float,
         default=0.0,
         help="Process noise std for training trajectories (default: 0.0 = deterministic)",
+    )
+    
+    parser.add_argument(
+        "--process-noise-variations",
+        type=str,
+        default=None,
+        help="Comma-separated list of process noise values to generate (e.g., '0.0,0.1'). If provided, overrides --process-noise-std.",
     )
 
     # Observation configuration
@@ -172,84 +181,133 @@ def main():
     obs_components = list(range(state_dim))
     print(f"Generating DENSE observations for all {state_dim} components.")
 
-    config = DataAssimilationConfig(
-        num_trajectories=args.num_trajectories,
-        len_trajectory=args.len_trajectory,
-        warmup_steps=args.warmup_steps,
-        dt=args.dt,
-        obs_noise_std=args.obs_noise_std,
-        obs_frequency=args.obs_frequency,
-        obs_components=obs_components,
-        obs_nonlinearity=args.observation_operator,
-        process_noise_std=args.process_noise_std,
-        system_params=system_params,
-        train_ratio=args.train_ratio,
-        val_ratio=args.val_ratio,
-        test_ratio=args.test_ratio,
-    )
-
-    # Generate directory name
-    if args.dataset_name:
-        dataset_dir_name = args.dataset_name
+    # Determine process noise levels
+    if args.process_noise_variations:
+        process_noise_levels = parse_float_list(args.process_noise_variations)
+        print(f"Generating datasets for process noise levels: {process_noise_levels}")
     else:
-        dataset_dir_name = generate_dataset_directory_name(config, system_name=system_name)
+        process_noise_levels = [args.process_noise_std]
 
-    # Create output directory
-    output_base = Path(args.output_dir)
-    output_base.mkdir(parents=True, exist_ok=True)
-    dataset_dir = output_base / dataset_dir_name
+    # Shared initial states (lazy initialization)
+    shared_initial_states = None
+    shared_splits = {}
 
-    print(f"\nSystem: {system_name}")
-    print(f"Dataset will be saved to: {dataset_dir}")
-    print(f"\nConfiguration:")
-    print(f"  num_trajectories: {config.num_trajectories}")
-    print(f"  len_trajectory: {config.len_trajectory}")
-    print(f"  warmup_steps: {config.warmup_steps}")
-    print(f"  dt: {config.dt}")
-    print(f"  obs_noise_std: {config.obs_noise_std}")
-    print(f"  obs_frequency: {config.obs_frequency}")
-    print(f"  obs_components: All {len(obs_components)} (Dense)")
-    print(f"  obs_nonlinearity: {config.obs_nonlinearity}")
-    print(f"  process_noise_std: {config.process_noise_std}" + (" (training only)" if config.process_noise_std > 0 else ""))
-    print(f"  system_params: {config.system_params}")
-
-    # Check if dataset already exists
-    if dataset_dir.exists() and (dataset_dir / "data.h5").exists():
-        if args.force:
-            response = "y"
-        else:
-            response = input(
-                f"\nDataset directory {dataset_dir} already exists. Overwrite? (y/N): "
-            )
+    for i, p_noise in enumerate(process_noise_levels):
+        print(f"\n[{i+1}/{len(process_noise_levels)}] Generating dataset for process noise std = {p_noise}")
         
-        if response.lower() != "y":
-            print("Aborting.")
-            return
-        # Remove existing directory
-        import shutil
-        shutil.rmtree(dataset_dir)
+        config = DataAssimilationConfig(
+            num_trajectories=args.num_trajectories,
+            len_trajectory=args.len_trajectory,
+            warmup_steps=args.warmup_steps,
+            dt=args.dt,
+            obs_noise_std=args.obs_noise_std,
+            obs_frequency=args.obs_frequency,
+            obs_components=obs_components,
+            obs_nonlinearity=args.observation_operator,
+            process_noise_std=p_noise,
+            system_params=system_params,
+            train_ratio=args.train_ratio,
+            val_ratio=args.val_ratio,
+            test_ratio=args.test_ratio,
+        )
 
-    dataset_dir.mkdir(parents=True, exist_ok=True)
+        # Initialize system
+        system = system_class(config)
 
-    # Generate dataset
-    print("\nGenerating dataset...")
-    data_module = DataAssimilationDataModule(
-        config=config,
-        system_class=system_class,
-        data_dir=str(dataset_dir),
-        batch_size=1,  # Not used for generation
-    )
+        # Generate shared initial states if first iteration
+        if shared_initial_states is None:
+            print("Sampling SHARED initial states for all variations...")
+            n_train = int(config.train_ratio * config.num_trajectories)
+            n_val = int(config.val_ratio * config.num_trajectories)
+            n_test = config.num_trajectories - n_train - n_val
+            
+            x0_train = system.sample_initial_state(n_train)
+            x0_val = system.sample_initial_state(n_val)
+            x0_test = system.sample_initial_state(n_test)
+            
+            # Ensure proper shapes (unsqueeze if needed)
+            if n_train == 1 and x0_train.ndim == 1: x0_train = x0_train.unsqueeze(0)
+            if n_val == 1 and x0_val.ndim == 1: x0_val = x0_val.unsqueeze(0)
+            if n_test == 1 and x0_test.ndim == 1: x0_test = x0_test.unsqueeze(0)
+            
+            shared_initial_states = {
+                "train": x0_train,
+                "val": x0_val,
+                "test": x0_test,
+            }
 
-    data_module.prepare_data()
+        # Generate directory name
+        if args.dataset_name:
+            if len(process_noise_levels) > 1:
+                # Append process noise to custom name to avoid collision
+                dataset_dir_name = f"{args.dataset_name}_pnoise{p_noise:.3f}".replace(".", "p")
+            else:
+                dataset_dir_name = args.dataset_name
+        else:
+            dataset_dir_name = generate_dataset_directory_name(config, system_name=system_name)
 
-    # Save config as YAML
-    config_path = dataset_dir / "config.yaml"
-    save_config_yaml(config, config_path)
-    print(f"\nConfig saved to {config_path}")
+        # Create output directory
+        output_base = Path(args.output_dir)
+        output_base.mkdir(parents=True, exist_ok=True)
+        dataset_dir = output_base / dataset_dir_name
+
+        print(f"\nSystem: {system_name}")
+        print(f"Dataset will be saved to: {dataset_dir}")
+        print(f"\nConfiguration:")
+        print(f"  process_noise_std: {config.process_noise_std}" + (" (training only)" if config.process_noise_std > 0 else ""))
+        
+        # Check if dataset already exists
+        if dataset_dir.exists() and (dataset_dir / "data.h5").exists():
+            if args.force:
+                response = "y"
+            else:
+                response = input(
+                    f"\nDataset directory {dataset_dir} already exists. Overwrite? (y/N): "
+                )
+            
+            if response.lower() != "y":
+                print("Skipping this dataset.")
+                continue
+                
+            # Remove existing directory
+            import shutil
+            shutil.rmtree(dataset_dir)
+
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+
+        # Generate dataset using SHARED initial states and shared splits (val/test)
+        print("\nGenerating dataset...")
+        
+        precomputed_splits_for_call = None
+        if "val" in shared_splits and "test" in shared_splits:
+             precomputed_splits_for_call = {
+                 "val": shared_splits["val"],
+                 "test": shared_splits["test"]
+             }
+             print("Using precomputed val/test splits for consistency.")
+
+        splits_unscaled, obs_mask = generate_dataset_splits(
+            system, 
+            config, 
+            initial_states=shared_initial_states,
+            precomputed_splits=precomputed_splits_for_call
+        )
+        
+        # Store val/test if first iteration
+        if "val" not in shared_splits:
+            shared_splits["val"] = (splits_unscaled["val"]["trajectories"], splits_unscaled["val"]["observations"])
+            shared_splits["test"] = (splits_unscaled["test"]["trajectories"], splits_unscaled["test"]["observations"])
+        
+        # Save data
+        save_generated_data(dataset_dir, splits_unscaled, obs_mask)
+
+        # Save config as YAML
+        config_path = dataset_dir / "config.yaml"
+        save_config_yaml(config, config_path)
+        print(f"\nConfig saved to {config_path}")
 
     print("\n" + "=" * 80)
     print("Dataset generation completed!")
-    print(f"Dataset directory: {dataset_dir}")
     print("=" * 80)
 
 

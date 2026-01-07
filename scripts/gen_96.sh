@@ -9,104 +9,31 @@ cd "$SCRIPT_DIR/.." || exit
 export PYTHONPATH=$(pwd)
 
 echo "=========================================="
-echo "Generating Lorenz 96 Datasets (50D)"
+echo "Generating Lorenz 96 Datasets (Multi-dim, Pairwise)"
 echo "=========================================="
 
-# 1. Lorenz 96, No Process Noise
-echo ""
-echo "Dataset 1: Lorenz 96, No Process Noise, 50D"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 50 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.2 \
-    --process-noise-std 0.0 \
-    --seed 42 \
-    --force
+# Generate new datasets
+# Dimensions: 5, 10, 15, 20, 25, 50
+DIMS=(5 10 15 20 25 50)
 
-# 2. Lorenz 96, Process Noise 0.1
-echo ""
-echo "Dataset 2: Lorenz 96, Process Noise 0.1, 50D"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 50 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.2 \
-    --process-noise-std 0.1 \
-    --seed 42 \
-    --force
-
-# 3. Lorenz 96, 10 dim, No Process Noise
-echo ""
-echo "Dataset 3: Lorenz 96, 10 dim, No Process Noise"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 10 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.1 \
-    --process-noise-std 0.0 \
-    --seed 42 \
-    --force
-
-# 4. Lorenz 96, 10 dim, Process Noise 0.1
-echo ""
-echo "Dataset 4: Lorenz 96, 10 dim, Process Noise 0.1"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 10 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.1 \
-    --process-noise-std 0.1 \
-    --seed 42 \
-    --force
-
-# 5. Lorenz 96, 100 dim, No Process Noise
-echo ""
-echo "Dataset 5: Lorenz 96, 100 dim, No Process Noise"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 100 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.1 \
-    --process-noise-std 0.0 \
-    --seed 42 \
-    --force
-
-# 6. Lorenz 96, 100 dim, Process Noise 0.1
-echo ""
-echo "Dataset 6: Lorenz 96, 100 dim, Process Noise 0.1"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz96 \
-    --l96-dim 100 \
-    --num-trajectories 2048 \
-    --len-trajectory 200 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --obs-noise-std 0.1 \
-    --process-noise-std 0.1 \
-    --seed 42 \
-    --force
+for DIM in "${DIMS[@]}"; do
+    echo ""
+    echo "----------------------------------------"
+    echo "Generating datasets for Lorenz 96, Dimension $DIM"
+    echo "----------------------------------------"
+    
+    python generate.py \
+        --system lorenz96 \
+        --l96-dim $DIM \
+        --process-noise-variations "0.0,0.1" \
+        --obs-noise-std 0.1 \
+        --num-trajectories 2048 \
+        --len-trajectory 200 \
+        --obs-frequency 1 \
+        --observation-operator arctan \
+        --seed 42 \
+        --force
+done
 
 echo ""
 echo "=========================================="
