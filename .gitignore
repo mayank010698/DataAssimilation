@@ -8,6 +8,8 @@ __pycache__/
 
 # Common
 .env
+*.png
+*.pdf
 
 # other
 datasets/
@@ -17,3 +19,7 @@ logs/
 wandb/
 flowdas-lorenz/
 scratch/
+enff-code/
+*plot.py
+*wandb*
+visualize_ks.py

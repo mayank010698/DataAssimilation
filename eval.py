@@ -17,6 +17,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data import (
     DataAssimilationConfig,
     DataAssimilationDataModule,
+    KuramotoSivashinsky,
     Lorenz63,
     Lorenz96,
     TimeAlignedBatchSampler,
@@ -49,6 +50,11 @@ def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
     
     crps_sum = 0.0
     
+    # Pre-compute coefficients for dispersion term (0.5 * E|X - X'|)
+    # Formula: (1 / K^2) * sum_{i=0}^{K-1} x_i * (2i - K + 1)  (assuming sorted x)
+    # This replaces the O(K^2) pairwise difference calculation
+    coeffs = (2 * np.arange(K) - K + 1) / (K * K)
+    
     for d in range(D):
         ens_d = np.sort(ensemble[:, d])
         truth_d = truth[d]
@@ -59,16 +65,8 @@ def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
         
         # Term 2: Dispersion (mean absolute difference between members)
         # 0.5 * E|X - X'|
-        # Efficient calculation using sorted array:
-        # sum_{i,j} |x_i - x_j| = 2 * sum_{i<j} (x_j - x_i)
-        # = 2 * sum_{i=0}^{K-1} x_i * (2i - K + 1)
-        
-        # We want (1 / (2 * K^2)) * sum_{i,j} |x_i - x_j|
-        # = (1 / K^2) * sum_{i<j} (x_j - x_i)
-        
-        # However, for small K, direct computation is fast enough and safer
-        diffs = np.abs(ens_d[:, None] - ens_d[None, :])
-        dispersion = np.sum(diffs) / (2 * K * K)
+        # Efficient calculation using sorted array
+        dispersion = np.sum(ens_d * coeffs)
         
         crps_sum += (mae - dispersion)
         
@@ -534,6 +532,7 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=1, help="Batch size for evaluation. >1 uses batched evaluation.")
     parser.add_argument("--obs-dim", type=int, default=None)
     parser.add_argument("--obs-components", type=str, default=None, help="Comma-separated list of observed components (overrides config)")
+    parser.add_argument("--obs-frequency", type=int, default=1, help="Observation frequency (default: 1, observe every step)")
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
@@ -548,7 +547,7 @@ def parse_args():
     parser.add_argument("--rf-sampling-steps", type=int, default=None)
     parser.add_argument("--rf-trace-estimator", type=str, default="rademacher", choices=["gaussian", "rademacher"], help="Trace estimator type for RF log_prob")
     parser.add_argument("--rf-num-probes", type=int, default=1, help="Number of probes for Hutchinson trace estimator")
-    parser.add_argument("--device", type=str, default="gpu")
+    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
     # Guidance configuration
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance during inference")
@@ -615,11 +614,24 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
     for batch in pbar:
         x_prev = batch["x_prev"]
         x_curr = batch["x_curr"]
-        y_curr = batch["y_curr"] if batch["has_observation"].any() else None 
         
         traj_idxs = batch["trajectory_idx"].squeeze(-1)
         time_idxs = batch["time_idx"].squeeze(-1)
         batch_size_curr = x_prev.shape[0]
+        
+        # Apply temporal sparsity masking
+        # Assuming synchronized batch (TimeAlignedBatchSampler)
+        current_time = time_idxs[0].item()
+        # Ensure we observe at t=0 if it were included, but eval usually 1..T
+        # Usually we want observations at t s.t. t % freq == 0.
+        is_observed = (current_time % args.obs_frequency == 0)
+        
+        if is_observed:
+            y_curr = batch["y_curr"] if batch["has_observation"].any() else None
+        else:
+            y_curr = None
+            # Update batch metadata for logging if needed, though y_curr passed to step is explicit
+            batch["has_observation"][:] = False
         
         # Initialize Filter for new trajectories
         is_start = (time_idxs[0] == 1)
@@ -794,6 +806,14 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             
         current_traj_idx = batch_traj_idx
         
+        # Apply temporal sparsity masking
+        time_idx = batch["time_idx"].item()
+        is_observed = (time_idx % args.obs_frequency == 0)
+        
+        if not is_observed:
+            batch["has_observation"][:] = False
+            # test_step will see has_observation=False and set y_curr=None
+        
         # Process current batch
         metrics = pf.test_step(batch, 0)
         
@@ -923,7 +943,10 @@ def main():
     obs_dim = args.obs_dim if args.obs_dim is not None else inferred_obs_dim
 
     # Create system
-    if "dim" in config.system_params or "F" in config.system_params:
+    if "J" in config.system_params:
+        system_class = KuramotoSivashinsky
+        logging.info("Detected Kuramoto-Sivashinsky system config")
+    elif "dim" in config.system_params or "F" in config.system_params:
         system_class = Lorenz96
         logging.info("Detected Lorenz96 system config")
     else:
@@ -1097,6 +1120,7 @@ def main():
         if trajectory_results:
             max_steps = max(len(r["metrics"]) for r in trajectory_results)
             traj_cumulative_resamples = [0] * len(trajectory_results)
+            last_ess_pre_vals_map = [None] * len(trajectory_results)
             
             for t in range(max_steps):
                 rmse_vals = []
@@ -1108,6 +1132,11 @@ def main():
                 obs_log_vals = []
                 obs_log_std_vals = []
 
+                # Determine if this step involves an observation update
+                # Assuming t=0 corresponds to time_idx=1
+                time_idx = t + 1
+                is_observed_step = (time_idx % args.obs_frequency == 0)
+
                 for i, r in enumerate(trajectory_results):
                     if t < len(r["metrics"]):
                         rmse_vals.append(r["metrics"][t]["rmse"])
@@ -1115,8 +1144,21 @@ def main():
                             crps_vals.append(r["metrics"][t]["crps"])
                         if "ess" in r["metrics"][t]:
                             ess_vals.append(r["metrics"][t]["ess"])
+                        
+                        # Handle ESS Pre-Resample with "Sample and Hold" for sparse observations
                         if "ess_pre_resample" in r["metrics"][t]:
-                            ess_pre_vals.append(r["metrics"][t]["ess_pre_resample"])
+                            curr_val = r["metrics"][t]["ess_pre_resample"]
+                            if is_observed_step:
+                                last_ess_pre_vals_map[i] = curr_val
+                                ess_pre_vals.append(curr_val)
+                            else:
+                                # If not observed, hold the last valid value to avoid spikes back to N
+                                if last_ess_pre_vals_map[i] is not None:
+                                    ess_pre_vals.append(last_ess_pre_vals_map[i])
+                                else:
+                                    # Before first observation, just use current value
+                                    ess_pre_vals.append(curr_val)
+
                         if r["metrics"][t].get("resampled", False):
                             traj_cumulative_resamples[i] += 1
                         cumulative_resample_vals.append(traj_cumulative_resamples[i])

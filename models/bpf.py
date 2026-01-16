@@ -40,6 +40,8 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         else:
             self.proposal = proposal_distribution
 
+        self.transition_prior = TransitionProposal(system, process_noise_std)
+
         self.particles = None
         self.particles_prev = None  # Store previous particles for weight computation
         self.weights = None
@@ -61,6 +63,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
 
     def initialize_filter(self, x0: torch.Tensor) -> None:
         """Initialize particles around initial state"""
+        # x0 should be (1, State_dim) for unbatched or (Batch, State_dim) for batched
         if x0.dim() == 1:
             x0 = x0.unsqueeze(0)
         
@@ -68,9 +71,11 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         x0 = x0.to(self.device)
 
         init_std = 0.5
+        # Noise: (N_particles, State_dim)
         noise = init_std * torch.randn(
             self.n_particles, self.state_dim, device=self.device
         )
+        # x0: (1, State_dim), noise: (N, State_dim) -> particles: (N, State_dim)
         self.particles = x0 + noise
         self.particles_prev = self.particles.clone()  # Initialize previous particles
 
@@ -88,39 +93,22 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
     def predict_step(self, dt: float, y_curr: Optional[torch.Tensor] = None) -> None:
         """
         CORRECTED: Propagate particles using the PROPOSAL DISTRIBUTION
+        If y_curr is None, falls back to transition prior (diffusion).
         """
         # Store previous particles for weight computation
         self.particles_prev = self.particles.clone()
 
         # Vectorized proposal sampling
-        # proposal.sample should handle batch of particles
-        # If it doesn't, we might need to loop, but ideally it should be vectorized.
-        # Let's assume proposal.sample is vectorized or we keep the loop for now if unsure.
-        # TransitionProposal uses system.integrate/dynamics which are now vectorized.
-        
-        # However, ProposalDistribution base class sample might not be guaranteed to be vectorized 
-        # if specific implementations aren't.
-        # TransitionProposal logic: x + integration(x) + noise. This is vectorized.
-        # RectifiedFlowProposal logic: might be complex.
-        
-        # Let's try to use vectorized call if possible, but fallback to loop if needed.
-        # Given the refactoring, let's try to be efficient.
-        
-        # Check if proposal supports batch sampling
-        # The loop approach is safe for now.
         new_particles = []
         
-        # Optimization: if proposal is TransitionProposal, we can vectorize
-        if isinstance(self.proposal, TransitionProposal):
-             # It likely calls system.integrate internally or similar.
-             # Actually TransitionProposal.sample in the user code might be doing 
-             # single particle steps. But let's stick to the loop to be safe with existing proposals 
-             # unless we change proposals.py too.
-             pass
+        # Select proposal: if observation missing, use transition prior
+        proposal = self.proposal
+        if y_curr is None:
+            proposal = self.transition_prior
 
         for i in range(self.n_particles):
             # Use the proposal distribution to sample new particles
-            x_new = self.proposal.sample(self.particles[i], y_curr, dt)
+            x_new = proposal.sample(self.particles[i], y_curr, dt)
             new_particles.append(x_new)
 
         self.particles = torch.stack(new_particles)
@@ -449,28 +437,72 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         """Particle filter step"""
 
         start_time = time.perf_counter()
-        self.step_count += 1
-        metrics = super().step(x_prev, x_curr, y_curr, dt, trajectory_idx, time_idx)
-        resampled, ess_pre = self.resample()
         
-        if self.last_proposal_log_probs is not None:
-             metrics["proposal_log_prob_mean"] = self.last_proposal_log_probs.mean().item()
-        if self.last_obs_log_likelihoods is not None:
-             metrics["obs_log_prob_mean"] = self.last_obs_log_likelihoods.mean().item()
-             metrics["obs_log_prob_std"] = self.last_obs_log_likelihoods.std().item()
+        # Initialize filter if this is the start of a new trajectory
+        if self.current_trajectory_idx != trajectory_idx:
+            self.initialize_filter(x_prev)
+            self.current_trajectory_idx = trajectory_idx
+            self.current_time_idx = time_idx
+            
+        self.step_count += 1
+        
+        # Propagate
+        self.predict_step(dt, y_curr)
 
-        metrics["resampled"] = resampled
-        metrics["ess_pre_resample"] = ess_pre
-        # Compute current ESS (will be N if resampled)
-        metrics["ess"] = (1.0 / torch.sum(self.weights**2)).item()
-        metrics["n_effective_particles"] = metrics["ess"]
-        metrics["max_weight"] = torch.max(self.weights).item()
-        metrics["min_weight"] = torch.min(self.weights).item()
-        metrics["particle_spread"] = torch.std(self.particles, dim=0).cpu().numpy()
-        metrics["proposal_type"] = type(self.proposal).__name__
+        # Update and Resample ONLY if observation is present
+        if y_curr is not None:
+            # Likelihood
+            log_likelihood = self.compute_log_likelihood(y_curr)
+            
+            # Update
+            self.update_step(y_curr)
+            
+            # Resample
+            resampled, ess_pre = self.resample()
+            
+            # Record metrics dependent on update
+            if self.last_proposal_log_probs is not None:
+                 metrics_extra = {"proposal_log_prob_mean": self.last_proposal_log_probs.mean().item()}
+            else:
+                 metrics_extra = {}
+                 
+            if self.last_obs_log_likelihoods is not None:
+                 metrics_extra["obs_log_prob_mean"] = self.last_obs_log_likelihoods.mean().item()
+                 metrics_extra["obs_log_prob_std"] = self.last_obs_log_likelihoods.std().item()
+                 
+            metrics_extra["log_likelihood"] = log_likelihood 
+        else:
+            # Missing observation
+            resampled = False
+            # ESS doesn't change if weights don't change
+            ess_pre = (1.0 / torch.sum(self.weights**2)).item()
+            metrics_extra = {"log_likelihood": 0.0}
+
+        # Calculate RMSE
+        x_est = self.get_state_estimate()
+        x_est_np = x_est.detach().cpu().numpy()
+        error = x_est - x_curr.to(self.device)
+        rmse = torch.sqrt(torch.mean(error**2)).item()
         
         elapsed_time = time.perf_counter() - start_time
-        metrics["step_time"] = elapsed_time
+        
+        metrics = {
+            "rmse": rmse,
+            "x_est": x_est_np,
+            "error": error.cpu().numpy(),
+            "trajectory_idx": trajectory_idx,
+            "time_idx": time_idx,
+            "resampled": resampled,
+            "ess_pre_resample": ess_pre,
+            "ess": (1.0 / torch.sum(self.weights**2)).item(),
+            "n_effective_particles": (1.0 / torch.sum(self.weights**2)).item(),
+            "max_weight": torch.max(self.weights).item(),
+            "min_weight": torch.min(self.weights).item(),
+            "particle_spread": torch.std(self.particles, dim=0).cpu().numpy(),
+            "proposal_type": type(self.proposal).__name__,
+            "step_time": elapsed_time,
+            **metrics_extra
+        }
 
         if self.step_count % 1 == 0:
             logging.debug(
@@ -521,6 +553,8 @@ class BootstrapParticleFilter(FilteringMethod):
             self.proposal = TransitionProposal(system, process_noise_std)
         else:
             self.proposal = proposal_distribution
+
+        self.transition_prior = TransitionProposal(system, process_noise_std)
 
         self.particles = None
         self.particles_prev = None
@@ -591,8 +625,12 @@ class BootstrapParticleFilter(FilteringMethod):
              y_curr_flat = y_curr_expanded.reshape(batch_size * self.n_particles, y_curr.shape[-1])
 
         # Sample new particles
+        proposal = self.proposal
+        if y_curr is None:
+            proposal = self.transition_prior
+            
         # proposal.sample should handle the flat batch of particles
-        x_new_flat = self.proposal.sample(particles_flat, y_curr_flat, dt)
+        x_new_flat = proposal.sample(particles_flat, y_curr_flat, dt)
         
         # Reshape back to (Batch, N, D)
         self.particles = x_new_flat.reshape(batch_size, self.n_particles, self.state_dim)
@@ -918,6 +956,9 @@ class BootstrapParticleFilter(FilteringMethod):
         
         # Update
         log_likelihoods = torch.zeros(x_curr.shape[0], device=self.device)
+        resampled_flags = [False] * x_curr.shape[0]
+        ess_pre = (1.0 / torch.sum(self.weights**2, dim=1))
+        
         if y_curr is not None:
              # Check which indices have observations
              # If passed as None, none have it. If passed as tensor, check masks.
@@ -932,12 +973,12 @@ class BootstrapParticleFilter(FilteringMethod):
              log_likelihoods = self.compute_log_likelihood(y_curr)
              self.update_step(y_curr)
              
+             # Resample
+             resampled_flags, ess_pre = self.resample()
+             
         # Estimates
         x_est = self.get_state_estimate()
         P_est = self.get_state_covariance()
-        
-        # Resample
-        resampled_flags, ess_pre = self.resample()
         
         # Metrics
         elapsed_time = (time.perf_counter() - start_time) / x_curr.shape[0] # Average time per item

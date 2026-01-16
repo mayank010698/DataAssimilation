@@ -22,6 +22,7 @@ from data import (
     DataAssimilationDataModule,
     Lorenz63,
     Lorenz96,
+    KuramotoSivashinsky,
     TimeAlignedBatchSampler,
     load_config_yaml,
 )
@@ -218,9 +219,18 @@ def run_proposal_eval(
     model = RFProposal.load_from_checkpoint(checkpoint_path)
 
     # Determine system class
-    system_class = Lorenz63
-    if "dim" in config.system_params and config.system_params["dim"] > 3:
+    config_lower = str(config_path).lower()
+    data_dir_lower = str(data_dir).lower()
+    
+    if "ks" in data_dir_lower or "kuramoto" in data_dir_lower or "ks" in config_lower:
+        system_class = KuramotoSivashinsky
+        logger.info("Detected Kuramoto-Sivashinsky system")
+    elif "lorenz96" in data_dir_lower or "96" in config_lower or "lorenz96" in config_lower or ("dim" in config.system_params and config.system_params["dim"] > 3):
         system_class = Lorenz96
+        logger.info("Detected Lorenz 96 system")
+    else:
+        system_class = Lorenz63
+        logger.info("Defaulting to Lorenz 63 system")
     
     # Override guidance settings
     if mc_guidance:
@@ -596,7 +606,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-trajectories", type=int, default=None, help="Number of trajectories to evaluate (default: all)")
     parser.add_argument("--n-vis-trajectories", type=int, default=10, help="Number of trajectories to visualize")
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--n-samples-per-traj", type=int, default=1, help="Number of samples per trajectory (for CRPS)")
+    parser.add_argument("--n-samples-per-traj", type=int, default=20, help="Number of samples per trajectory (for CRPS)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--no-wandb", action="store_true", help="Disable wandb logging")
     parser.add_argument("--num-sampling-steps", type=int, default=None, help="Override number of Euler steps for sampling (default: use checkpoint value)")

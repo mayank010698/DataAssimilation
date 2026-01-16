@@ -350,6 +350,405 @@ class Lorenz96(DynamicalSystem):
         return init_mean + init_std * x
 
 
+class KuramotoSivashinsky(DynamicalSystem):
+    """Kuramoto-Sivashinsky system implementation using ETD-RK4 integration"""
+
+    def __init__(self, config: DataAssimilationConfig):
+        # Default parameters
+        # J = 64 (spatial resolution)
+        # L = 32 * pi (domain size)
+        default_params = {"J": 64, "L": 16 * np.pi, "init_std": 1.0}
+        if config.system_params is None:
+            config.system_params = default_params
+        else:
+            for key, val in default_params.items():
+                if key not in config.system_params:
+                    config.system_params[key] = val
+
+        # Default to observing all components if not specified
+        if config.obs_components is None:
+            config.obs_components = list(range(config.system_params["J"]))
+
+        self.J = config.system_params["J"]
+        self.L = config.system_params["L"]
+        self.init_std = config.system_params["init_std"]
+
+        super().__init__(config)
+        
+        # Mean/Std for normalization (updated from data if available, else defaults)
+        self.init_mean = torch.zeros(self.J)
+        # init_std from config is a scalar multiplier, but self.init_std can be vector
+        # We start with ones * scalar
+        self.init_std_vector = torch.ones(self.J) * self.init_std
+        # Note: DynamicalSystem doesn't enforce self.init_std name, but Lorenz uses it.
+        # I will shadow it with self.normalization_mean/std to avoid confusion with the scalar param
+        self.normalization_mean = torch.zeros(self.J)
+        self.normalization_std = torch.ones(self.J)
+
+        # Spectral Setup
+        # Wave numbers for Real FFT
+        # rfftfreq returns [0, 1, ..., n/2]
+        # We need to scale by 2*pi/L
+        # k = 2*pi/L * [0, 1, ..., J/2]
+        self.k = (2 * np.pi / self.L) * torch.arange(0, self.J // 2 + 1, dtype=torch.float64)
+        
+        # Precompute ETD-RK4 coefficients (on CPU initially)
+        self.precompute_etd_rk4_coefficients()
+
+    def get_state_dim(self) -> int:
+        return self.J
+
+    def precompute_etd_rk4_coefficients(self):
+        """Precompute ETD-RK4 coefficients using complex contour integration"""
+        # Based on Kassam and Trefethen (2005) and DAFM implementation
+        
+        # Use float64 for precision in coefficient calculation
+        dtype = torch.float64
+        device = torch.device("cpu") # Compute on CPU
+        
+        h = self.config.dt
+        k = self.k.to(device=device, dtype=dtype)
+        
+        # Linear operator L = k^2 - k^4 (diagonal in spectral space)
+        # Note: signs matter. 
+        # KS eq: u_t + u_xx + u_xxxx + u u_x = 0
+        # => u_t = -u_xx - u_xxxx - u u_x
+        # Linear part: -u_xx - u_xxxx
+        # In Fourier: -(-k^2) - (k^4) = k^2 - k^4
+        L = k**2 - k**4
+        
+        # Precompute ETD-RK4 scalar quantities
+        self.E = torch.exp(h * L).to(dtype=dtype)
+        self.E2 = torch.exp(h * L / 2).to(dtype=dtype)
+        
+        # Roots of unity for contour integration
+        n_roots = 16
+        roots = np.exp(1j * np.pi * (0.5 + np.arange(n_roots)) / n_roots)
+        roots = torch.from_numpy(roots).to(device=device)
+        
+        # Contour for each element of L
+        # CL shape: (n_roots, len(k))
+        CL = h * L.unsqueeze(0) + roots.unsqueeze(1)
+        
+        # Function to compute mean over contour
+        def contour_mean(func_of_CL):
+            return func_of_CL.mean(dim=0).real
+            
+        # Q = h * mean( (exp(CL/2) - 1) / CL )
+        self.Q = h * contour_mean((torch.exp(CL / 2) - 1) / CL)
+        
+        # f1 = h * mean( (-4 - CL + exp(CL)(4 - 3CL + CL^2)) / CL^3 )
+        self.f1 = h * contour_mean(
+            (-4 - CL + torch.exp(CL) * (4 - 3 * CL + CL ** 2)) / CL ** 3
+        )
+        
+        # f2 = h * mean( (2 + CL + exp(CL)(-2 + CL)) / CL^3 )
+        self.f2 = h * contour_mean(
+            (2 + CL + torch.exp(CL) * (-2 + CL)) / CL ** 3
+        )
+        
+        # f3 = h * mean( (-4 - 3CL - CL^2 + exp(CL)(4 - CL)) / CL^3 )
+        self.f3 = h * contour_mean(
+            (-4 - 3 * CL - CL ** 2 + torch.exp(CL) * (4 - CL)) / CL ** 3
+        )
+        
+        self.E = self.E.float()
+        self.E2 = self.E2.float()
+        self.Q = self.Q.float()
+        self.f1 = self.f1.float()
+        self.f2 = self.f2.float()
+        self.f3 = self.f3.float()
+        self.k = self.k.float()
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        """
+        Compute only the nonlinear term N(u) = -u u_x = -0.5 (u^2)_x.
+        Note: This is NOT the full dynamics dx/dt. It is used internally by ETD-RK4.
+        
+        Input: x is in SPECTRAL space (u_hat) if called internally?
+        Wait, DynamicalSystem expects x in PHYSICAL space.
+        
+        If this is called by rk4_step (from base class), it will be wrong because it misses linear part.
+        Since we override integrate, this shouldn't be called for integration.
+        But for completeness/debugging, we might want to throw error or implement full dynamics.
+        
+        Given we override integrate, let's implement the nonlinear term helper here,
+        but expect input in SPECTRAL space.
+        """
+        raise NotImplementedError("Use integrate() for KS system. Standard dynamics() not implemented.")
+
+    def nonlinear_term(self, u_hat: torch.Tensor) -> torch.Tensor:
+        """
+        Compute nonlinear term N(u) = -0.5 * d/dx (u^2) in Fourier space.
+        
+        Args:
+            u_hat: State in spectral domain (batch, J//2 + 1)
+        """
+        # Transform to physical space
+        u = torch.fft.irfft(u_hat, n=self.J, dim=-1)
+        
+        # Compute u^2
+        u2 = u ** 2
+        
+        # Transform back to spectral
+        u2_hat = torch.fft.rfft(u2, n=self.J, dim=-1)
+        
+        # Derivative in spectral space: d/dx -> * (i k)
+        # N(u_hat) = -0.5 * (i k) * u2_hat
+        # Note: k is shape (J//2+1,)
+        # Ensure k is on correct device
+        if self.k.device != u_hat.device:
+            self.k = self.k.to(u_hat.device)
+            
+        ik = 1j * self.k
+        
+        return -0.5 * ik * u2_hat
+
+    def integrate(
+        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0
+    ) -> torch.Tensor:
+        """Integrate using ETD-RK4."""
+        if dt is None:
+            dt = self.config.dt
+            
+        # Ensure coefficients are on correct device
+        device = x0.device
+        if self.E.device != device:
+            self.E = self.E.to(device)
+            self.E2 = self.E2.to(device)
+            self.Q = self.Q.to(device)
+            self.f1 = self.f1.to(device)
+            self.f2 = self.f2.to(device)
+            self.f3 = self.f3.to(device)
+            self.k = self.k.to(device)
+
+        # Handle batch
+        if not isinstance(x0, torch.Tensor):
+            x0 = torch.tensor(x0, dtype=torch.float32)
+        is_batch = x0.ndim > 1
+        if not is_batch:
+            x0 = x0.unsqueeze(0)
+            
+        # Initial state is in physical space. Transform to spectral.
+        u_hat = torch.fft.rfft(x0, n=self.J, dim=-1)
+        
+        trajectories = [x0]
+        
+        for _ in range(n_steps - 1):
+            # ETD-RK4 Step
+            
+            # N1 = N(u_n)
+            N1 = self.nonlinear_term(u_hat)
+            
+            # a = E2 * u_n + Q * N1
+            a = self.E2 * u_hat + self.Q * N1
+            
+            # N2 = N(a)
+            N2 = self.nonlinear_term(a)
+            
+            # b = E2 * u_n + Q * N2
+            b = self.E2 * u_hat + self.Q * N2
+            
+            # N3 = N(b)
+            N3 = self.nonlinear_term(b)
+            
+            # c = E2 * a + Q * (2*N3 - N1) 
+            # DAFM:
+            # v = u_hat (u in code)
+            # v1 = E2*v + Q*N1
+            # v2a = E2*v + Q*N2a  (where N2a = NL(v1))
+            # v2b = E2*v1 + Q*(2*N2b - N1) (where N2b = NL(v2a))
+            # Final: v_new = E*v + f1*N1 + 2*f2*(N2a + N2b) + f3*N3 (where N3 = NL(v2b))
+            
+            # Mapping names:
+            # v -> u_hat
+            # N1 -> N1
+            # v1 -> a
+            # N2a -> N2
+            # v2a -> b
+            # N2b -> N3 (different from my simple N3 above)
+            
+            # Correct Sequence:
+            # 1. N1 = NL(u_hat)
+            # 2. a = E2*u_hat + Q*N1
+            # 3. N2 = NL(a)
+            # 4. b = E2*u_hat + Q*N2
+            # 5. N3 = NL(b)
+            # 6. c = E2*a + Q*(2*N3 - N1)
+            # 7. N4 = NL(c)
+            # 8. u_next = E*u_hat + f1*N1 + 2*f2*(N2 + N3) + f3*N4
+            
+            # Note: DAFM code uses:
+            # v1 = E2 * v + Q * N1
+            # v2a = E2 * v + Q * N2a (N2a = NL(v1))
+            # v2b = E2 * v1 + Q * (2 * N2b - N1) (N2b = NL(v2a))
+            # v = E * v + N1 * f1 + 2 * (N2a + N2b) * f2 + N3 * f3 (N3 = NL(v2b))
+            
+            # So my "a" is v1.
+            # My "b" is v2a.
+            # My "c" is v2b.
+            
+            v = u_hat
+            
+            # Step 1
+            N1 = self.nonlinear_term(v)
+            v1 = self.E2 * v + self.Q * N1
+            
+            # Step 2
+            N2a = self.nonlinear_term(v1)
+            v2a = self.E2 * v + self.Q * N2a
+            
+            # Step 3
+            N2b = self.nonlinear_term(v2a)
+            v2b = self.E2 * v1 + self.Q * (2 * N2b - N1)
+            
+            # Step 4
+            N3 = self.nonlinear_term(v2b)
+            
+            # Update
+            u_next = self.E * v + N1 * self.f1 + 2 * (N2a + N2b) * self.f2 + N3 * self.f3
+            
+            # Process Noise handling (Physical space)
+            if process_noise_std > 0:
+                # Transform to physical
+                u_phys = torch.fft.irfft(u_next, n=self.J, dim=-1)
+                # Add noise
+                u_phys = u_phys + process_noise_std * torch.randn_like(u_phys)
+                # Transform back
+                u_next = torch.fft.rfft(u_phys, n=self.J, dim=-1)
+            
+            u_hat = u_next
+            
+            # Save trajectory in physical space
+            trajectories.append(torch.fft.irfft(u_hat, n=self.J, dim=-1))
+            
+        result = torch.stack(trajectories, dim=1)
+        
+        if not is_batch:
+            return result.squeeze(0)
+        return result
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        # Standard initial condition from papers often involves cosine/sine sum
+        # u(x, 0) = cos(x/L) * (1 + sin(x/L)) is a common one, 
+        # but DAFM uses noise on spectral modes?
+        # DAFM KS: x0 from dapper.mods.KS.Model.x0.
+        # DAPPER default x0: cos(x/16 * (2*pi/L) * x)? No.
+        
+        # Let's use a simple random start with some smoothness, 
+        # or the one from the plan:
+        # "Seed Profile: Initialize with u(x) = cos(x/16) * (1 + sin(x/16))"
+        # Wait, plan says: "Seed Profile: Initialize with u = cos(x) * (1 + sin(x))"
+        # and "L = 32 pi".
+        # If L=32pi, domain is [0, 32pi).
+        # x = np.arange(J) * L / J.
+        
+        # Let's implement this profile.
+        x = torch.arange(self.J, dtype=torch.float32) * self.L / self.J
+        # Rescale argument to match "cos(x/16)" for domain size?
+        # If domain is 32pi, x goes 0 to ~100.
+        # cos(x) oscillates 16 times in 32pi? No, 32pi/2pi = 16 periods.
+        # "cos(x/16) * (1 + sin(x/16))" -> Period is 32pi. 
+        # This matches the domain size L=32pi (one full period).
+        
+        # x/16 goes from 0 to 2pi.
+        arg = x / 16.0
+        u0 = torch.cos(arg) * (1.0 + torch.sin(arg))
+        return u0
+
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        """
+        Sample initial state with burn-in.
+        Plan: 
+        1. Seed Profile: u = cos(x/16)*(1+sin(x/16))
+        2. Burn-in: Discard first 2,000 steps of the generated trajectory.
+        """
+        
+        # 1. Base seed
+        u0 = self.get_default_initial_state() # (J,)
+        
+        # Create batch
+        if n_samples > 1:
+            u0 = u0.unsqueeze(0).repeat(n_samples, 1)
+            # Add small noise to differentiate trajectories
+            u0 = u0 + 1e-4 * torch.randn_like(u0)
+        else:
+            u0 = u0.unsqueeze(0) # (1, J)
+            
+        # 2. Burn-in
+        # "Discard the first 2,000 steps"
+        # We integrate for 2000 steps.
+        # We assume dt is default.
+        burn_in_steps = 2000
+        
+        # We can use our integrate method, but we only need the last state.
+        # integrate returns full trajectory, which is memory expensive for 2000 steps if we only need last.
+        # I'll implement a loop here to save memory.
+        
+        # Move to device if needed (currently CPU)
+        u_curr = u0
+        
+        # Spectral transform
+        u_hat = torch.fft.rfft(u_curr, n=self.J, dim=-1)
+        
+        # Ensure coeffs on correct device
+        if self.E.device != u_hat.device:
+            self.E = self.E.to(u_hat.device)
+            self.E2 = self.E2.to(u_hat.device)
+            self.Q = self.Q.to(u_hat.device)
+            self.f1 = self.f1.to(u_hat.device)
+            self.f2 = self.f2.to(u_hat.device)
+            self.f3 = self.f3.to(u_hat.device)
+            self.k = self.k.to(u_hat.device)
+            
+        # Burn-in loop
+        # We can do this in chunks if needed, but 2000 is fast for 1D.
+        # We assume deterministic burn-in to reach attractor? Or with noise?
+        # Usually attractor is intrinsic, noise helps exploration.
+        # The plan doesn't specify noise during burn-in, but usually KS is chaotic enough.
+        
+        for _ in range(burn_in_steps):
+             # Copying single step logic from integrate to avoid overhead/memory of full storage
+             v = u_hat
+             N1 = self.nonlinear_term(v)
+             v1 = self.E2 * v + self.Q * N1
+             N2a = self.nonlinear_term(v1)
+             v2a = self.E2 * v + self.Q * N2a
+             N2b = self.nonlinear_term(v2a)
+             v2b = self.E2 * v1 + self.Q * (2 * N2b - N1)
+             N3 = self.nonlinear_term(v2b)
+             u_hat = self.E * v + N1 * self.f1 + 2 * (N2a + N2b) * self.f2 + N3 * self.f3
+             
+        # Transform back to physical
+        u_final = torch.fft.irfft(u_hat, n=self.J, dim=-1)
+        
+        if n_samples == 1:
+            return u_final.squeeze(0)
+        return u_final
+
+    def preprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        if isinstance(x, np.ndarray):
+            init_mean = self.normalization_mean.numpy()
+            init_std = self.normalization_std.numpy()
+            return (x - init_mean) / init_std
+            
+        device = x.device
+        init_mean = self.normalization_mean.to(device)
+        init_std = self.normalization_std.to(device)
+        return (x - init_mean) / init_std
+
+    def postprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        if isinstance(x, np.ndarray):
+            init_mean = self.normalization_mean.numpy()
+            init_std = self.normalization_std.numpy()
+            return init_mean + init_std * x
+            
+        device = x.device
+        init_mean = self.normalization_mean.to(device)
+        init_std = self.normalization_std.to(device)
+        return init_mean + init_std * x
+
+
 def generate_dataset_splits(system: DynamicalSystem, config: DataAssimilationConfig, initial_states: Optional[Dict[str, torch.Tensor]] = None, precomputed_splits: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None) -> Tuple[Dict[str, Dict[str, np.ndarray]], np.ndarray]:
     """
     Generate trajectory data (splits).
@@ -827,8 +1226,19 @@ class DataAssimilationDataModule(pl.LightningDataModule):
                 scaler_std = torch.from_numpy(f["scaler_std"][:]).float()
                 
                 # Update system's normalization parameters
-                self.system.init_mean = scaler_mean
-                self.system.init_std = scaler_std
+                # For Lorenz63/96/KS:
+                if hasattr(self.system, 'init_mean'):
+                    self.system.init_mean = scaler_mean
+                if hasattr(self.system, 'init_std'):
+                    # Be careful if init_std is scalar vs vector
+                    # If it was scalar in __init__, this overwrites with vector.
+                    self.system.init_std = scaler_std
+                    
+                if hasattr(self.system, 'normalization_mean'):
+                    self.system.normalization_mean = scaler_mean
+                if hasattr(self.system, 'normalization_std'):
+                    self.system.normalization_std = scaler_std
+
                 logging.info(f"Updated system normalization stats from data.h5")
 
             if "obs_scaler_mean" in f:
@@ -984,7 +1394,13 @@ def generate_dataset_directory_name(
     """Generate comprehensive directory name from config parameters"""
     # For many obs_components (like Lorenz96), just indicate count
     if len(config.obs_components) > 4:
-        obs_comp_str = f"{len(config.obs_components)}of{config.system_params.get('dim', len(config.obs_components))}"
+        dim = config.system_params.get('dim')
+        if dim is None:
+            dim = config.system_params.get('J') # KS
+        if dim is None:
+            dim = len(config.obs_components)
+            
+        obs_comp_str = f"{len(config.obs_components)}of{dim}"
     else:
         obs_comp_str = ",".join(map(str, config.obs_components))
     
@@ -1008,6 +1424,11 @@ def generate_dataset_directory_name(
     init_std = config.system_params.get("init_std", 1.0)
     if init_std != 1.0:
         parts.append(f"init{init_std:.3f}".replace(".", "p"))
+
+    # Add KS specific parameters
+    if "J" in config.system_params and "L" in config.system_params:
+        parts.append(f"J{config.system_params['J']}")
+        parts.append(f"L{config.system_params['L']:.2f}".replace(".", "p"))
     
     return "_".join(parts)
 
@@ -1089,5 +1510,22 @@ if __name__ == "__main__":
     obs_l96 = system_l96.observe(x0_l96)
     print(f"Observation shape: {obs_l96.shape} (Expected: 3)")
     print(f"Observation values: {obs_l96}")
+
+    print("\n5. Testing Kuramoto-Sivashinsky (ETD-RK4)")
+    config_ks = DataAssimilationConfig(
+        dt=0.05, # typical for KS
+        system_params={"J": 64, "L": 32 * np.pi},
+        obs_nonlinearity="arctan"
+    )
+    system_ks = KuramotoSivashinsky(config_ks)
+    print(f"KS State dim: {system_ks.state_dim} (Expected: 64)")
+    
+    x0_ks = system_ks.sample_initial_state(1).squeeze(0)
+    print(f"KS Initial state shape: {x0_ks.shape}")
+    
+    # Test dynamics integration
+    traj_ks = system_ks.integrate(x0_ks, 20)
+    print(f"KS Trajectory shape: {traj_ks.shape}")
+    print(f"KS Last state mean: {traj_ks[-1].mean():.3f}")
 
     print("\nAll tests passed!")

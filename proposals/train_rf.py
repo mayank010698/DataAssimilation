@@ -68,6 +68,7 @@ def train_rectified_flow(
     mc_guidance: bool = False,
     guidance_scale: float = 1.0,
     obs_indices: list = None,
+    wandb_project: str = "rf-train-96",
 ):
     """
     Train a rectified flow proposal distribution
@@ -97,6 +98,7 @@ def train_rectified_flow(
         mc_guidance: Whether to use Monte Carlo guidance during inference (saved to model config)
         guidance_scale: Scale for Monte Carlo guidance (saved to model config)
         obs_indices: List of indices where observations occur (for sparse observations)
+        wandb_project: WandB project name
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -202,7 +204,7 @@ def train_rectified_flow(
     # Setup logger
     wandb_logger = WandbLogger(
         entity="ml-climate",
-        project="flow-proposal",
+        project=wandb_project,
         name=output_dir.name,
         save_dir=str(output_dir),
     )
@@ -333,6 +335,9 @@ def main():
     parser.add_argument('--obs_components', type=str, default=None,
                         help='Comma-separated indices of observed variables (e.g. "0,2,4")')
     
+    parser.add_argument('--wandb_project', type=str, default="rf-train-96",
+                        help='WandB project name')
+
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
 
@@ -398,6 +403,7 @@ def main():
             mc_guidance=args.mc_guidance,
             guidance_scale=args.guidance_scale,
             obs_indices=obs_components,
+            wandb_project=args.wandb_project,
         )
         checkpoint_to_eval = best_checkpoint
     else:

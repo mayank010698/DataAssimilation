@@ -15,6 +15,7 @@ from data import (
     DataAssimilationDataModule,
     Lorenz63,
     Lorenz96,
+    KuramotoSivashinsky,
     generate_dataset_directory_name,
     save_config_yaml,
     generate_dataset_splits,
@@ -37,7 +38,7 @@ def parse_args():
     parser.add_argument(
         "--system",
         type=str,
-        choices=["lorenz63", "lorenz96"],
+        choices=["lorenz63", "lorenz96", "ks", "kuramoto-sivashinsky"],
         default="lorenz63",
         help="Dynamical system to use",
     )
@@ -92,6 +93,11 @@ def parse_args():
     parser.add_argument("--l96-forcing", type=float, default=8.0, help="Forcing parameter F for Lorenz 96")
     parser.add_argument("--l96-init-std", type=float, default=3.0, help="Initial standard deviation for Lorenz 96")
 
+    # System parameters (Kuramoto-Sivashinsky)
+    parser.add_argument("--ks-J", type=int, default=64, help="Spatial resolution J for KS")
+    parser.add_argument("--ks-L", type=float, default=None, help="Domain size L for KS (default: 16*pi or 32*pi depending on usage)")
+    parser.add_argument("--ks-init-std", type=float, default=1.0, help="Initial standard deviation for KS")
+
     # Data splits
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -101,7 +107,7 @@ def parse_args():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="./datasets",
+        default="/data/da_outputs/datasets/",
         help="Base directory for saving datasets",
     )
     parser.add_argument(
@@ -169,6 +175,19 @@ def main():
             "dim": args.l96_dim,
             "F": args.l96_forcing,
             "init_std": args.l96_init_std,
+        }
+    elif args.system in ["ks", "kuramoto-sivashinsky"]:
+        system_class = KuramotoSivashinsky
+        system_name = "ks"
+        state_dim = args.ks_J
+        
+        # Default L to 16*pi if not specified, though script usually passes it
+        L = args.ks_L if args.ks_L is not None else 16 * np.pi
+        
+        system_params = {
+            "J": args.ks_J,
+            "L": L,
+            "init_std": args.ks_init_std,
         }
     else:
         raise ValueError(f"Unknown system: {args.system}")
