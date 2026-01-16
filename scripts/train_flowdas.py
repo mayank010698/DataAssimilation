@@ -32,6 +32,44 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()]
 )
 
+class EarlyStopping:
+    """
+    Early stopping to stop the training when the loss does not improve after
+    certain epochs.
+    """
+    def __init__(self, patience=50, min_delta=0, verbose=False):
+        """
+        Args:
+            patience (int): How long to wait after last time validation loss improved.
+                            Default: 50
+            min_delta (float): Minimum change in the monitored quantity to qualify as an improvement.
+                               Default: 0
+            verbose (bool): If True, prints a message for each validation loss improvement. 
+                            Default: False
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+        self.val_loss_min = float('inf')
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+            self.val_loss_min = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.verbose:
+                logging.info(f'EarlyStopping counter: {self.counter} out of {self.patience}')
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.val_loss_min = val_loss
+            self.counter = 0
+
 class FlowDASDataModule(DataAssimilationDataModule):
     """
     Subclass to force datasets into 'inference' mode (returning pairs) for training.
@@ -351,13 +389,21 @@ def train(args):
         da_config = DataAssimilationConfig()
 
     # Determine system class
-    from data import Lorenz63, Lorenz96
+    from data import Lorenz63, Lorenz96, KuramotoSivashinsky
     
     # Check dataset dir name or config to guess system
-    if "lorenz96" in str(args.data_dir).lower() or "96" in str(args.config) or "lorenz96" in str(args.config).lower():
+    path_lower = str(args.data_dir).lower()
+    config_lower = str(args.config).lower()
+    
+    if "ks" in path_lower or "kuramoto" in path_lower or "ks" in config_lower:
+        system_class = KuramotoSivashinsky
+        logging.info("Detected Kuramoto-Sivashinsky system")
+    elif "lorenz96" in path_lower or "96" in config_lower or "lorenz96" in config_lower:
         system_class = Lorenz96
+        logging.info("Detected Lorenz 96 system")
     else:
         system_class = Lorenz63
+        logging.info("Defaulting to Lorenz 63 system")
 
     # Handle obs_components override
     if args.obs_components:
@@ -416,6 +462,9 @@ def train(args):
     optimizer = Adam(model.parameters(), lr=args.lr)
     scheduler = LambdaLR(optimizer, lr_lambda=lambda t: 1 - (t / args.epochs))
     
+    # Initialize Early Stopping
+    early_stopping = EarlyStopping(patience=args.patience, verbose=True)
+
     # Training Loop
     best_val_loss = float('inf')
     save_dir = Path(args.run_dir)
@@ -502,6 +551,13 @@ def train(args):
                 "learning_rate": optimizer.param_groups[0]['lr']
             })
 
+        # Check early stopping
+        early_stopping(avg_val_loss)
+        
+        if early_stopping.early_stop:
+            logging.info("Early stopping triggered.")
+            break
+
         # Save checkpoint
         checkpoint = {
             'epoch': epoch,
@@ -565,6 +621,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--batch_size", type=int, default=1024, help="Batch size")
     parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--patience", type=int, default=50, help="Early stopping patience")
     parser.add_argument("--num_workers", type=int, default=4, help="Number of dataloader workers")
     parser.add_argument("--device", type=str, default="cuda", help="Device (cuda/cpu)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")

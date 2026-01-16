@@ -1,0 +1,313 @@
+import os
+import sys
+import time
+import subprocess
+import glob
+import re
+from pathlib import Path
+from datetime import datetime
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# GPUs to use (2 through 7)
+AVAILABLE_GPUS = [2, 3, 4, 5, 6, 7]
+
+# Memory buffer (MiB)
+MEMORY_BUFFER = 2000 
+
+# Paths
+DATASETS_ROOT = "/data/da_outputs/datasets"
+LOGS_DIR = "logs/bpf_eval_scheduler"
+
+# Evaluation Parameters
+PARTICLE_COUNTS = [1000, 5000, 10000]
+TARGET_BATCH_SIZE = 100 # We want to evaluate all 100 trajectories in one go if possible
+RESAMPLING_THRESHOLD = 0.33
+NUM_EVAL_TRAJECTORIES = 100
+PYTHON_EXEC = "/home/cnagda/miniconda3/envs/da/bin/python"
+
+# Timestamp for this run
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# =============================================================================
+# UTILITIES
+# =============================================================================
+
+def setup_logging():
+    os.makedirs(LOGS_DIR, exist_ok=True)
+    print(f"Logging to {LOGS_DIR}")
+
+def get_gpu_free_memory():
+    """
+    Returns a dict {gpu_index: free_memory_mib}
+    """
+    try:
+        cmd = ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"]
+        result = subprocess.check_output(cmd).decode('utf-8').strip()
+        
+        gpu_memory = {}
+        for line in result.split('\n'):
+            if not line.strip(): continue
+            idx, free_mem = line.split(',')
+            gpu_memory[int(idx)] = int(free_mem)
+            
+        return gpu_memory
+    except Exception as e:
+        print(f"Error getting GPU memory: {e}")
+        return {}
+
+def estimate_bpf_memory_usage(state_dim, n_particles, batch_size, cache={}):
+    """
+    Estimates memory usage for BPF.
+    """
+    key = (state_dim, n_particles, batch_size)
+    if key in cache:
+        return cache[key]
+    
+    print(f"Estimating memory for BPF: dim={state_dim}, particles={n_particles}, batch={batch_size}...")
+    
+    # Use the last available GPU for estimation
+    est_gpu = AVAILABLE_GPUS[-1]
+    
+    cmd = [
+        PYTHON_EXEC, "scripts/estimate_bpf_memory.py",
+        "--state_dim", str(state_dim),
+        "--n_particles", str(n_particles),
+        "--batch_size", str(batch_size),
+        "--device", str(est_gpu)
+    ]
+    
+    try:
+        result = subprocess.check_output(cmd).decode('utf-8').strip()
+        memory_mib = int(result.split('\n')[-1])
+        
+        # Add safety margin (10%)
+        safe_memory = int(memory_mib * 1.1)
+        
+        print(f"  -> Estimated: {memory_mib} MiB (Safe: {safe_memory} MiB)")
+        cache[key] = safe_memory
+        return safe_memory
+    except Exception as e:
+        print(f"  -> Error estimating memory: {e}")
+        # Fallback values
+        return 10000 # Conservative fallback
+
+def determine_optimal_batch_size(state_dim, n_particles, max_memory_mib):
+    """
+    Determine the largest batch size (up to TARGET_BATCH_SIZE) that fits in memory.
+    """
+    # Try target first
+    mem = estimate_bpf_memory_usage(state_dim, n_particles, TARGET_BATCH_SIZE)
+    if mem < max_memory_mib:
+        return TARGET_BATCH_SIZE, mem
+    
+    # If fails, try halving
+    current_bs = TARGET_BATCH_SIZE // 2
+    while current_bs >= 1:
+        mem = estimate_bpf_memory_usage(state_dim, n_particles, current_bs)
+        if mem < max_memory_mib:
+            return current_bs, mem
+        current_bs //= 2
+        
+    return 1, 1000 # Worst case
+
+# =============================================================================
+# JOB GENERATION
+# =============================================================================
+
+def discover_datasets():
+    """
+    Scans DATASETS_ROOT for relevant datasets.
+    """
+    all_datasets = []
+    target_dims = [5, 10, 15, 20, 25, 50]
+    
+    dataset_dirs = glob.glob(os.path.join(DATASETS_ROOT, "lorenz96_*"))
+    
+    for d_path in dataset_dirs:
+        d_name = os.path.basename(d_path)
+        
+        # Extract dimension
+        match = re.search(r"comp(\d+)of(\d+)", d_name)
+        if not match: continue
+        
+        dim1 = int(match.group(1))
+        
+        if dim1 not in target_dims: continue
+        
+        # Check noise - we WANT NO noise (i.e. exclude if pnoise is present)
+        is_noise = "pnoise" in d_name
+        if is_noise: continue
+        
+        all_datasets.append({
+            "path": d_path,
+            "name": d_name,
+            "dim": dim1
+        })
+        
+    return sorted(all_datasets, key=lambda x: x['dim'])
+
+def create_jobs(datasets):
+    jobs = []
+    
+    # Pre-estimate max memory to determine batch sizes
+    # We assume roughly 40GB safe limit for determining batch size (A100 split or full)
+    # Actually, let's assume we have full A100 80GB, so limit is ~75GB.
+    SAFE_GPU_LIMIT = 75000 
+    
+    for ds in datasets:
+        dim = ds['dim']
+        
+        for particles in PARTICLE_COUNTS:
+            
+            # Determine batch size
+            batch_size, est_mem = determine_optimal_batch_size(dim, particles, SAFE_GPU_LIMIT)
+            
+            run_name = f"bpf_d{dim}_{particles}k"
+            job_name = f"{run_name}_{TIMESTAMP}"
+            log_file = os.path.join(LOGS_DIR, f"{job_name}.log")
+            
+            # Construct command
+            cmd = [
+                PYTHON_EXEC, "eval.py",
+                "--data-dir", ds['path'],
+                "--n-particles", str(particles),
+                "--batch-size", str(batch_size),
+                "--resampling-threshold", str(RESAMPLING_THRESHOLD),
+                "--proposal-type", "transition",
+                "--num-eval-trajectories", str(NUM_EVAL_TRAJECTORIES),
+                "--experiment-label", run_name,
+                "--wandb-project", "pf-eval-96",
+                "--run-name", run_name,
+                # Device will be set by CUDA_VISIBLE_DEVICES
+                "--device", "cuda" 
+            ]
+            
+            jobs.append({
+                "name": job_name,
+                "cmd": cmd,
+                "log": log_file,
+                "dim": dim,
+                "particles": particles,
+                "batch_size": batch_size,
+                "cost": est_mem
+            })
+            
+    return jobs
+
+# =============================================================================
+# SCHEDULER
+# =============================================================================
+
+def run():
+    setup_logging()
+    
+    print("Discovering datasets...")
+    datasets = discover_datasets()
+    print(f"Found {len(datasets)} non-noisy datasets.")
+    for d in datasets:
+        print(f"  - {d['name']} (Dim: {d['dim']})")
+        
+    print("\nCreating jobs...")
+    jobs = create_jobs(datasets)
+    
+    # Sort jobs by cost (descending)
+    jobs.sort(key=lambda x: x['cost'], reverse=True)
+    
+    print(f"Generated {len(jobs)} jobs.")
+    
+    pending_jobs = jobs
+    running_jobs = [] 
+    finished_jobs = []
+    
+    print("Starting scheduler loop...")
+    print(f"Available GPUs: {AVAILABLE_GPUS}")
+    
+    while pending_jobs or running_jobs:
+        # 1. Check running jobs
+        active_jobs = []
+        for rj in running_jobs:
+            if rj['process'].poll() is not None:
+                # Job finished
+                rc = rj['process'].returncode
+                duration = time.time() - rj['start_time']
+                print(f"Job finished: {rj['job']['name']} on GPU {rj['gpu']} (RC: {rc}, Time: {duration:.1f}s)")
+                finished_jobs.append(rj)
+            else:
+                active_jobs.append(rj)
+        running_jobs = active_jobs
+        
+        # 2. Get current GPU status
+        gpu_free = get_gpu_free_memory()
+        
+        # 3. Calculate effective free memory
+        effective_free = {}
+        now = time.time()
+        for g in AVAILABLE_GPUS:
+            actual = gpu_free.get(g, 0)
+            # Subtract cost of recently launched jobs (< 60s)
+            recent_deduction = sum(rj['cost'] for rj in running_jobs if rj['gpu'] == g and (now - rj['start_time'] < 60))
+            effective_free[g] = max(0, actual - recent_deduction)
+            
+        # 4. Schedule pending jobs
+        remaining_pending = []
+        jobs_to_launch = [] # To modify pending_jobs safely
+        
+        # Try to fit jobs
+        # Copy pending_jobs to iterate
+        current_pending = list(pending_jobs)
+        pending_jobs = [] # Will rebuild
+        
+        for job in current_pending:
+            cost_with_buffer = job['cost'] + MEMORY_BUFFER
+            
+            # Find suitable GPU
+            candidates = [g for g in AVAILABLE_GPUS if effective_free[g] >= cost_with_buffer]
+            candidates.sort(key=lambda g: effective_free[g]) # Best fit
+            
+            if candidates:
+                chosen_gpu = candidates[0]
+                
+                print(f"Launching {job['name']} on GPU {chosen_gpu} (Est: {job['cost']} MiB, Batch: {job['batch_size']})")
+                
+                env = os.environ.copy()
+                env["CUDA_VISIBLE_DEVICES"] = str(chosen_gpu)
+                env["PYTHONPATH"] = os.getcwd()
+                
+                os.makedirs(os.path.dirname(job['log']), exist_ok=True)
+                log_file = open(job['log'], 'w')
+                
+                proc = subprocess.Popen(
+                    job['cmd'],
+                    env=env,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT
+                )
+                
+                running_jobs.append({
+                    'job': job,
+                    'process': proc,
+                    'gpu': chosen_gpu,
+                    'cost': job['cost'],
+                    'start_time': time.time(),
+                    'log_handle': log_file
+                })
+                
+                effective_free[chosen_gpu] -= job['cost']
+            else:
+                pending_jobs.append(job)
+        
+        print(f"Status: {len(running_jobs)} running, {len(pending_jobs)} pending. GPU Free (Eff): {effective_free}")
+        
+        if not pending_jobs and not running_jobs:
+            break
+            
+        time.sleep(10)
+        
+    print("All jobs completed.")
+
+if __name__ == "__main__":
+    run()
+

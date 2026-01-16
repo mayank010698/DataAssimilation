@@ -143,14 +143,14 @@ def evaluate(args):
     # Load Data Config
     if args.config:
         config_path = Path(args.config)
+    elif args.data_dir:
+        config_path = Path(args.data_dir) / "config.yaml"
     else:
         # Try to find config in checkpoint or infer
         if 'config' in train_config and isinstance(train_config['config'], str): 
              config_path = Path(train_config['config']) # original config path string
         elif 'data_dir' in train_config and train_config['data_dir']:
              config_path = Path(train_config['data_dir']) / "config.yaml"
-        elif args.data_dir:
-             config_path = Path(args.data_dir) / "config.yaml"
         else:
              raise ValueError("Data config not found. Please specify --config or --data_dir")
                  
@@ -164,6 +164,7 @@ def evaluate(args):
     if config_path.exists():
         logging.info(f"Loading data config from {config_path}")
         da_config = load_config_yaml(config_path)
+        logging.info(f"Loaded config obs_nonlinearity: {da_config.obs_nonlinearity}")
     else:
         logging.warning(f"Data config file not found at {config_path}. Using minimal defaults.")
         da_config = DataAssimilationConfig() # Defaults
@@ -178,6 +179,7 @@ def evaluate(args):
         
     logging.info(f"Using system: {system_class.__name__}")
     system = system_class(da_config)
+    logging.info(f"System observation nonlinearity: {system.observation_operator.nonlinearity}")
     
     # Load Dataset (Test Split, Full Trajectories)
     if args.data_dir:
@@ -229,9 +231,36 @@ def evaluate(args):
     kernel_size = train_config.get('kernel_size', 5)
     obs_components = train_config.get('obs_components', None)
     
+    # Determine observation parameters
+    obs_indices = None
+    obs_dim = 0
+    use_observations = train_config.get('use_observations', False)
+    
+    if use_observations:
+        if obs_components is not None:
+            if isinstance(obs_components, str) and obs_components.lower() != 'none':
+                try:
+                    obs_indices = [int(x) for x in obs_components.split(',')]
+                except ValueError:
+                    logging.warning(f"Could not parse obs_components: {obs_components}")
+            elif isinstance(obs_components, (list, tuple)):
+                obs_indices = list(obs_components)
+        
+        if obs_indices is not None:
+            obs_dim = len(obs_indices)
+        elif 'obs_dim' in train_config:
+            obs_dim = train_config['obs_dim']
+        else:
+            # Fallback: if use_observations is True but no indices/dim, 
+            # might be full observation or handled internally.
+            # But better to be safe.
+            logging.warning("use_observations is True but obs_indices/dim could not be determined. Assuming obs_dim=0.")
+            obs_dim = 0
+            
     logging.info(f"Model Architecture: {architecture}, Width: {width}, Depth: {depth}")
     if architecture == 'resnet1d':
         logging.info(f"ResNet Params: Channels: {channels}, Num Blocks: {num_blocks}, Kernel: {kernel_size}")
+    logging.info(f"Observation Params: use_observations={use_observations}, obs_dim={obs_dim}, indices_len={len(obs_indices) if obs_indices else 0}")
     
     model = ScoreNet(
         marginal_prob_std=None,
@@ -245,21 +274,10 @@ def evaluate(args):
         channels=channels,
         num_blocks=num_blocks,
         kernel_size=kernel_size,
-        # Eval usually assumes no obs conditioning in the score model itself if trained without
-        # But we pass what's in config
-        # Note: obs_dim depends on use_observations in training
-        obs_dim=0, # Assuming no_obs for these experiments, or we should infer?
-        # Ideally we infer obs_dim from config 'use_observations'
-        # But here we hardcode 0 if not present, or try to respect training config?
-        # The 'no_obs' models were trained with use_observations=False
+        # Obs params
+        obs_dim=obs_dim,
+        obs_indices=obs_indices,
     ).to(args.device)
-    
-    # Correct obs_dim/indices if trained with observations
-    if train_config.get('use_observations', False):
-        # We need to reconstruct obs_dim and indices
-        # This requires the training da_config usually, or just what's in train_config
-        # train_config saves all args, including obs_components string
-        pass # Not handling reconstruction of obs conditioning for now as we focus on no_obs models
         
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
@@ -283,7 +301,7 @@ def evaluate(args):
         wandb_dir = Path("/data/da_outputs/wandb")
         wandb_dir.mkdir(parents=True, exist_ok=True)
         
-        wandb.init(project="FlowDAS-Eval", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
+        wandb.init(project="flowdas-eval-96", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
         
     # Data structure to hold detailed results for plotting
     trajectory_results = {}
@@ -321,6 +339,11 @@ def evaluate(args):
             # Start with ground truth
             curr_x_scaled = gt_traj_scaled[0].unsqueeze(0) # (1, D)
             
+            # Repeat for ensemble if needed
+            if args.n_samples_per_traj > 1:
+                curr_x_scaled = curr_x_scaled.repeat(args.n_samples_per_traj, 1) # (K, D)
+            
+            # Storage for trajectory (list of tensors)
             est_traj_scaled = [curr_x_scaled]
             if scaler_mean is not None:
                 curr_x_phys = curr_x_scaled * scaler_std + scaler_mean
@@ -328,22 +351,37 @@ def evaluate(args):
                 curr_x_phys = curr_x_scaled
             est_traj_phys = [curr_x_phys]
             
+            # Initial metrics
+            curr_x_phys_np = curr_x_phys.detach().cpu().numpy() # (K, D)
+            curr_x_mean_np = np.mean(curr_x_phys_np, axis=0) # (D,)
+            curr_x_std_np = np.std(curr_x_phys_np, axis=0) if args.n_samples_per_traj > 1 else np.zeros_like(curr_x_mean_np)
+            
             # Record initial state stats
             trajectory_results[i]["trajectory_data"].append({
                 "time_idx": 0,
                 "x_true": gt_traj[0].cpu().numpy(),
-                "x_est": curr_x_phys[0].cpu().numpy(),
+                "x_est": curr_x_mean_np,
+                "x_std": curr_x_std_np,
                 "rmse": 0.0, # Initial condition given
+                "crps": 0.0,
                 "has_observation": mask[0].item(),
                 "observation": observations[0].cpu().numpy() if mask[0] else None
             })
             
+            trajectory_results[i]["crps_sum"] = 0.0 # Init CRPS sum
+            
             for t in range(T - 1):
                 # Target time t+1
-                has_obs = mask[t+1]
+                time_idx = t + 1
+                
+                # Check observation availability based on dataset mask AND frequency
+                is_observed = (time_idx % args.obs_frequency == 0)
+                has_obs = (mask[time_idx].item() > 0.5) and is_observed
                 
                 if has_obs:
-                    obs_t_plus_1 = observations[t+1].unsqueeze(0)
+                    obs_t_plus_1 = observations[time_idx].unsqueeze(0)
+                    if args.n_samples_per_traj > 1:
+                        obs_t_plus_1 = obs_t_plus_1.repeat(args.n_samples_per_traj, 1)
                 else:
                     obs_t_plus_1 = None
                 
@@ -372,29 +410,38 @@ def evaluate(args):
                 est_traj_phys.append(next_x_phys.detach())
                 
                 # Compute Step Error
-                x_est_np = next_x_phys[0].detach().cpu().numpy()
-                x_true_np = gt_traj[t+1].cpu().numpy()
+                x_est_ens_np = next_x_phys.detach().cpu().numpy() # (K, D)
+                x_est_mean_np = np.mean(x_est_ens_np, axis=0) # (D,)
+                x_est_std_np = np.std(x_est_ens_np, axis=0) if args.n_samples_per_traj > 1 else np.zeros_like(x_est_mean_np)
+                x_true_np = gt_traj[t+1].cpu().numpy() # (D,)
                 
-                step_mse = np.mean((x_est_np - x_true_np) ** 2)
+                step_mse = np.mean((x_est_mean_np - x_true_np) ** 2)
                 step_rmse = np.sqrt(step_mse)
+                
+                step_crps = compute_crps_ensemble(x_est_ens_np, x_true_np)
                 
                 # Store step data
                 trajectory_results[i]["trajectory_data"].append({
                     "time_idx": t + 1,
                     "x_true": x_true_np,
-                    "x_est": x_est_np,
+                    "x_est": x_est_mean_np,
+                    "x_std": x_est_std_np,
                     "rmse": step_rmse,
-                    "has_observation": has_obs.item(),
+                    "crps": step_crps,
+                    "has_observation": has_obs,
                     "observation": observations[t+1].cpu().numpy() if has_obs else None
                 })
                 
                 trajectory_results[i]["rmse_sum"] += step_rmse
+                trajectory_results[i]["crps_sum"] += step_crps
                 trajectory_results[i]["count"] += 1
                 
                 curr_x_scaled = next_x_scaled.detach()
                 
             # Stack full trajectory
-            est_traj_phys_stack = torch.cat(est_traj_phys, dim=0) # (T, D)
+            est_traj_phys_stack = torch.stack(est_traj_phys, dim=0) # (T, K, D)
+            if args.n_samples_per_traj == 1:
+                est_traj_phys_stack = est_traj_phys_stack.squeeze(1) # (T, D)
             
             # Save to H5
             grp = f_out.create_group(f"traj_{i}")
@@ -411,37 +458,67 @@ def evaluate(args):
                 if i < args.n_vis_trajectories:
                     fig = plot_trajectory_comparison(trajectory_results[i], da_config)
                     if fig:
-                        wandb.log({f"eval/trajectory_{i}": wandb.Image(fig)})
+                        # Save locally for verification
+                        local_plot_path = results_dir / f"trajectory_{i}.png"
+                        try:
+                            fig.savefig(local_plot_path)
+                            logging.info(f"Saved plot locally to {local_plot_path}")
+                        except Exception as e:
+                            logging.error(f"Failed to save plot locally: {e}")
+
+                        if args.use_wandb and wandb is not None:
+                            try:
+                                # Use path string for robustness
+                                wandb.log({f"eval/trajectory_{i}": wandb.Image(str(local_plot_path))})
+                            except Exception as e:
+                                logging.error(f"Failed to log plot to wandb: {e}")
+                        
                         plt.close(fig)
+                    else:
+                        logging.warning(f"Plot generation returned None for trajectory {i}")
 
     # Compute Global Aggregates
     all_rmses = []
+    all_crps = []
     rmse_per_timestep = {} # Map time_idx -> list of rmses
+    crps_per_timestep = {} # Map time_idx -> list of crps
     
     for i in trajectory_results:
         traj_data = trajectory_results[i]["trajectory_data"]
         traj_rmse = trajectory_results[i]["rmse_sum"] / max(1, trajectory_results[i]["count"])
+        traj_crps = trajectory_results[i].get("crps_sum", 0.0) / max(1, trajectory_results[i]["count"])
+        
         all_rmses.append(traj_rmse)
+        all_crps.append(traj_crps)
         
         for d in traj_data:
             t = d["time_idx"]
             if t not in rmse_per_timestep:
                 rmse_per_timestep[t] = []
+                crps_per_timestep[t] = []
             rmse_per_timestep[t].append(d["rmse"])
+            crps_per_timestep[t].append(d.get("crps", 0.0))
             
     avg_rmse = np.mean(all_rmses)
+    avg_crps = np.mean(all_crps)
     logging.info(f"Global Average RMSE: {avg_rmse:.4f}")
+    logging.info(f"Global Average CRPS: {avg_crps:.4f}")
     
     if args.use_wandb and wandb is not None:
-        wandb.log({"eval/global_mean_rmse": avg_rmse})
+        wandb.log({
+            "eval/global_mean_rmse": avg_rmse,
+            "eval/global_mean_crps": avg_crps
+        })
         
-        # Log RMSE over time
+        # Log RMSE/CRPS over time
         # Sort timesteps
         sorted_times = sorted(rmse_per_timestep.keys())
         for t in sorted_times:
             mean_rmse_t = np.mean(rmse_per_timestep[t])
+            mean_crps_t = np.mean(crps_per_timestep[t])
             wandb.log({
                 "eval/mean_rmse_over_time": mean_rmse_t,
+                "eval/mean_crps_over_time": mean_crps_t,
                 "time_step": t
             })
 
@@ -457,15 +534,65 @@ def parse_args():
     parser.add_argument("--num_trajs", type=int, default=-1, help="Number of trajectories to evaluate")
     parser.add_argument("--n_vis_trajectories", type=int, default=10, help="Number of trajectories to visualize in WandB")
     parser.add_argument("--num_steps", type=int, default=50, help="Number of Euler steps")
-    parser.add_argument("--sigma_obs", type=float, default=0.25, help="Observation noise std for guidance")
+    parser.add_argument("--sigma_obs", type=float, default=0.1, help="Observation noise std for guidance")
     parser.add_argument("--mc_times", type=int, default=1, help="MC samples for Taylor approximation")
+    parser.add_argument("--n_samples_per_traj", type=int, default=20, help="Number of samples per trajectory (for CRPS)")
     parser.add_argument("--guidance_step", type=float, default=0.1, help="Step size for guidance gradient")
+    
+    parser.add_argument("--obs_frequency", type=int, default=1, help="Observation frequency (default: 1, observe every step)")
     
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
     parser.add_argument("--wandb_entity", type=str, default="ml-climate", help="WandB entity")
     parser.add_argument("--run_name", type=str, default=None, help="WandB run name")
     
     return parser.parse_args()
+
+def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
+    """
+    Compute CRPS for an ensemble.
+    
+    Args:
+        ensemble: Shape (K, D) or (K,)
+        truth: Shape (D,) or scalar
+        
+    Returns:
+        Average CRPS over dimensions (or scalar CRPS)
+    """
+    # Ensure 2D (K, D)
+    if ensemble.ndim == 1:
+        ensemble = ensemble[:, None]
+    if truth.ndim == 0:
+        truth = truth[None]
+        
+    # Dimensions: K=ensemble_size, D=state_dim
+    K, D = ensemble.shape
+    
+    crps_sum = 0.0
+    
+    for d in range(D):
+        ens_d = np.sort(ensemble[:, d])
+        truth_d = truth[d]
+        
+        # Term 1: Mean absolute error vs truth
+        # E|X - y|
+        mae = np.mean(np.abs(ens_d - truth_d))
+        
+        # Term 2: Dispersion (mean absolute difference between members)
+        # 0.5 * E|X - X'|
+        # Efficient calculation using sorted array:
+        # sum_{i,j} |x_i - x_j| = 2 * sum_{i<j} (x_j - x_i)
+        # = 2 * sum_{i=0}^{K-1} x_i * (2i - K + 1)
+        
+        # We want (1 / (2 * K^2)) * sum_{i,j} |x_i - x_j|
+        # = (1 / K^2) * sum_{i<j} (x_j - x_i)
+        
+        # However, for small K, direct computation is fast enough and safer
+        diffs = np.abs(ens_d[:, None] - ens_d[None, :])
+        dispersion = np.sum(diffs) / (2 * K * K)
+        
+        crps_sum += (mae - dispersion)
+        
+    return crps_sum / D
 
 if __name__ == "__main__":
     args = parse_args()
