@@ -298,6 +298,11 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.rf_model = RFProposal.load_from_checkpoint(checkpoint_path)
         self.rf_model.eval()
         self.rf_model.to(device)
+        
+        # Freeze model parameters to ensure no gradients are tracked for weights
+        for param in self.rf_model.parameters():
+            param.requires_grad = False
+            
         self.device = device
         self.system = system
         self.use_exact_trace = use_exact_trace

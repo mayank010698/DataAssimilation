@@ -10,6 +10,7 @@ __pycache__/
 .env
 *.png
 *.pdf
+*.log
 
 # other
 datasets/
@@ -20,6 +21,6 @@ wandb/
 flowdas-lorenz/
 scratch/
 enff-code/
-*plot.py
+*plot*
 *wandb*
 visualize_ks.py

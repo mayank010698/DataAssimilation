@@ -582,7 +582,7 @@ class RFProposal(pl.LightningModule):
                     v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
                     
                     divergence_sum = torch.zeros(batch_size, device=self.device)
-                    for _ in range(num_trace_probes):
+                    for j in range(num_trace_probes):
                         if trace_estimator == 'rademacher':
                             eps = torch.randint_like(x, low=0, high=2).float() * 2 - 1
                         else:
@@ -592,7 +592,7 @@ class RFProposal(pl.LightningModule):
                             v, x_for_grad,
                             grad_outputs=eps,
                             create_graph=False,
-                            retain_graph=True
+                            retain_graph=(j < num_trace_probes - 1)
                         )[0]
                         divergence_sum += torch.sum(vjp * eps, dim=-1)
                     divergence = divergence_sum / num_trace_probes
@@ -600,6 +600,9 @@ class RFProposal(pl.LightningModule):
             # Backward Euler step
             x = x - v.detach() * ds
             log_prob_correction = log_prob_correction + divergence.detach() * ds
+            
+            # Explicit cleanup
+            del x_for_grad, v, divergence
         
         # Base log prob of final z
         log_prob_base = -0.5 * torch.sum(x ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)
