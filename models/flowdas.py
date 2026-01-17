@@ -299,16 +299,12 @@ def grad_and_value_NOEST(x_prev, x1_hat, measurement, observation_operator=None,
         scaler_mean, scaler_std: For unscaling if working in scaled space.
         sigma_obs: Observation noise standard deviation.
     """
-    if isinstance(x1_hat, list):
-        x1_hat = torch.cat(x1_hat, dim=0) # (B*MC_times, D)
+    if not isinstance(x1_hat, list):
+        x1_hat = [x1_hat]
+    x1_hat = torch.cat(x1_hat, dim=0).requires_grad_(True)  # (B*MC_times, D)
     
-    # Enable gradient tracking on x1_hat if not already
-    if not x1_hat.requires_grad:
-        x1_hat = x1_hat.requires_grad_(True)
-        
     # Unscale if needed
     if scaler_mean is not None and scaler_std is not None:
-        # Assuming x1_hat is scaled, we unscale it to apply physical observation operator
         x1_phys = x1_hat * scaler_std + scaler_mean
     else:
         x1_phys = x1_hat
@@ -316,40 +312,35 @@ def grad_and_value_NOEST(x_prev, x1_hat, measurement, observation_operator=None,
     # Apply observation operator
     if observation_operator is None:
         y_pred = observe(x1_phys)
-        # Default legacy behavior: only use -3 dim if it looks like (..., 3*window)
-        # But here x1_phys is likely (B*MC, D)
-        # The legacy code: observe(x1_hat)[:,-3] implies scalar observation of one variable?
-        # We will assume observation_operator handles dimensions correctly.
     else:
         y_pred = observation_operator(x1_phys)
 
     # Compute difference
     # measurement shape: (B, obs_dim)
     # y_pred shape: (B*MC, obs_dim)
-    # We need to broadcast measurement
     B = measurement.shape[0]
     MC = x1_hat.shape[0] // B
-    
     measurement_expanded = measurement.repeat_interleave(MC, dim=0)
     
-    # Norm over observation dimensions
-    differences = torch.linalg.norm(measurement_expanded - y_pred, dim=-1) # (B*MC,)
+    if y_pred.ndim == 1:
+        differences = (measurement_expanded - y_pred).abs()
+    else:
+        differences = torch.linalg.norm(measurement_expanded - y_pred, dim=-1)
     
     # Compute weights
-    # 0.25 is hardcoded sigma in original code. Use sigma_obs.
     weights = -differences / (2 * (sigma_obs)**2)
-    
-    # Detach weights
+
+    # Detach weights to prevent gradients from flowing through them
     weights_detached = weights.detach()
-    
-    # Reshape to (B, MC) to do softmax over MC samples for each batch item
+
+    # Softmax over MC samples for each batch item
     weights_reshaped = weights_detached.view(B, MC)
-    softmax_weights = torch.softmax(weights_reshaped, dim=1).view(-1) # Flatten back to (B*MC,)
-    
-    # Result
+    softmax_weights = torch.softmax(weights_reshaped, dim=1).view(-1)
+
+    # Weighted differences
     result = softmax_weights * differences
     final_result = result.sum()
-    
+
     # Gradients
     norm_grad_tuple = torch.autograd.grad(outputs=final_result, inputs=x_prev, allow_unused=True)
     norm_grad = norm_grad_tuple[0]
