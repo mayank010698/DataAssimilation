@@ -7,6 +7,7 @@ import re
 import numpy as np
 from pathlib import Path
 from datetime import datetime
+import argparse
 
 # Add project root to path
 sys.path.append(os.getcwd())
@@ -124,14 +125,13 @@ def estimate_job_memory(model_type, state_dim, cache={}):
 # JOB GENERATION
 # =============================================================================
 
-def discover_datasets():
+def discover_datasets(filter_p_noise=None, filter_obs_noise=None):
     """
     Scans DATASETS_ROOT for relevant KS datasets.
     Filters by config parameters:
-    - process_noise_std approx 0.05
-    - obs_noise_std approx 0.2
     - J in {64, 128}
     - L in {16pi, 32pi}
+    - Optional filters for p_noise and obs_noise
     """
     
     target_Js = [64, 128]
@@ -174,13 +174,23 @@ def discover_datasets():
                 
             # Check Process Noise
             p_noise = config.process_noise_std
-            if abs(p_noise - 0.05) > 0.01:
-                continue
-                
+            
+            if filter_p_noise is None:
+                 if abs(p_noise - 0.05) > 0.01: continue
+            elif filter_p_noise < 0:
+                 pass # Accept all
+            else:
+                 if abs(p_noise - filter_p_noise) > 0.01: continue
+
             # Check Obs Noise
             o_noise = config.obs_noise_std
-            if abs(o_noise - 0.2) > 0.01:
-                continue
+            
+            if filter_obs_noise is None:
+                 if abs(o_noise - 0.2) > 0.01: continue
+            elif filter_obs_noise < 0:
+                 pass # Accept all
+            else:
+                 if abs(o_noise - filter_obs_noise) > 0.01: continue
             
             all_datasets.append({
                 "path": d_path,
@@ -197,7 +207,7 @@ def discover_datasets():
         
     return sorted(all_datasets, key=lambda x: (x['dim'], x['L']))
 
-def create_jobs(datasets):
+def create_jobs(datasets, skip_flowdas=False):
     jobs = []
     
     for ds in datasets:
@@ -211,13 +221,17 @@ def create_jobs(datasets):
         else:
             l_str = f"L{int(ds['L'])}"
             
-        noise_str = "pnoise0p05"
+        # Format pnoise string
+        if ds['p_noise'] < 1e-6:
+             noise_str = "nonoise"
+        else:
+             noise_str = f"pnoise{str(ds['p_noise']).replace('.', 'p')}"
         
         # Dense observations: 0 to dim-1
         obs_components = ",".join(map(str, range(dim)))
         
         # 1. RF Job
-        rf_name = f"ks_{noise_str}_J{dim}_{l_str}_{TIMESTAMP}"
+        rf_name = f"ks_{noise_str}_J{dim}_{l_str}_cd0p1_{TIMESTAMP}"
         rf_out = os.path.join(OUTPUT_ROOT_RF, rf_name)
         rf_log = os.path.join(LOGS_DIR, f"rf_{rf_name}.log")
         
@@ -234,6 +248,8 @@ def create_jobs(datasets):
             "--train-cond-method", "adaln",
             "--cond_embed_dim", "128",
             "--use_observations",
+            "--predict_delta",
+            "--cond_dropout", "0.1",
             "--batch_size", str(BATCH_SIZE),
             "--learning_rate", str(LR),
             "--max_epochs", str(RF_EPOCHS),
@@ -252,38 +268,40 @@ def create_jobs(datasets):
         })
         
         # 2. FlowDAS Job
-        flowdas_name = f"flowdas_ks_{noise_str}_J{dim}_{l_str}_{TIMESTAMP}"
-        flowdas_out = os.path.join(OUTPUT_ROOT_FLOWDAS, flowdas_name)
-        flowdas_log = os.path.join(LOGS_DIR, f"flowdas_{flowdas_name}.log")
-        
-        flowdas_cmd = [
-            "python", "scripts/train_flowdas.py",
-            "--config", os.path.join(ds['path'], "config.yaml"),
-            "--data_dir", ds['path'],
-            "--run_dir", flowdas_out,
-            "--obs_components", obs_components,
-            "--architecture", "resnet1d",
-            "--channels", str(CHANNELS),
-            "--num_blocks", str(NUM_BLOCKS),
-            "--kernel_size", str(KERNEL_SIZE),
-            "--use_observations",
-            "--batch_size", str(BATCH_SIZE),
-            "--lr", str(LR),
-            "--epochs", str(FLOWDAS_EPOCHS),
-            "--use_wandb",
-            "--wandb_project", WANDB_PROJECT_FLOWDAS,
-            "--wandb_name", flowdas_name,
-            "--evaluate"
-        ]
-        
-        jobs.append({
-            "type": "flowdas",
-            "dim": dim,
-            "name": flowdas_name,
-            "cmd": flowdas_cmd,
-            "log": flowdas_log,
-            "dataset": ds['name']
-        })
+        if not skip_flowdas:
+            flowdas_name = f"flowdas_ks_{noise_str}_J{dim}_{l_str}_{TIMESTAMP}"
+            flowdas_out = os.path.join(OUTPUT_ROOT_FLOWDAS, flowdas_name)
+            flowdas_log = os.path.join(LOGS_DIR, f"flowdas_{flowdas_name}.log")
+            
+            flowdas_cmd = [
+                "python", "scripts/train_flowdas.py",
+                "--config", os.path.join(ds['path'], "config.yaml"),
+                "--data_dir", ds['path'],
+                "--run_dir", flowdas_out,
+                "--obs_components", obs_components,
+                "--architecture", "resnet1d",
+                "--channels", str(CHANNELS),
+                "--num_blocks", str(NUM_BLOCKS),
+                "--kernel_size", str(KERNEL_SIZE),
+                "--use_observations",
+                "--cond_dropout", "0.1",
+                "--batch_size", str(BATCH_SIZE),
+                "--lr", str(LR),
+                "--epochs", str(FLOWDAS_EPOCHS),
+                "--use_wandb",
+                "--wandb_project", WANDB_PROJECT_FLOWDAS,
+                "--wandb_name", flowdas_name,
+                "--evaluate"
+            ]
+            
+            jobs.append({
+                "type": "flowdas",
+                "dim": dim,
+                "name": flowdas_name,
+                "cmd": flowdas_cmd,
+                "log": flowdas_log,
+                "dataset": ds['name']
+            })
         
     return jobs
 
@@ -292,19 +310,35 @@ def create_jobs(datasets):
 # =============================================================================
 
 def run():
+    parser = argparse.ArgumentParser(description="Run KS Experiments (RF & FlowDAS)")
+    parser.add_argument("--skip-flowdas", action="store_true", help="Skip FlowDAS jobs, run only RF")
+    parser.add_argument("--dry-run", action="store_true", help="List jobs without running them")
+    parser.add_argument("--p-noise", type=float, default=None, help="Filter by process noise (default: 0.05). Set to -1 for all.")
+    parser.add_argument("--obs-noise", type=float, default=None, help="Filter by observation noise (default: 0.2). Set to -1 for all.")
+    
+    args = parser.parse_args()
+
     setup_logging()
     
     print("Discovering KS datasets...")
-    datasets = discover_datasets()
+    datasets = discover_datasets(filter_p_noise=args.p_noise, filter_obs_noise=args.obs_noise)
     print(f"Found {len(datasets)} matching datasets.")
     for d in datasets:
         print(f"  - {d['name']} (J: {d['dim']}, L: {d['L']:.2f}, pnoise: {d['p_noise']})")
         
-    jobs = create_jobs(datasets)
+    jobs = create_jobs(datasets, skip_flowdas=args.skip_flowdas)
     # Sort jobs by dimension descending (largest first)
     jobs.sort(key=lambda x: x['dim'], reverse=True)
     
     print(f"Generated {len(jobs)} jobs.")
+    
+    if args.dry_run:
+        print("\n[DRY RUN] Would launch the following jobs:")
+        for i, job in enumerate(jobs):
+            print(f"{i+1}. {job['name']} ({job['type']})")
+            print(f"   Dataset: {job['dataset']}")
+            print(f"   Cmd: {' '.join(job['cmd'][:2])} ...")
+        return
     
     pending_jobs = jobs
     running_jobs = [] # List of {'job': job_dict, 'process': Popen, 'gpu': gpu_idx, 'cost': mem_est}
@@ -431,4 +465,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-

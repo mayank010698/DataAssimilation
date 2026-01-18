@@ -26,7 +26,7 @@ GPU_IDX=0
 TIMESTAMP="20260109_193733"
 
 # Dimensions to evaluate
-DIMS=(5 10 15 20 25 50)
+DIMS=(5)
 
 # Model types
 TYPES=("noise" "nonoise")

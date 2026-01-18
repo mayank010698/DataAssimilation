@@ -68,6 +68,7 @@ def train_rectified_flow(
     mc_guidance: bool = False,
     guidance_scale: float = 1.0,
     obs_indices: list = None,
+    cond_dropout: float = 0.0,
     wandb_project: str = "rf-train-96",
 ):
     """
@@ -98,6 +99,7 @@ def train_rectified_flow(
         mc_guidance: Whether to use Monte Carlo guidance during inference (saved to model config)
         guidance_scale: Scale for Monte Carlo guidance (saved to model config)
         obs_indices: List of indices where observations occur (for sparse observations)
+        cond_dropout: Probability of dropping conditioning during training
         wandb_project: WandB project name
     """
     output_dir = Path(output_dir)
@@ -176,6 +178,7 @@ def train_rectified_flow(
         mc_guidance=mc_guidance,
         guidance_scale=guidance_scale,
         obs_indices=obs_indices,
+        cond_dropout=cond_dropout,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -233,6 +236,7 @@ def train_rectified_flow(
         "mc_guidance": mc_guidance,
         "guidance_scale": guidance_scale,
         "obs_indices": obs_indices,
+        "cond_dropout": cond_dropout,
     })
     
     # Setup trainer
@@ -331,6 +335,8 @@ def main():
                         help='Enable Monte Carlo guidance by default during inference')
     parser.add_argument('--guidance-scale', type=float, default=1.0,
                         help='Default scale for Monte Carlo guidance')
+    parser.add_argument('--cond_dropout', type=float, default=0.0,
+                        help='Probability of dropping conditioning during training (Classifier-Free Guidance)')
 
     parser.add_argument('--obs_components', type=str, default=None,
                         help='Comma-separated indices of observed variables (e.g. "0,2,4")')
@@ -403,6 +409,7 @@ def main():
             mc_guidance=args.mc_guidance,
             guidance_scale=args.guidance_scale,
             obs_indices=obs_components,
+            cond_dropout=args.cond_dropout,
             wandb_project=args.wandb_project,
         )
         checkpoint_to_eval = best_checkpoint

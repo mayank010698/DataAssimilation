@@ -139,11 +139,23 @@ def plot_trajectory_comparison(
         if i in config.obs_components and len(obs_times) > 0:
             valid_mask = obs_indices < len(x_true_orig)
             if np.any(valid_mask):
-                ax.scatter(
-                    obs_times[valid_mask], 
-                    x_true_orig[obs_indices[valid_mask], i], 
-                    color="red", marker="x", s=40, label="Obs"
-                )
+                try:
+                    # Find which column in obs_values corresponds to state component i
+                    obs_col_idx = config.obs_components.index(i)
+                    
+                    # Handle dimension of obs_values
+                    if obs_values.ndim > 1:
+                        vals = obs_values[valid_mask, obs_col_idx]
+                    else:
+                        vals = obs_values[valid_mask]
+
+                    ax.scatter(
+                        obs_times[valid_mask], 
+                        vals, 
+                        color="red", marker="x", s=40, label="Obs"
+                    )
+                except ValueError:
+                    pass
         ax.set_ylabel(name)
         ax.legend()
 

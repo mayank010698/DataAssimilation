@@ -47,6 +47,7 @@ class RFProposal(pl.LightningModule):
         predict_delta: If True, learn increment (x_curr - x_prev) instead of absolute x_curr.
                        This provides a residual structure that can improve learning.
         time_embed_dim: Dimension of time embedding (default: 64 for MLP, typically 32 for ResNet1D)
+        cond_dropout: Probability of dropping conditioning during training (Classifier-Free Guidance)
     """
     
     def __init__(
@@ -71,6 +72,7 @@ class RFProposal(pl.LightningModule):
         mc_guidance: bool = False,
         guidance_scale: float = 1.0,
         obs_indices: Optional[list] = None,
+        cond_dropout: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -87,6 +89,7 @@ class RFProposal(pl.LightningModule):
         self.mc_guidance = mc_guidance
         self.guidance_scale = guidance_scale
         self.obs_indices = obs_indices
+        self.cond_dropout = cond_dropout
         
         # Create velocity network using factory
         self.velocity_net = create_velocity_network(
@@ -189,6 +192,11 @@ class RFProposal(pl.LightningModule):
         x_prev = batch['x_prev']
         x_curr = batch['x_curr']
         y_curr = batch.get('y_curr', None)
+        
+        # Apply Conditioning Dropout (Classifier-Free Guidance)
+        if self.training and self.cond_dropout > 0:
+            if torch.rand(1, device=self.device).item() < self.cond_dropout:
+                y_curr = None
         
         # Compute loss
         loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr)
