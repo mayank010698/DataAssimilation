@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 # Add project root to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from data import DataAssimilationConfig, DataAssimilationDataset, load_config_yaml, Lorenz63, Lorenz96
+from data import DataAssimilationConfig, DataAssimilationDataset, load_config_yaml, Lorenz63, Lorenz96, KuramotoSivashinsky
 from models.flowdas import ScoreNet, Euler_Maruyama_sampler
 
 try:
@@ -35,7 +35,6 @@ def plot_trajectory_comparison(result, config):
     """
     trajectory_data = result["trajectory_data"]
     traj_idx = result["trajectory_idx"]
-
     if not trajectory_data:
         return None
 
@@ -172,7 +171,11 @@ def evaluate(args):
     # Determine System
     # Heuristic:
     data_dir_str = str(args.data_dir or train_config.get('data_dir', ''))
-    if "lorenz96" in str(config_path) or "lorenz96" in data_dir_str or "96" in str(config_path):
+    
+    if "ks" in str(config_path):
+        system_class = KuramotoSivashinsky
+        logging.info("Detected Kuramoto-Sivashinsky system")
+    elif "lorenz96" in str(config_path) or "lorenz96" in data_dir_str or "96" in str(config_path):
         system_class = Lorenz96
     else:
         system_class = Lorenz63
@@ -245,6 +248,7 @@ def evaluate(args):
                     logging.warning(f"Could not parse obs_components: {obs_components}")
             elif isinstance(obs_components, (list, tuple)):
                 obs_indices = list(obs_components)
+                
         
         if obs_indices is not None:
             obs_dim = len(obs_indices)
@@ -301,7 +305,7 @@ def evaluate(args):
         wandb_dir = Path("/data/da_outputs/wandb")
         wandb_dir.mkdir(parents=True, exist_ok=True)
         
-        wandb.init(project="flowdas-eval-96", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
+        wandb.init(project="flowdas-eval-96-guidance-ablation", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
         
     # Data structure to hold detailed results for plotting
     trajectory_results = {}
@@ -318,6 +322,7 @@ def evaluate(args):
     with h5py.File(save_path, 'w') as f_out:
         
         for i in tqdm(range(num_trajs), desc="Evaluating"):
+            
             item = test_dataset[i]
             
             # Init results for this traj
@@ -334,7 +339,9 @@ def evaluate(args):
             observations = item['observations'].to(args.device) # (T, obs_dim)
             mask = item['obs_mask'].to(args.device) # (T,)
             
-            T = gt_traj.shape[0]
+            # T = gt_traj.shape[0]
+            T = 100
+            
             
             # Start with ground truth
             curr_x_scaled = gt_traj_scaled[0].unsqueeze(0) # (1, D)
@@ -377,7 +384,7 @@ def evaluate(args):
                 # Check observation availability based on dataset mask AND frequency
                 is_observed = (time_idx % args.obs_frequency == 0)
                 has_obs = (mask[time_idx].item() > 0.5) and is_observed
-                
+                # has_obs = False
                 if has_obs:
                     obs_t_plus_1 = observations[time_idx].unsqueeze(0)
                     if args.n_samples_per_traj > 1:
@@ -432,11 +439,20 @@ def evaluate(args):
                     "observation": observations[t+1].cpu().numpy() if has_obs else None
                 })
                 
+                
                 trajectory_results[i]["rmse_sum"] += step_rmse
                 trajectory_results[i]["crps_sum"] += step_crps
                 trajectory_results[i]["count"] += 1
                 
                 curr_x_scaled = next_x_scaled.detach()
+                
+                # Start with ground truth
+                # curr_x_scaled = gt_traj_scaled[t+1].unsqueeze(0) # (1, D)
+                
+                # # Repeat for ensemble if needed
+                # if args.n_samples_per_traj > 1:
+                #     curr_x_scaled = curr_x_scaled.repeat(args.n_samples_per_traj, 1) # (K, D)
+                
                 
             # Stack full trajectory
             est_traj_phys_stack = torch.stack(est_traj_phys, dim=0) # (T, K, D)
@@ -455,27 +471,28 @@ def evaluate(args):
                 wandb.log({"rmse": traj_rmse, "traj_idx": i})
                 
                 # Visualizations for first few trajectories
-                if i < args.n_vis_trajectories:
-                    fig = plot_trajectory_comparison(trajectory_results[i], da_config)
-                    if fig:
-                        # Save locally for verification
-                        local_plot_path = results_dir / f"trajectory_{i}.png"
-                        try:
-                            fig.savefig(local_plot_path)
-                            logging.info(f"Saved plot locally to {local_plot_path}")
-                        except Exception as e:
-                            logging.error(f"Failed to save plot locally: {e}")
+            if i < args.n_vis_trajectories:
+                fig = plot_trajectory_comparison(trajectory_results[i], da_config)
+                
+                if fig:
+                    # Save locally for verification
+                    local_plot_path = results_dir / f"trajectory_{i}.png"
+                    try:
+                        fig.savefig(local_plot_path)
+                        logging.info(f"Saved plot locally to {local_plot_path}")
+                    except Exception as e:
+                        logging.error(f"Failed to save plot locally: {e}")
 
-                        if args.use_wandb and wandb is not None:
-                            try:
-                                # Use path string for robustness
-                                wandb.log({f"eval/trajectory_{i}": wandb.Image(str(local_plot_path))})
-                            except Exception as e:
-                                logging.error(f"Failed to log plot to wandb: {e}")
-                        
-                        plt.close(fig)
-                    else:
-                        logging.warning(f"Plot generation returned None for trajectory {i}")
+                    if args.use_wandb and wandb is not None:
+                        try:
+                            # Use path string for robustness
+                            wandb.log({f"eval/trajectory_{i}": wandb.Image(str(local_plot_path))})
+                        except Exception as e:
+                            logging.error(f"Failed to log plot to wandb: {e}")
+                    
+                    plt.close(fig)
+                else:
+                    logging.warning(f"Plot generation returned None for trajectory {i}")
 
     # Compute Global Aggregates
     all_rmses = []
@@ -501,13 +518,19 @@ def evaluate(args):
             
     avg_rmse = np.mean(all_rmses)
     avg_crps = np.mean(all_crps)
+    
+    std_rmse = np.std(all_rmses)
+    std_crps = np.std(all_crps)
+    
     logging.info(f"Global Average RMSE: {avg_rmse:.4f}")
     logging.info(f"Global Average CRPS: {avg_crps:.4f}")
     
     if args.use_wandb and wandb is not None:
         wandb.log({
             "eval/global_mean_rmse": avg_rmse,
-            "eval/global_mean_crps": avg_crps
+            "eval/global_mean_crps": avg_crps,
+            "eval/global_std_rmse": std_rmse,
+            "eval/global_std_crps": std_crps
         })
         
         # Log RMSE/CRPS over time
@@ -515,10 +538,14 @@ def evaluate(args):
         sorted_times = sorted(rmse_per_timestep.keys())
         for t in sorted_times:
             mean_rmse_t = np.mean(rmse_per_timestep[t])
+            stddev_rmse_t = np.std(rmse_per_timestep[t])
             mean_crps_t = np.mean(crps_per_timestep[t])
+            std_crps_t = np.std(crps_per_timestep[t])
             wandb.log({
                 "eval/mean_rmse_over_time": mean_rmse_t,
                 "eval/mean_crps_over_time": mean_crps_t,
+                "eval/std_rmse_over_time": stddev_rmse_t,
+                "eval/std_crps_t": std_crps_t,
                 "time_step": t
             })
 
@@ -535,9 +562,9 @@ def parse_args():
     parser.add_argument("--n_vis_trajectories", type=int, default=10, help="Number of trajectories to visualize in WandB")
     parser.add_argument("--num_steps", type=int, default=50, help="Number of Euler steps")
     parser.add_argument("--sigma_obs", type=float, default=0.1, help="Observation noise std for guidance")
-    parser.add_argument("--mc_times", type=int, default=1, help="MC samples for Taylor approximation")
+    parser.add_argument("--mc_times", type=int, default=25, help="MC samples for Taylor approximation")
     parser.add_argument("--n_samples_per_traj", type=int, default=20, help="Number of samples per trajectory (for CRPS)")
-    parser.add_argument("--guidance_step", type=float, default=0.1, help="Step size for guidance gradient")
+    parser.add_argument("--guidance_step", type=float, default=0.01, help="Step size for guidance gradient")
     
     parser.add_argument("--obs_frequency", type=int, default=1, help="Observation frequency (default: 1, observe every step)")
     
