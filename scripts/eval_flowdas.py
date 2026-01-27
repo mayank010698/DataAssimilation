@@ -339,10 +339,8 @@ def evaluate(args):
             observations = item['observations'].to(args.device) # (T, obs_dim)
             mask = item['obs_mask'].to(args.device) # (T,)
             
-            # T = gt_traj.shape[0]
-            T = 100
-            
-            
+            T = gt_traj.shape[0]
+
             # Start with ground truth
             curr_x_scaled = gt_traj_scaled[0].unsqueeze(0) # (1, D)
             
@@ -384,7 +382,6 @@ def evaluate(args):
                 # Check observation availability based on dataset mask AND frequency
                 is_observed = (time_idx % args.obs_frequency == 0)
                 has_obs = (mask[time_idx].item() > 0.5) and is_observed
-                # has_obs = False
                 if has_obs:
                     obs_t_plus_1 = observations[time_idx].unsqueeze(0)
                     if args.n_samples_per_traj > 1:
@@ -445,13 +442,6 @@ def evaluate(args):
                 trajectory_results[i]["count"] += 1
                 
                 curr_x_scaled = next_x_scaled.detach()
-                
-                # Start with ground truth
-                # curr_x_scaled = gt_traj_scaled[t+1].unsqueeze(0) # (1, D)
-                
-                # # Repeat for ensemble if needed
-                # if args.n_samples_per_traj > 1:
-                #     curr_x_scaled = curr_x_scaled.repeat(args.n_samples_per_traj, 1) # (K, D)
                 
                 
             # Stack full trajectory
