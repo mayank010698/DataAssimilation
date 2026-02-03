@@ -21,6 +21,8 @@ wandb/
 flowdas-lorenz/
 scratch/
 enff-code/
+Score-based-Filter/
 *plot*
 *wandb*
 visualize_ks.py
+docs/
