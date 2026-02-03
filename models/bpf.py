@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Dict, Any, Optional, List, Tuple
+from typing import Dict, Any, Optional, List, Tuple, Union
 import logging
 import time
 
@@ -61,7 +61,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
             f"obs_dim={obs_dim}"
         )
 
-    def initialize_filter(self, x0: torch.Tensor) -> None:
+    def initialize_filter(self, x0: torch.Tensor, init_std: Optional[Union[float, torch.Tensor]] = None) -> None:
         """Initialize particles around initial state"""
         # x0 should be (1, State_dim) for unbatched or (Batch, State_dim) for batched
         if x0.dim() == 1:
@@ -70,13 +70,37 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         # Ensure x0 is on correct device
         x0 = x0.to(self.device)
 
-        init_std = 0.5
+        if init_std is None:
+            init_std = self.system.config.obs_noise_std
+        
+        # Handle if init_std is a tensor (e.g. climatological std)
+        if isinstance(init_std, torch.Tensor):
+            init_std = init_std.to(self.device)
+            # Expand to match batch/particles if necessary, or just rely on broadcasting
+            # noise shape: (Batch, N_particles, State_dim)
+            # init_std shape: (State_dim,) or scalar
+            if init_std.dim() > 0:
+                # Reshape to (1, 1, State_dim) for broadcasting
+                scale = init_std.reshape(1, 1, -1)
+            else:
+                scale = init_std
+        else:
+            scale = init_std
+
         # Noise: (N_particles, State_dim)
-        noise = init_std * torch.randn(
+        noise = torch.randn(
             self.n_particles, self.state_dim, device=self.device
         )
+        
+        # If batched, we need (Batch, N, D)
+        batch_size = x0.shape[0]
+        noise = noise.unsqueeze(0).expand(batch_size, -1, -1)
+        
+        # Apply scaling
+        noise = noise * scale
+        
         # x0: (1, State_dim), noise: (N, State_dim) -> particles: (N, State_dim)
-        self.particles = x0 + noise
+        self.particles = x0.unsqueeze(1) + noise
         self.particles_prev = self.particles.clone()  # Initialize previous particles
 
         self.weights = (
@@ -571,11 +595,14 @@ class BootstrapParticleFilter(FilteringMethod):
 
         logging.info("Initialized BootstrapParticleFilter (Batched)")
 
-    def initialize_filter(self, x0: torch.Tensor) -> None:
+    def initialize_filter(self, x0: torch.Tensor, init_std: Optional[Union[float, torch.Tensor]] = None) -> None:
         """
         Initialize particles around initial state.
         Args:
             x0: Initial states for batch, shape (Batch, State_dim)
+            init_std: Optional standard deviation for initialization. 
+                      If None, uses obs_noise_std.
+                      Can be scalar or tensor (State_dim,).
         """
         if x0.dim() == 1:
             x0 = x0.unsqueeze(0)
@@ -585,11 +612,26 @@ class BootstrapParticleFilter(FilteringMethod):
         # Ensure x0 is on correct device
         x0 = x0.to(self.device)
 
-        init_std = 0.5
+        if init_std is None:
+            init_std = self.system.config.obs_noise_std
+
+        # Handle if init_std is a tensor (e.g. climatological std)
+        if isinstance(init_std, torch.Tensor):
+            init_std = init_std.to(self.device)
+            if init_std.dim() > 0:
+                # Reshape to (1, 1, State_dim) for broadcasting: (Batch, N, D)
+                scale = init_std.reshape(1, 1, -1)
+            else:
+                scale = init_std
+        else:
+            scale = init_std
+
         # Shape: (Batch, N_particles, State_dim)
-        noise = init_std * torch.randn(
+        noise = torch.randn(
             batch_size, self.n_particles, self.state_dim, device=self.device
         )
+        
+        noise = noise * scale
         
         # Expand x0: (Batch, 1, State_dim) -> (Batch, N, State_dim)
         self.particles = x0.unsqueeze(1) + noise

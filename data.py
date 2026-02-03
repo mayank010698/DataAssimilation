@@ -32,6 +32,10 @@ class ObservationOperator:
         # 2. Nonlinearity (phi)
         if self.nonlinearity == "arctan":
             return torch.arctan(observed)
+        elif self.nonlinearity == "square":
+            return torch.square(observed)
+        elif self.nonlinearity == "cube":
+            return torch.pow(observed, 3)
         elif self.nonlinearity in ["linear_projection", "identity", "none"]:
             return observed
         elif hasattr(torch, self.nonlinearity):
@@ -62,6 +66,7 @@ class DataAssimilationConfig:
     
     # Process noise (for stochastic trajectory generation)
     process_noise_std: float = 0.0  # 0.0 = deterministic dynamics
+    stochastic_validation_test: bool = False  # Whether to use process noise for val/test splits
 
     # Data splits
     train_ratio: float = 0.8
@@ -128,7 +133,7 @@ class DynamicalSystem(ABC):
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
     
     def integrate(
-        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0
+        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
     ) -> torch.Tensor:
         """Integrate the system forward in time.
         
@@ -138,6 +143,7 @@ class DynamicalSystem(ABC):
             dt: Time step size (defaults to config.dt)
             process_noise_std: Standard deviation of additive Gaussian process noise.
                               If > 0, noise is added after each RK4 step: x_{t+1} = RK4(x_t) + σ·ε
+            step_start: The absolute step index corresponding to x0 (used for time-dependent dynamics/jumps).
         """
         if dt is None:
             dt = self.config.dt
@@ -155,7 +161,7 @@ class DynamicalSystem(ABC):
         x_curr = x0
         
         # We start from t=0, so we need n_steps-1 more steps to get n_steps total points
-        for _ in range(n_steps - 1):
+        for i in range(n_steps - 1):
             x_curr = self.rk4_step(x_curr, dt)
             # Add process noise if specified (stochastic dynamics)
             if process_noise_std > 0:
@@ -182,6 +188,114 @@ class DynamicalSystem(ABC):
             observed = observed + noise
 
         return observed
+
+
+
+class DoubleWell(DynamicalSystem):
+    """
+    Double Well system with manual state jumps.
+    Dynamics: dx = -4x(x^2 - 1)dt + sigma*dW
+    Manual jumps (sign flips) applied periodically to replicate specific experiments.
+    """
+
+    def __init__(self, config: DataAssimilationConfig):
+        # Default to observing component 0
+        if config.obs_components is None:
+            config.obs_components = [0]
+            
+        # Add identifier
+        if config.system_params is None:
+            config.system_params = {}
+        config.system_params["system_name"] = "double_well"
+            
+        super().__init__(config)
+        self.init_mean = torch.tensor([-1.0], dtype=torch.float32)
+        self.init_std = torch.tensor([1.0], dtype=torch.float32)
+
+    def get_state_dim(self) -> int:
+        return 1
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        """
+        Double Well deterministic dynamics: f(x) = -V'(x)
+        V(x) = (x^2 - 1)^2
+        f(x) = -4x(x^2 - 1) = 4x(1 - x^2)
+        """
+        return 4 * x * (1 - x**2)
+
+    def preprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        """Scale data using init_mean and init_std (loaded from data file)."""
+        if isinstance(x, np.ndarray):
+            init_mean_np = self.init_mean.numpy()
+            init_std_np = self.init_std.numpy()
+            return (x - init_mean_np) / init_std_np
+
+        device = x.device
+        return (x - self.init_mean.to(device)) / self.init_std.to(device)
+
+    def postprocess(self, x: Union[torch.Tensor, np.ndarray]) -> Union[torch.Tensor, np.ndarray]:
+        """Unscale data using init_mean and init_std (loaded from data file)."""
+        if isinstance(x, np.ndarray):
+            init_mean_np = self.init_mean.numpy()
+            init_std_np = self.init_std.numpy()
+            return init_mean_np + init_std_np * x
+
+        device = x.device
+        return self.init_mean.to(device) + self.init_std.to(device) * x
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        return torch.tensor([-1.0])
+
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        # Replicate original: -1 + randn * 0.02
+        default = self.get_default_initial_state()
+        if n_samples == 1:
+            return default + 0.02 * torch.randn_like(default)
+        else:
+            return default.unsqueeze(0) + 0.02 * torch.randn(n_samples, *default.shape)
+            
+    def integrate(
+        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
+    ) -> torch.Tensor:
+        """
+        Integrate with manual jumps to match original experiment.
+        Jumps occur at steps 21, 41, 61, 81... (indices where loop i=20, 40...)
+        """
+        if dt is None:
+            dt = self.config.dt
+            
+        if not isinstance(x0, torch.Tensor):
+            x0 = torch.tensor(x0, dtype=torch.float32)
+        is_batch = x0.ndim > 1
+        if not is_batch:
+            x0 = x0.unsqueeze(0)
+            
+        trajectories = [x0]
+        x_curr = x0
+        
+        # Stability clamping threshold
+        CLAMP_MIN, CLAMP_MAX = -5.0, 5.0
+        
+        for i in range(n_steps - 1):
+            real_i = i + step_start
+            
+            x_curr = self.rk4_step(x_curr, dt)
+            if process_noise_std > 0:
+                x_curr = x_curr + process_noise_std * torch.randn_like(x_curr)
+            
+            # Manual jumps logic from original code:
+            if real_i > 0 and real_i % 20 == 0:
+                 x_curr = -x_curr
+            
+            # Clamp to prevent explosion
+            x_curr = torch.clamp(x_curr, CLAMP_MIN, CLAMP_MAX)
+                 
+            trajectories.append(x_curr)
+            
+        result = torch.stack(trajectories, dim=1)
+        if not is_batch:
+            return result.squeeze(0)
+        return result
 
 
 class Lorenz63(DynamicalSystem):
@@ -505,7 +619,7 @@ class KuramotoSivashinsky(DynamicalSystem):
         return -0.5 * ik * u2_hat
 
     def integrate(
-        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0
+        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
     ) -> torch.Tensor:
         """Integrate using ETD-RK4."""
         if dt is None:
@@ -835,16 +949,19 @@ def generate_dataset_splits(system: DynamicalSystem, config: DataAssimilationCon
     else:
         train_traj, train_obs = generate_split(n_train, use_process_noise=True, x0_given=x0_train)
         
-    # Validation and test data: always deterministic
+    # Validation and test data
+    val_use_noise = config.stochastic_validation_test
+    test_use_noise = config.stochastic_validation_test
+    
     if precomputed_splits and "val" in precomputed_splits:
         val_traj, val_obs = precomputed_splits["val"]
     else:
-        val_traj, val_obs = generate_split(n_val, use_process_noise=False, x0_given=x0_val)
+        val_traj, val_obs = generate_split(n_val, use_process_noise=val_use_noise, x0_given=x0_val)
         
     if precomputed_splits and "test" in precomputed_splits:
         test_traj, test_obs = precomputed_splits["test"]
     else:
-        test_traj, test_obs = generate_split(n_test, use_process_noise=False, x0_given=x0_test)
+        test_traj, test_obs = generate_split(n_test, use_process_noise=test_use_noise, x0_given=x0_test)
     
     splits_unscaled = {
         "train": {"trajectories": train_traj, "observations": train_obs},
@@ -1527,5 +1644,28 @@ if __name__ == "__main__":
     traj_ks = system_ks.integrate(x0_ks, 20)
     print(f"KS Trajectory shape: {traj_ks.shape}")
     print(f"KS Last state mean: {traj_ks[-1].mean():.3f}")
+
+    print("\n6. Testing Double Well (Jumps)")
+    config_dw = DataAssimilationConfig(
+        dt=0.1,
+        system_params={},
+        obs_nonlinearity="identity"
+    )
+    system_dw = DoubleWell(config_dw)
+    x0_dw = system_dw.get_default_initial_state() # -1
+    print(f"DW Initial: {x0_dw}")
+    
+    # Run long enough to see a jump (at i=20 -> step 21)
+    # We need n_steps > 21. Let's do 25.
+    traj_dw = system_dw.integrate(x0_dw, 25)
+    print(f"DW Trajectory shape: {traj_dw.shape}")
+    
+    # Check values around jump
+    # i=20 corresponds to index 21 in trajectory (since traj[0] is x0)
+    # Loop i=19 computes traj[20] -> No jump
+    # Loop i=20 computes traj[21] -> Jump
+    print(f"Step 20 (i=19): {traj_dw[20].item():.4f}")
+    print(f"Step 21 (i=20): {traj_dw[21].item():.4f} (Should be flipped/positive)")
+    print(f"Step 22 (i=21): {traj_dw[22].item():.4f}")
 
     print("\nAll tests passed!")

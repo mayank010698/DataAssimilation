@@ -12,7 +12,7 @@ from datetime import datetime
 # =============================================================================
 
 # GPUs to use (excluding 0 and 1 as they might be reserved or busy, using 2-7)
-AVAILABLE_GPUS = [0, 1, 2, 5, 6, 7]
+AVAILABLE_GPUS = [1, 2, 3, 4, 5, 6, 7]
 
 # Memory buffer (MiB)
 MEMORY_BUFFER = 2000 
@@ -36,7 +36,7 @@ PARTICLE_SETTINGS = {
 }
 
 TARGET_BATCH_SIZE = 100 # Evaluate all 100 trajectories in one go if possible
-NUM_EVAL_TRAJECTORIES = 100
+NUM_EVAL_TRAJECTORIES = 50
 RF_SAMPLING_STEPS = 100
 RF_LIKELIHOOD_STEPS = 100
 
@@ -175,14 +175,14 @@ def discover_jobs():
     """
     jobs = []
     
-    # Retry specific failed jobs
-    RETRY_JOBS = [
-        "eval_rf_noise_d15_5000k",
-        "eval_rf_nonoise_d15_5000k",
-        "eval_rf_nonoise_d5_1000k",
-        "eval_rf_noise_d5_1000k",
-        "eval_rf_noise_d10_1000k"
-    ]
+    # Only run the failed jobs
+    # RETRY_JOBS = [
+    #     "eval_rf_noise_d15_5000k",
+    #     "eval_rf_nonoise_d15_5000k",
+    #     "eval_rf_nonoise_d5_1000k",
+    #     "eval_rf_noise_d5_1000k",
+    #     "eval_rf_noise_d10_1000k"
+    # ]
     
     # Dimensions to process
     dims = sorted(PARTICLE_SETTINGS.keys())
@@ -214,14 +214,14 @@ def discover_jobs():
         n_particles = PARTICLE_SETTINGS[dim]
         
         # We need two jobs: one for noisy-trained RF, one for nonoise-trained RF
-        for train_noisy in [False, True]:
+        for train_noisy in [True]:
             noise_label = "noise" if train_noisy else "nonoise"
             
-            run_name = f"eval_rf_{noise_label}_d{dim}_{n_particles}k"
+            run_name = f"eval_rf_{noise_label}_d{dim}_{n_particles}k_clim"
             
             # Only run the failed jobs
-            if run_name not in RETRY_JOBS:
-                continue
+            # if run_name not in RETRY_JOBS:
+            #     continue
             
             ckpt_path = find_checkpoint(dim, train_noisy)
             if not ckpt_path:
@@ -230,7 +230,12 @@ def discover_jobs():
                 
             # FORCE batch size 100 and high cost to ensure 1 job per GPU
             # as per user request to fix OOM/small batch sizes
-            batch_size = 100
+            # UPDATE: Reduce to 10 for high dims (20, 25) to fix OOM
+            if dim >= 20:
+                batch_size = 10
+            else:
+                batch_size = 100
+                
             est_mem = 70000 
             
             job_name = f"{run_name}_{TIMESTAMP}"
@@ -249,7 +254,8 @@ def discover_jobs():
                 "--experiment-label", run_name,
                 "--wandb-project", "pf-rf-eval-96",
                 "--run-name", run_name,
-                "--device", "cuda"
+                "--device", "cuda",
+                "--init-mode", "climatology"
             ]
             
             jobs.append({

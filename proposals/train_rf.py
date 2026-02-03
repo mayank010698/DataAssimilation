@@ -70,6 +70,7 @@ def train_rectified_flow(
     obs_indices: list = None,
     cond_dropout: float = 0.0,
     wandb_project: str = "rf-train-96",
+    save_every_n_epochs: int = None,
 ):
     """
     Train a rectified flow proposal distribution
@@ -101,6 +102,7 @@ def train_rectified_flow(
         obs_indices: List of indices where observations occur (for sparse observations)
         cond_dropout: Probability of dropping conditioning during training
         wandb_project: WandB project name
+        save_every_n_epochs: Save a checkpoint every N epochs
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -204,6 +206,20 @@ def train_rectified_flow(
     
     lr_monitor = LearningRateMonitor(logging_interval='epoch')
     
+    callbacks = [checkpoint_callback, early_stop_callback, lr_monitor]
+    
+    if save_every_n_epochs is not None and save_every_n_epochs > 0:
+        periodic_checkpoint = ModelCheckpoint(
+            dirpath=output_dir / "checkpoints",
+            filename='rf-periodic-{epoch:03d}',
+            every_n_epochs=save_every_n_epochs,
+            save_top_k=-1, # Save all periodic checkpoints
+            save_last=False, # Already handled by main checkpoint callback
+            save_on_train_epoch_end=True
+        )
+        callbacks.append(periodic_checkpoint)
+        logger_obj.info(f"Saving periodic checkpoints every {save_every_n_epochs} epochs")
+    
     # Setup logger
     wandb_logger = WandbLogger(
         entity="ml-climate",
@@ -244,7 +260,7 @@ def train_rectified_flow(
         max_epochs=max_epochs,
         accelerator='gpu' if gpus > 0 and torch.cuda.is_available() else 'cpu',
         devices=gpus if gpus > 0 and torch.cuda.is_available() else 1,
-        callbacks=[checkpoint_callback, early_stop_callback, lr_monitor],
+        callbacks=callbacks,
         logger=wandb_logger,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
@@ -335,7 +351,7 @@ def main():
                         help='Enable Monte Carlo guidance by default during inference')
     parser.add_argument('--guidance-scale', type=float, default=1.0,
                         help='Default scale for Monte Carlo guidance')
-    parser.add_argument('--cond_dropout', type=float, default=0.0,
+    parser.add_argument('--cond_dropout', type=float, default=0.1,
                         help='Probability of dropping conditioning during training (Classifier-Free Guidance)')
 
     parser.add_argument('--obs_components', type=str, default=None,
@@ -343,6 +359,9 @@ def main():
     
     parser.add_argument('--wandb_project', type=str, default="rf-train-96",
                         help='WandB project name')
+
+    parser.add_argument('--save_every_n_epochs', type=int, default=None,
+                        help='Save a checkpoint every N epochs')
 
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
@@ -411,6 +430,7 @@ def main():
             obs_indices=obs_components,
             cond_dropout=args.cond_dropout,
             wandb_project=args.wandb_project,
+            save_every_n_epochs=args.save_every_n_epochs,
         )
         checkpoint_to_eval = best_checkpoint
     else:

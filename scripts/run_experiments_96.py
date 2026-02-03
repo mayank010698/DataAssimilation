@@ -188,6 +188,7 @@ def create_jobs(datasets):
             "--batch_size", str(BATCH_SIZE),
             "--learning_rate", str(LR),
             "--max_epochs", str(RF_EPOCHS),
+            "--cond_dropout", "0.1",
             "--gpus", "1",
             "--evaluate"
         ]
@@ -198,40 +199,6 @@ def create_jobs(datasets):
             "name": rf_name,
             "cmd": rf_cmd,
             "log": rf_log,
-            "dataset": ds['name']
-        })
-        
-        # 2. FlowDAS Job
-        flowdas_name = f"flowdas_l96_{noise_str}_dim{dim}_{TIMESTAMP}"
-        flowdas_out = os.path.join(OUTPUT_ROOT_FLOWDAS, flowdas_name)
-        flowdas_log = os.path.join(LOGS_DIR, f"flowdas_{flowdas_name}.log")
-        
-        flowdas_cmd = [
-            "python", "scripts/train_flowdas.py",
-            "--config", os.path.join(ds['path'], "config.yaml"),
-            "--data_dir", ds['path'],
-            "--run_dir", flowdas_out,
-            "--obs_components", obs_components,
-            "--architecture", "resnet1d",
-            "--channels", str(CHANNELS),
-            "--num_blocks", str(NUM_BLOCKS),
-            "--kernel_size", str(KERNEL_SIZE),
-            "--use_observations",
-            "--batch_size", str(BATCH_SIZE),
-            "--lr", str(LR),
-            "--epochs", str(FLOWDAS_EPOCHS),
-            "--use_wandb",
-            "--wandb_project", "flowdas-train-96",
-            "--wandb_name", flowdas_name,
-            "--evaluate"
-        ]
-        
-        jobs.append({
-            "type": "flowdas",
-            "dim": dim,
-            "name": flowdas_name,
-            "cmd": flowdas_cmd,
-            "log": flowdas_log,
             "dataset": ds['name']
         })
         

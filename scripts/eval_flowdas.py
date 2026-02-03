@@ -13,7 +13,15 @@ import matplotlib.pyplot as plt
 # Add project root to path
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
-from data import DataAssimilationConfig, DataAssimilationDataset, load_config_yaml, Lorenz63, Lorenz96, KuramotoSivashinsky
+from data import (
+    DataAssimilationConfig,
+    DataAssimilationDataset,
+    DoubleWell,
+    KuramotoSivashinsky,
+    load_config_yaml,
+    Lorenz63,
+    Lorenz96,
+)
 from models.flowdas import ScoreNet, Euler_Maruyama_sampler
 
 try:
@@ -60,59 +68,90 @@ def plot_trajectory_comparison(result, config):
                 obs_values.append(d["observation"])
                 obs_indices.append(time_to_idx[t])
 
+    state_dim = x_true.shape[1]
+    obs_components = config.obs_components if config.obs_components else []
+
+    if state_dim == 1:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(time_steps, x_true[:, 0], "b-", alpha=0.8, label="True")
+        ax.plot(time_steps, x_est[:, 0], "r--", alpha=0.8, label="Generated")
+        if 0 in obs_components and len(obs_times) > 0:
+            try:
+                obs_idx = obs_components.index(0)
+                obs_vals_arr = np.array(obs_values)
+                ax.scatter(obs_times, obs_vals_arr[:, obs_idx], color="red", marker="x", s=40, label="Obs")
+            except ValueError:
+                pass
+        ax.set_title(f"1D Trajectory (ID: {traj_idx})")
+        ax.set_xlabel("Time Step")
+        ax.set_ylabel("State")
+        ax.legend()
+        ax.grid(True)
+        return fig
+
     fig = plt.figure(figsize=(16, 12))
 
-    # 3D Plot (using first 3 dims)
-    ax1 = fig.add_subplot(3, 2, 1, projection="3d")
-    ax1.plot(x_true[:, 0], x_true[:, 1], x_true[:, 2], "b-", alpha=0.8, label="True")
-    ax1.plot(x_est[:, 0], x_est[:, 1], x_est[:, 2], "r--", alpha=0.8, label="Generated")
-    ax1.set_title(f"3D Trajectory (ID: {traj_idx})")
-    ax1.legend()
+    if state_dim == 3:
+        # 3D Plot (using first 3 dims)
+        ax1 = fig.add_subplot(3, 2, 1, projection="3d")
+        ax1.plot(x_true[:, 0], x_true[:, 1], x_true[:, 2], "b-", alpha=0.8, label="True")
+        ax1.plot(x_est[:, 0], x_est[:, 1], x_est[:, 2], "r--", alpha=0.8, label="Generated")
+        ax1.set_title(f"3D Trajectory (ID: {traj_idx})")
+        ax1.legend()
 
-    # Component Plots (first 3)
-    state_names = ["X", "Y", "Z"]
-    colors = ["blue", "green", "orange"]
-    
-    obs_components = config.obs_components if config.obs_components else []
-    
-    for i, (name, color) in enumerate(zip(state_names, colors)):
-        if i >= x_true.shape[1]: break
+        # Component Plots (first 3)
+        state_names = ["X", "Y", "Z"]
+        colors = ["blue", "green", "orange"]
         
-        ax = fig.add_subplot(3, 2, i + 2)
-        ax.plot(time_steps, x_true[:, i], color=color, label=f"{name} (true)")
-        ax.plot(time_steps, x_est[:, i], color="red", linestyle="--", label=f"{name} (gen)")
-        
-        # Plot observations if available for this component
-        # Note: This simple check assumes obs_values matches state indices which might not be true for all operators
-        # But for identity/subset observation it often works if we map correctly.
-        # Here we simplify and just plot if we have data and it looks like identity-ish
-        
-        # Check if component i is observed
-        # If obs_components is list of indices, check if i in it
-        is_observed = i in obs_components
-        
-        if is_observed and len(obs_times) > 0:
-            # We need to know WHICH index in obs_values corresponds to state component i
-            # If obs_components = [0, 2], then obs_values[:, 0] is state 0, obs_values[:, 1] is state 2
-            try:
-                obs_idx = obs_components.index(i)
-                # obs_values is (N_obs, Obs_Dim)
-                if obs_idx < obs_values[0].shape[0]: # Check dimension validity
-                    # Filter valid times
-                    valid_mask = [idx < len(x_true) for idx in obs_indices]
-                    # We need to array-ify obs_values first
+        for i, (name, color) in enumerate(zip(state_names, colors)):
+            if i >= x_true.shape[1]:
+                break
+            
+            ax = fig.add_subplot(3, 2, i + 2)
+            ax.plot(time_steps, x_true[:, i], color=color, label=f"{name} (true)")
+            ax.plot(time_steps, x_est[:, i], color="red", linestyle="--", label=f"{name} (gen)")
+            
+            is_observed = i in obs_components
+            if is_observed and len(obs_times) > 0:
+                try:
+                    obs_idx = obs_components.index(i)
                     obs_vals_arr = np.array(obs_values)
-                    
                     ax.scatter(
                         obs_times, 
                         obs_vals_arr[:, obs_idx], 
                         color="red", marker="x", s=40, label="Obs"
                     )
-            except ValueError:
-                pass # Component not observed
+                except ValueError:
+                    pass
 
-        ax.set_ylabel(name)
-        ax.legend()
+            ax.set_ylabel(name)
+            ax.legend()
+    else:
+        # High-dimensional case: plot heatmaps and component 0 time series
+        ax1 = fig.add_subplot(3, 2, 1)
+        im1 = ax1.imshow(x_true.T, aspect='auto', interpolation='nearest', cmap='viridis', origin='lower')
+        ax1.set_title(f"True State Heatmap (ID: {traj_idx})")
+        ax1.set_ylabel("State Component")
+        plt.colorbar(im1, ax=ax1)
+
+        ax2 = fig.add_subplot(3, 2, 2)
+        im2 = ax2.imshow(x_est.T, aspect='auto', interpolation='nearest', cmap='viridis', origin='lower')
+        ax2.set_title("Estimated State Heatmap")
+        ax2.set_ylabel("State Component")
+        plt.colorbar(im2, ax=ax2)
+
+        ax3 = fig.add_subplot(3, 2, 3)
+        ax3.plot(time_steps, x_true[:, 0], "b-", label="True (Dim 0)")
+        ax3.plot(time_steps, x_est[:, 0], "r--", label="Gen (Dim 0)")
+        if 0 in obs_components and len(obs_times) > 0:
+            try:
+                obs_idx = obs_components.index(0)
+                obs_vals_arr = np.array(obs_values)
+                ax3.scatter(obs_times, obs_vals_arr[:, obs_idx], color="red", marker="x", s=40, label="Obs")
+            except ValueError:
+                pass
+        ax3.set_title("Component 0 Time Series")
+        ax3.legend()
 
     # RMSE over time
     ax5 = fig.add_subplot(3, 2, 5)
@@ -169,7 +208,6 @@ def evaluate(args):
         da_config = DataAssimilationConfig() # Defaults
 
     # Determine System
-    # Heuristic:
     data_dir_str = str(args.data_dir or train_config.get('data_dir', ''))
     
     if "ks" in str(config_path):
@@ -305,7 +343,13 @@ def evaluate(args):
         wandb_dir = Path("/data/da_outputs/wandb")
         wandb_dir.mkdir(parents=True, exist_ok=True)
         
-        wandb.init(project="flowdas-eval-96-guidance-ablation", config=args.__dict__, name=run_name, entity=args.wandb_entity, dir=str(wandb_dir))
+        wandb.init(
+            project=args.wandb_project,
+            config=args.__dict__,
+            name=run_name,
+            entity=args.wandb_entity,
+            dir=str(wandb_dir),
+        )
         
     # Data structure to hold detailed results for plotting
     trajectory_results = {}
@@ -528,14 +572,14 @@ def evaluate(args):
         sorted_times = sorted(rmse_per_timestep.keys())
         for t in sorted_times:
             mean_rmse_t = np.mean(rmse_per_timestep[t])
-            stddev_rmse_t = np.std(rmse_per_timestep[t])
             mean_crps_t = np.mean(crps_per_timestep[t])
+            std_rmse_t = np.std(rmse_per_timestep[t])
             std_crps_t = np.std(crps_per_timestep[t])
             wandb.log({
                 "eval/mean_rmse_over_time": mean_rmse_t,
+                "eval/std_rmse_over_time": std_rmse_t,
                 "eval/mean_crps_over_time": mean_crps_t,
-                "eval/std_rmse_over_time": stddev_rmse_t,
-                "eval/std_crps_t": std_crps_t,
+                "eval/std_crps_over_time": std_crps_t,
                 "time_step": t
             })
 
@@ -559,6 +603,7 @@ def parse_args():
     parser.add_argument("--obs_frequency", type=int, default=1, help="Observation frequency (default: 1, observe every step)")
     
     parser.add_argument("--use_wandb", action="store_true", help="Use Weights & Biases")
+    parser.add_argument("--wandb_project", type=str, default="flowdas-eval", help="WandB project")
     parser.add_argument("--wandb_entity", type=str, default="ml-climate", help="WandB entity")
     parser.add_argument("--run_name", type=str, default=None, help="WandB run name")
     

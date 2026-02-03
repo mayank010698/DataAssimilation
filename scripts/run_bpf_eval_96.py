@@ -4,6 +4,7 @@ import time
 import subprocess
 import glob
 import re
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -12,7 +13,7 @@ from datetime import datetime
 # =============================================================================
 
 # GPUs to use (2 through 7)
-AVAILABLE_GPUS = [2, 3, 4, 5, 6, 7]
+AVAILABLE_GPUS = [1, 2, 6, 7]
 
 # Memory buffer (MiB)
 MEMORY_BUFFER = 2000 
@@ -22,10 +23,16 @@ DATASETS_ROOT = "/data/da_outputs/datasets"
 LOGS_DIR = "logs/bpf_eval_scheduler"
 
 # Evaluation Parameters
-PARTICLE_COUNTS = [1000, 5000, 10000]
-TARGET_BATCH_SIZE = 100 # We want to evaluate all 100 trajectories in one go if possible
+PARTICLE_SETTINGS = {
+    5: 1000,
+    10: 1000,
+    15: 5000,
+    20: 5000,
+    25: 5000
+}
+TARGET_BATCH_SIZE = 50 # We want to evaluate all 100 trajectories in one go if possible
 RESAMPLING_THRESHOLD = 0.33
-NUM_EVAL_TRAJECTORIES = 100
+NUM_EVAL_TRAJECTORIES = 50
 PYTHON_EXEC = "/home/cnagda/miniconda3/envs/da/bin/python"
 
 # Timestamp for this run
@@ -117,18 +124,22 @@ def determine_optimal_batch_size(state_dim, n_particles, max_memory_mib):
 # JOB GENERATION
 # =============================================================================
 
-def discover_datasets():
+def discover_datasets(obs_operator="arctan"):
     """
     Scans DATASETS_ROOT for relevant datasets.
     """
     all_datasets = []
-    target_dims = [5, 10, 15, 20, 25, 50]
+    target_dims = sorted(PARTICLE_SETTINGS.keys())
     
     dataset_dirs = glob.glob(os.path.join(DATASETS_ROOT, "lorenz96_*"))
     
     for d_path in dataset_dirs:
         d_name = os.path.basename(d_path)
         
+        # Check observation operator
+        if obs_operator not in d_name:
+            continue
+
         # Extract dimension
         match = re.search(r"comp(\d+)of(\d+)", d_name)
         if not match: continue
@@ -149,7 +160,7 @@ def discover_datasets():
         
     return sorted(all_datasets, key=lambda x: x['dim'])
 
-def create_jobs(datasets):
+def create_jobs(datasets, obs_operator="arctan"):
     jobs = []
     
     # Pre-estimate max memory to determine batch sizes
@@ -160,40 +171,44 @@ def create_jobs(datasets):
     for ds in datasets:
         dim = ds['dim']
         
-        for particles in PARTICLE_COUNTS:
+        if dim not in PARTICLE_SETTINGS:
+            continue
             
-            # Determine batch size
-            batch_size, est_mem = determine_optimal_batch_size(dim, particles, SAFE_GPU_LIMIT)
+        particles = PARTICLE_SETTINGS[dim]
             
-            run_name = f"bpf_d{dim}_{particles}k"
-            job_name = f"{run_name}_{TIMESTAMP}"
-            log_file = os.path.join(LOGS_DIR, f"{job_name}.log")
-            
-            # Construct command
-            cmd = [
-                PYTHON_EXEC, "eval.py",
-                "--data-dir", ds['path'],
-                "--n-particles", str(particles),
-                "--batch-size", str(batch_size),
-                "--resampling-threshold", str(RESAMPLING_THRESHOLD),
-                "--proposal-type", "transition",
-                "--num-eval-trajectories", str(NUM_EVAL_TRAJECTORIES),
-                "--experiment-label", run_name,
-                "--wandb-project", "pf-eval-96",
-                "--run-name", run_name,
-                # Device will be set by CUDA_VISIBLE_DEVICES
-                "--device", "cuda" 
-            ]
-            
-            jobs.append({
-                "name": job_name,
-                "cmd": cmd,
-                "log": log_file,
-                "dim": dim,
-                "particles": particles,
-                "batch_size": batch_size,
-                "cost": est_mem
-            })
+        # Determine batch size
+        batch_size, est_mem = determine_optimal_batch_size(dim, particles, SAFE_GPU_LIMIT)
+        
+        run_name = f"bpf_d{dim}_{particles}k_{obs_operator}_clim"
+        job_name = f"{run_name}_{TIMESTAMP}"
+        log_file = os.path.join(LOGS_DIR, f"{job_name}.log")
+        
+        # Construct command
+        cmd = [
+            PYTHON_EXEC, "eval.py",
+            "--data-dir", ds['path'],
+            "--n-particles", str(particles),
+            "--batch-size", str(batch_size),
+            "--resampling-threshold", str(RESAMPLING_THRESHOLD),
+            "--proposal-type", "transition",
+            "--num-eval-trajectories", str(NUM_EVAL_TRAJECTORIES),
+            "--experiment-label", run_name,
+            "--wandb-project", "pf-eval-96",
+            "--run-name", run_name,
+            # Device will be set by CUDA_VISIBLE_DEVICES
+            "--device", "cuda",
+            "--init-mode", "climatology"
+        ]
+        
+        jobs.append({
+            "name": job_name,
+            "cmd": cmd,
+            "log": log_file,
+            "dim": dim,
+            "particles": particles,
+            "batch_size": batch_size,
+            "cost": est_mem
+        })
             
     return jobs
 
@@ -201,17 +216,24 @@ def create_jobs(datasets):
 # SCHEDULER
 # =============================================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run BPF evaluation on L96 datasets")
+    parser.add_argument("--obs-operator", type=str, default="arctan", 
+                        help="Observation operator to match in dataset names (default: arctan)")
+    return parser.parse_args()
+
 def run():
+    args = parse_args()
     setup_logging()
     
-    print("Discovering datasets...")
-    datasets = discover_datasets()
+    print(f"Discovering datasets (obs_operator='{args.obs_operator}')...")
+    datasets = discover_datasets(obs_operator=args.obs_operator)
     print(f"Found {len(datasets)} non-noisy datasets.")
     for d in datasets:
         print(f"  - {d['name']} (Dim: {d['dim']})")
         
     print("\nCreating jobs...")
-    jobs = create_jobs(datasets)
+    jobs = create_jobs(datasets, obs_operator=args.obs_operator)
     
     # Sort jobs by cost (descending)
     jobs.sort(key=lambda x: x['cost'], reverse=True)

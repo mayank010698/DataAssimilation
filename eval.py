@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -17,6 +18,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from data import (
     DataAssimilationConfig,
     DataAssimilationDataModule,
+    DoubleWell,
     KuramotoSivashinsky,
     Lorenz63,
     Lorenz96,
@@ -25,6 +27,7 @@ from data import (
 )
 from models.base_pf import FilteringMethod
 from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
+from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
 from models.proposals import RectifiedFlowProposal, TransitionProposal
 
 
@@ -132,6 +135,48 @@ def test_rf_log_probs(rf_proposal, system):
         print("Log probs vary across samples (Good).")
 
 
+def save_trajectory_data(trajectory_data: List[Dict[str, Any]], traj_idx: int, save_dir: Path):
+    """Save trajectory data to disk"""
+    if not trajectory_data:
+        return
+
+    save_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Sort by time
+    trajectory_data.sort(key=lambda x: x["time_idx"])
+    
+    time_steps = np.array([d["time_idx"] for d in trajectory_data])
+    x_true = np.array([d["x_true"] for d in trajectory_data])
+    x_est = np.array([d["x_est"] for d in trajectory_data])
+    rmse = np.array([d["rmse"] for d in trajectory_data])
+    
+    save_dict = {
+        "time_steps": time_steps,
+        "x_true": x_true,
+        "x_est": x_est,
+        "rmse": rmse,
+    }
+    
+    if "crps" in trajectory_data[0]:
+        save_dict["crps"] = np.array([d["crps"] for d in trajectory_data])
+
+    # Extract valid observations
+    obs_times = []
+    obs_values = []
+    for d in trajectory_data:
+        if d.get("has_observation") and d.get("observation") is not None:
+            obs_times.append(d["time_idx"])
+            obs_values.append(d["observation"])
+            
+    if obs_times:
+        save_dict["obs_times"] = np.array(obs_times)
+        save_dict["obs_values"] = np.array(obs_values)
+
+    out_path = save_dir / f"traj_{traj_idx}_data.npz"
+    np.savez(out_path, **save_dict)
+    print(f"Saved trajectory {traj_idx} to {out_path}")
+
+
 def plot_trajectory_comparison(
     result: Dict[str, Any],
     config: DataAssimilationConfig,
@@ -184,7 +229,8 @@ def plot_trajectory_comparison(
     fig = plt.figure(figsize=(16, 12))
 
     # Determine if high dimensional (e.g. > 3)
-    is_high_dim = x_true.shape[1] > 3
+    state_dim = x_true.shape[1]
+    is_high_dim = state_dim > 3
 
     if is_high_dim:
         # High-dim plotting (Heatmaps + Projections)
@@ -235,6 +281,32 @@ def plot_trajectory_comparison(
 
         ax4.set_title("Component 0 Time Series")
         ax4.legend()
+
+    elif state_dim == 1:
+        # 1D Plot for Double Well
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.plot(time_steps, x_true_orig[:, 0], "b-", alpha=0.8, label="True")
+        ax.plot(time_steps, x_est_orig[:, 0], "r--", alpha=0.8, label="PF")
+        
+        # Plot observations if available
+        if 0 in config.obs_components and len(obs_times) > 0:
+            valid_mask = obs_indices < len(x_true_orig)
+            if np.any(valid_mask):
+                try:
+                    obs_col_idx = config.obs_components.index(0)
+                    val = obs_values[valid_mask, obs_col_idx] if obs_values.ndim > 1 else obs_values[valid_mask]
+                    ax.scatter(
+                        obs_times[valid_mask], 
+                        val, 
+                        color="red", marker="x", s=40, label="Obs"
+                    )
+                except ValueError:
+                    pass
+        
+        ax.set_title(f"1D Trajectory{space_label} (ID: {traj_idx})")
+        ax.legend()
+        ax.grid(True)
+        return fig # Return early since subplot layout is different
 
     else:
         # 3D Plot
@@ -472,8 +544,13 @@ def log_config_to_wandb(
     """Log configuration settings to wandb"""
     obs_op_type = config.obs_nonlinearity
     
+    proposal_type_name = "Gaussian/Linear"
+    if hasattr(pf, "proposal"):
+        proposal_type_name = type(pf.proposal).__name__
+    
     wandb_config = {
         # Data configuration
+        "dataset_name": Path(args.data_dir).name,
         "num_trajectories": config.num_trajectories,
         "len_trajectory": config.len_trajectory,
         "warmup_steps": config.warmup_steps,
@@ -494,7 +571,7 @@ def log_config_to_wandb(
         # Particle filter configuration
         "n_particles": pf.n_particles,
         "process_noise_std": pf.process_noise_std,
-        "proposal_type": type(pf.proposal).__name__,
+        "proposal_type": proposal_type_name,
         "state_dim": pf.state_dim,
         "obs_dim": pf.obs_dim,
         "resampling_threshold": args.resampling_threshold,
@@ -505,7 +582,7 @@ def log_config_to_wandb(
         "batch_size": args.batch_size,
     }
 
-    if isinstance(pf.proposal, RectifiedFlowProposal):
+    if hasattr(pf, "proposal") and isinstance(pf.proposal, RectifiedFlowProposal):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
 
     wandb.config.update(wandb_config)
@@ -536,9 +613,12 @@ def parse_args():
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
+    parser.add_argument("--method", type=str, default="bpf", choices=["bpf", "enkf", "letkf"], help="Filtering method to use")
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
     parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
+    parser.add_argument("--inflation", type=float, default=1.0, help="Multiplicative inflation factor (EnKF/LETKF)")
+    parser.add_argument("--localization-radius", type=float, default=4.0, help="Localization radius (LETKF)")
     parser.add_argument(
         "--proposal-type", type=str, choices=["transition", "rf"], default="transition"
     )
@@ -555,6 +635,7 @@ def parse_args():
     parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
     parser.add_argument("--use-opt-weight-update", action="store_true", help="Use optimal weight update approximation")
     parser.add_argument("--resampling-threshold", type=float, default=0.33, help="Resampling threshold ratio (default: 0.5)")
+    parser.add_argument("--init-mode", type=str, default="truth", choices=["truth", "climatology"], help="Initialization mode: 'truth' (x0 + obs_noise) or 'climatology' (mean + std)")
 
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
@@ -564,25 +645,54 @@ def parse_args():
     parser.add_argument("--wandb-entity", type=str, default="ml-climate")
     parser.add_argument("--wandb-tags", type=str, default="")
     parser.add_argument("--disable-wandb", action="store_true", default=False)
+    parser.add_argument("--save-dir", type=str, default=None, help="Directory to save trajectory data (default: auto-generated)")
 
     return parser.parse_args()
 
 
 def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb_run, vis_indices):
     """Execute batched evaluation logic"""
-    print(f"\nInitializing Batched Bootstrap Particle Filter (Batch Size: {args.batch_size})...")
+    print(f"\nInitializing Batched {args.method.upper()} (Batch Size: {args.batch_size})...")
     
-    pf = BootstrapParticleFilter(
-        system=system,
-        proposal_distribution=proposal,
-        n_particles=args.n_particles,
-        state_dim=system.state_dim,
-        obs_dim=obs_dim,
-        process_noise_std=args.process_noise_std,
-        device=args.device,
-        use_optimal_weight_update=args.use_opt_weight_update,
-        resampling_threshold_ratio=args.resampling_threshold,
-    )
+    save_dir = Path(args.save_dir)
+    
+    if args.method == "bpf":
+        pf = BootstrapParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            use_optimal_weight_update=args.use_opt_weight_update,
+            resampling_threshold_ratio=args.resampling_threshold,
+        )
+    elif args.method == "enkf":
+        pf = EnsembleKalmanFilter(
+            system=system,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            obs_noise_std=args.obs_noise_std if args.obs_noise_std else config.obs_noise_std,
+            inflation_factor=args.inflation,
+            device=args.device,
+        )
+    elif args.method == "letkf":
+        pf = LocalEnsembleTransformKalmanFilter(
+            system=system,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            obs_noise_std=args.obs_noise_std if args.obs_noise_std else config.obs_noise_std,
+            inflation_factor=args.inflation,
+            localization_radius=args.localization_radius,
+            device=args.device,
+        )
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
     
     if wandb_run:
         log_config_to_wandb(config, args, pf, args.rf_checkpoint)
@@ -636,7 +746,23 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         # Initialize Filter for new trajectories
         is_start = (time_idxs[0] == 1)
         if is_start:
-             pf.initialize_filter(x_prev)
+             if args.init_mode == "climatology":
+                 # Use climatological statistics
+                 init_mean = system.init_mean.to(x_prev.device)
+                 if init_mean.dim() == 1:
+                     x_init = init_mean.unsqueeze(0).expand_as(x_prev)
+                 else:
+                     x_init = init_mean.expand_as(x_prev)
+                 
+                 # Pass climatological std as init_std
+                 pf.initialize_filter(x_init, init_std=system.init_std)
+             else:
+                 # Initialize from ground truth with obs_noise spread
+                 # We use obs_noise_std for initial spread to avoid stability issues with large system.init_std
+                 # (e.g. DoubleWell has init_std=1.0 which causes explosion with RK4 dt=0.1)
+                 init_spread = getattr(pf, "obs_noise_std", 0.1)
+                 pf.initialize_filter(x_prev, init_std=init_spread)
+
              for tid in traj_idxs.tolist():
                  trajectory_results_map[tid] = {
                      "metrics": [], 
@@ -718,30 +844,60 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         }
         final_results.append(res_dict)
         
-        if wandb_run and tid in vis_indices:
-            fig = plot_trajectory_comparison(res_dict, config, system)
-            if fig:
-                wandb.log({f"visualizations/traj_{tid}": wandb.Image(fig)})
-                plt.close(fig)
+        if tid in vis_indices and data["trajectory_data"] is not None:
+            save_trajectory_data(data["trajectory_data"], tid, save_dir)
+            if wandb_run:
+                fig = plot_trajectory_comparison(res_dict, config, system)
+                if fig:
+                    wandb.log({f"visualizations/traj_{tid}": wandb.Image(fig)})
+                    plt.close(fig)
 
     return final_results
 
 
 def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wandb_run, vis_indices):
     """Execute sequential evaluation logic (original behavior)"""
-    print(f"\nInitializing Bootstrap Particle Filter (Sequential)...")
+    print(f"\nInitializing {args.method.upper()} (Sequential)...")
     
-    pf = BootstrapParticleFilterUnbatched(
-        system=system,
-        proposal_distribution=proposal,
-        n_particles=args.n_particles,
-        state_dim=system.state_dim,
-        obs_dim=obs_dim,
-        process_noise_std=args.process_noise_std,
-        device=args.device,
-        use_optimal_weight_update=args.use_opt_weight_update,
-        resampling_threshold_ratio=args.resampling_threshold,
-    )
+    save_dir = Path(args.save_dir)
+    
+    if args.method == "bpf":
+        pf = BootstrapParticleFilterUnbatched(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            use_optimal_weight_update=args.use_opt_weight_update,
+            resampling_threshold_ratio=args.resampling_threshold,
+        )
+    elif args.method == "enkf":
+        pf = EnsembleKalmanFilter(
+            system=system,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            obs_noise_std=args.obs_noise_std if args.obs_noise_std else config.obs_noise_std,
+            inflation_factor=args.inflation,
+            device=args.device,
+        )
+    elif args.method == "letkf":
+        pf = LocalEnsembleTransformKalmanFilter(
+            system=system,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            obs_noise_std=args.obs_noise_std if args.obs_noise_std else config.obs_noise_std,
+            inflation_factor=args.inflation,
+            localization_radius=args.localization_radius,
+            device=args.device,
+        )
+    else:
+        raise ValueError(f"Unknown method: {args.method}")
     
     if wandb_run:
         log_config_to_wandb(config, args, pf, args.rf_checkpoint)
@@ -795,11 +951,13 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             }
             trajectory_results.append(result)
             
-            if wandb_run and do_vis:
-                fig = plot_trajectory_comparison(result, config, system)
-                if fig:
-                    wandb.log({f"visualizations/traj_{current_traj_idx}": wandb.Image(fig)})
-                    plt.close(fig)
+            if do_vis and current_traj_data:
+                save_trajectory_data(current_traj_data, current_traj_idx, save_dir)
+                if wandb_run:
+                    fig = plot_trajectory_comparison(result, config, system)
+                    if fig:
+                        wandb.log({f"visualizations/traj_{current_traj_idx}": wandb.Image(fig)})
+                        plt.close(fig)
 
             current_traj_metrics = []
             current_traj_data = []
@@ -882,11 +1040,13 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         }
         trajectory_results.append(result)
         
-        if wandb_run and do_vis:
-            fig = plot_trajectory_comparison(result, config, system)
-            if fig:
-                wandb.log({f"visualizations/traj_{current_traj_idx}": wandb.Image(fig)})
-                plt.close(fig)
+        if do_vis and current_traj_data:
+            save_trajectory_data(current_traj_data, current_traj_idx, save_dir)
+            if wandb_run:
+                fig = plot_trajectory_comparison(result, config, system)
+                if fig:
+                    wandb.log({f"visualizations/traj_{current_traj_idx}": wandb.Image(fig)})
+                    plt.close(fig)
                 
     return trajectory_results
 
@@ -901,7 +1061,7 @@ def main():
     logging.getLogger("models").setLevel(logging.WARNING)
 
     print("=" * 80)
-    print("Bootstrap Particle Filter Evaluation")
+    print("Filter Evaluation")
     print("=" * 80)
 
     # Load dataset directory
@@ -949,6 +1109,9 @@ def main():
     elif "dim" in config.system_params or "F" in config.system_params:
         system_class = Lorenz96
         logging.info("Detected Lorenz96 system config")
+    elif config.system_params.get("system_name") == "double_well":
+        system_class = DoubleWell
+        logging.info("Detected DoubleWell system config")
     else:
         system_class = Lorenz63
         logging.info("Detected Lorenz63 system config")
@@ -992,7 +1155,7 @@ def main():
     print(f"  Mean: {system.init_mean}")
     print(f"  Std:  {system.init_std}")
 
-    if args.proposal_type == "rf":
+    if args.method == "bpf" and args.proposal_type == "rf":
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
@@ -1041,14 +1204,20 @@ def main():
 
     # Setup Weights & Biases
     wandb_run = None
+    
+    # Construct run name (safe_name) regardless of wandb usage
+    obs_op_type = config.obs_nonlinearity
+    dataset_name = Path(args.data_dir).name
+    safe_name = (
+        args.run_name
+        or f"{dataset_name}_{args.method}"
+    )
+
     if not args.disable_wandb:
-        obs_op_type = config.obs_nonlinearity
-        safe_name = (
-            args.run_name
-            or f"{args.experiment_label}_{obs_op_type}_{args.proposal_type}"
-        )
         tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
-        tags.extend([args.proposal_type])
+        tags.extend([args.method])
+        if args.method == "bpf":
+            tags.append(args.proposal_type)
         if args.batch_size > 1:
             tags.append("batched")
             
@@ -1067,6 +1236,9 @@ def main():
         # Define x-axis for time-series plots
         wandb.define_metric("time_step")
         wandb.define_metric("mean_rmse_over_time", step_metric="time_step")
+        wandb.define_metric("std_rmse_over_time", step_metric="time_step")
+        wandb.define_metric("mean_crps_over_time", step_metric="time_step")
+        wandb.define_metric("std_crps_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_pre_resample_over_time", step_metric="time_step")
         wandb.define_metric("mean_cumulative_resamples", step_metric="time_step")
@@ -1074,11 +1246,30 @@ def main():
         wandb.define_metric("mean_obs_log_prob", step_metric="time_step")
         wandb.define_metric("mean_obs_log_prob_std", step_metric="time_step")
 
+    # Determine save directory
+    if args.save_dir:
+        # User specified directory
+        pass 
+    elif wandb_run:
+        # Use wandb directory
+        args.save_dir = str(Path(wandb.run.dir) / "trajectories")
+    else:
+        # Auto-generate local directory
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        args.save_dir = str(Path("evaluation_outputs") / f"{safe_name}_{timestamp}" / "trajectories")
+        
+    print(f"Trajectory data will be saved to: {args.save_dir}")
+
     # Identify first 10 trajectories for visualization
     vis_indices = set(range(10))
     
     # Choose execution path
-    if args.batch_size > 1:
+    # EnKF and LETKF are implemented as batched filters, so we use run_batched_eval
+    # even if batch_size is 1.
+    # Climatology initialization is also implemented only in run_batched_eval logic.
+    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf"]) or (args.init_mode == "climatology")
+
+    if use_batched:
         trajectory_results = run_batched_eval(
             args, config, system, data_module, obs_dim, proposal, wandb_run, vis_indices
         )
@@ -1173,7 +1364,9 @@ def main():
                     wandb.log({
                         "time_step": t,
                         "mean_rmse_over_time": np.mean(rmse_vals),
+                        "std_rmse_over_time": np.std(rmse_vals) if rmse_vals else 0.0,
                         "mean_crps_over_time": np.mean(crps_vals) if crps_vals else 0.0,
+                        "std_crps_over_time": np.std(crps_vals) if crps_vals else 0.0,
                         "mean_ess_over_time": np.mean(ess_vals) if ess_vals else 0.0,
                         "mean_ess_pre_resample_over_time": np.mean(ess_pre_vals) if ess_pre_vals else 0.0,
                         "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0,

@@ -77,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--observation-operator",
         type=str,
-        choices=["linear_projection", "arctan", "identity"],
+        choices=["linear_projection", "arctan", "identity", "square", "cube"],
         default="arctan",
         help="Observation nonlinearity type"
     )

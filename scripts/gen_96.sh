@@ -14,7 +14,7 @@ echo "=========================================="
 
 # Generate new datasets
 # Dimensions: 5, 10, 15, 20, 25, 50
-DIMS=(5 10 15 20 25 50)
+DIMS=(5 10 15 20 25)
 
 for DIM in "${DIMS[@]}"; do
     echo ""
@@ -30,7 +30,7 @@ for DIM in "${DIMS[@]}"; do
         --num-trajectories 2048 \
         --len-trajectory 200 \
         --obs-frequency 1 \
-        --observation-operator arctan \
+        --observation-operator cube \
         --seed 42 \
         --force
 done

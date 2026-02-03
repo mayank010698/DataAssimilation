@@ -389,7 +389,7 @@ def train(args):
         da_config = DataAssimilationConfig()
 
     # Determine system class
-    from data import Lorenz63, Lorenz96, KuramotoSivashinsky
+    from data import Lorenz63, Lorenz96, KuramotoSivashinsky, DoubleWell
     
     # Check dataset dir name or config to guess system
     path_lower = str(args.data_dir).lower()
@@ -401,6 +401,9 @@ def train(args):
     elif "lorenz96" in path_lower or "96" in config_lower or "lorenz96" in config_lower:
         system_class = Lorenz96
         logging.info("Detected Lorenz 96 system")
+    elif "double_well" in path_lower or "dw" in path_lower or "double_well" in config_lower:
+        system_class = DoubleWell
+        logging.info("Detected Double Well system")
     else:
         system_class = Lorenz63
         logging.info("Defaulting to Lorenz 63 system")
