@@ -26,3 +26,6 @@ Score-based-Filter/
 *wandb*
 visualize_ks.py
 docs/
+evaluation_outputs/
+runs/
+tuning_results/
