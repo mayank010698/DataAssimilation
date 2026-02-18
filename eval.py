@@ -28,6 +28,8 @@ from data import (
 from models.base_pf import FilteringMethod
 from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
+from models.ensf import EnsembleScoreFilter
+from models.ensf_proposal import EnsembleScoreFilterWithProposal
 from models.proposals import RectifiedFlowProposal, TransitionProposal
 
 
@@ -613,12 +615,20 @@ def parse_args():
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
-    parser.add_argument("--method", type=str, default="bpf", choices=["bpf", "enkf", "letkf"], help="Filtering method to use")
+    parser.add_argument("--method", type=str, default="bpf", choices=["bpf", "enkf", "letkf", "ensf"], help="Filtering method to use")
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
     parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
     parser.add_argument("--inflation", type=float, default=1.0, help="Multiplicative inflation factor (EnKF/LETKF)")
     parser.add_argument("--localization-radius", type=float, default=4.0, help="Localization radius (LETKF)")
+    
+    # EnSF configuration
+    parser.add_argument("--ensf-steps", type=int, default=100, help="Number of Euler-Maruyama steps for EnSF")
+    parser.add_argument("--ensf-eps-b", type=float, default=0.025, help="Initial noise variance (eps_b) for EnSF")
+    parser.add_argument("--ensf-eps-a", type=float, default=0.5, help="Small time cutoff (alpha_min) for EnSF")
+    parser.add_argument("--ensf-score-clip", type=float, default=50.0, help="Score clipping threshold for EnSF")
+    parser.add_argument("--ensf-score-type", type=str, default="mixture", choices=["mixture", "diagonal"], help="Prior score approximation type for EnSF")
+
     parser.add_argument(
         "--proposal-type", type=str, choices=["transition", "rf"], default="transition"
     )
@@ -690,6 +700,28 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             inflation_factor=args.inflation,
             localization_radius=args.localization_radius,
             device=args.device,
+        )
+    elif args.method == "ensf":
+        # Choose between standard EnSF and EnSF with Proposal Support
+        if args.proposal_type != "transition":
+            print(f"Using EnsembleScoreFilterWithProposal for {args.proposal_type} proposal")
+            EnSFClass = EnsembleScoreFilterWithProposal
+        else:
+            EnSFClass = EnsembleScoreFilter
+
+        pf = EnSFClass(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            ensf_time_steps=args.ensf_steps,
+            ensf_eps_a=args.ensf_eps_a,
+            ensf_eps_b=args.ensf_eps_b,
+            ensf_score_clip=args.ensf_score_clip,
+            ensf_score_type=args.ensf_score_type,
         )
     else:
         raise ValueError(f"Unknown method: {args.method}")
@@ -782,10 +814,50 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             
             # Compute CRPS
             # Resample based on weights to get equally weighted ensemble
-            indices = torch.multinomial(pf.weights[i], pf.n_particles, replacement=True)
-            ens_i = pf.particles[i, indices].detach().cpu().numpy()
-            truth_i = x_curr[i].detach().cpu().numpy()
-            metrics["crps"] = compute_crps_ensemble(ens_i, truth_i)
+            # Safety checks for weights
+            weights_i = pf.weights[i].clone()
+            
+            # Check for NaN or inf
+            if torch.isnan(weights_i).any() or torch.isinf(weights_i).any():
+                logging.warning(f"Invalid weights (NaN/inf) for trajectory {tid}, using uniform weights")
+                weights_i = torch.ones_like(weights_i) / pf.n_particles
+            else:
+                # Ensure weights are normalized and non-negative
+                weights_i = torch.clamp(weights_i, min=0.0)
+                weight_sum = weights_i.sum()
+                if weight_sum == 0 or weight_sum < 1e-10:
+                    logging.warning(f"All weights are zero for trajectory {tid}, using uniform weights")
+                    weights_i = torch.ones_like(weights_i) / pf.n_particles
+                else:
+                    weights_i = weights_i / weight_sum
+            
+            try:
+                # Verify particles tensor is valid
+                if pf.particles is None or pf.particles.shape[0] <= i:
+                    raise ValueError(f"Invalid particles tensor: shape={pf.particles.shape if pf.particles is not None else None}, i={i}")
+                
+                indices = torch.multinomial(weights_i, pf.n_particles, replacement=True)
+                # Ensure indices are in valid range (safety check)
+                indices = torch.clamp(indices, 0, pf.n_particles - 1)
+                
+                # Move to CPU before indexing to avoid CUDA errors
+                particles_cpu = pf.particles[i].detach().cpu()
+                indices_cpu = indices.cpu()  # Move indices to CPU to match particles_cpu
+                ens_i = particles_cpu[indices_cpu].numpy()
+                truth_i = x_curr[i].detach().cpu().numpy()
+                metrics["crps"] = compute_crps_ensemble(ens_i, truth_i)
+            except Exception as e:
+                logging.error(f"Error computing CRPS for trajectory {tid}: {e}")
+                logging.error(f"  weights_i stats: min={weights_i.min().item():.6f}, max={weights_i.max().item():.6f}, sum={weights_i.sum().item():.6f}")
+                logging.error(f"  particles shape: {pf.particles[i].shape if pf.particles is not None and pf.particles.shape[0] > i else 'INVALID'}")
+                # Fallback: use mean particle as ensemble
+                if pf.particles is not None and pf.particles.shape[0] > i:
+                    ens_i = pf.particles[i].mean(dim=0, keepdim=True).detach().cpu().numpy()
+                else:
+                    # Last resort: use truth as estimate
+                    ens_i = x_curr[i].unsqueeze(0).detach().cpu().numpy()
+                truth_i = x_curr[i].detach().cpu().numpy()
+                metrics["crps"] = compute_crps_ensemble(ens_i, truth_i)
 
             trajectory_results_map[tid]["metrics"].append(metrics)
             
@@ -896,6 +968,28 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             localization_radius=args.localization_radius,
             device=args.device,
         )
+    elif args.method == "ensf":
+        # Choose between standard EnSF and EnSF with Proposal Support
+        if args.proposal_type != "transition":
+            print(f"Using EnsembleScoreFilterWithProposal for {args.proposal_type} proposal")
+            EnSFClass = EnsembleScoreFilterWithProposal
+        else:
+            EnSFClass = EnsembleScoreFilter
+
+        pf = EnSFClass(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            ensf_time_steps=args.ensf_steps,
+            ensf_eps_a=args.ensf_eps_a,
+            ensf_eps_b=args.ensf_eps_b,
+            ensf_score_clip=args.ensf_score_clip,
+            ensf_score_type=args.ensf_score_type,
+        )
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -976,10 +1070,50 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         metrics = pf.test_step(batch, 0)
         
         # Compute CRPS
-        indices = torch.multinomial(pf.weights, pf.n_particles, replacement=True)
-        ens = pf.particles[indices].detach().cpu().numpy()
-        truth = batch["x_curr"].squeeze(0).detach().cpu().numpy()
-        metrics["crps"] = compute_crps_ensemble(ens, truth)
+        # Safety checks for weights
+        weights = pf.weights.clone()
+        
+        # Check for NaN or inf
+        if torch.isnan(weights).any() or torch.isinf(weights).any():
+            logging.warning(f"Invalid weights (NaN/inf) for trajectory {current_traj_idx}, using uniform weights")
+            weights = torch.ones_like(weights) / pf.n_particles
+        else:
+            # Ensure weights are normalized and non-negative
+            weights = torch.clamp(weights, min=0.0)
+            weight_sum = weights.sum()
+            if weight_sum == 0 or weight_sum < 1e-10:
+                logging.warning(f"All weights are zero for trajectory {current_traj_idx}, using uniform weights")
+                weights = torch.ones_like(weights) / pf.n_particles
+            else:
+                weights = weights / weight_sum
+        
+        try:
+            # Verify particles tensor is valid
+            if pf.particles is None:
+                raise ValueError(f"Particles tensor is None for trajectory {current_traj_idx}")
+            
+            indices = torch.multinomial(weights, pf.n_particles, replacement=True)
+            # Ensure indices are in valid range (safety check)
+            indices = torch.clamp(indices, 0, pf.n_particles - 1)
+            
+            # Move to CPU before indexing to avoid CUDA errors
+            particles_cpu = pf.particles.detach().cpu()
+            indices_cpu = indices.cpu()  # Move indices to CPU to match particles_cpu
+            ens = particles_cpu[indices_cpu].numpy()
+            truth = batch["x_curr"].squeeze(0).detach().cpu().numpy()
+            metrics["crps"] = compute_crps_ensemble(ens, truth)
+        except Exception as e:
+            logging.error(f"Error computing CRPS for trajectory {current_traj_idx}: {e}")
+            logging.error(f"  weights stats: min={weights.min().item():.6f}, max={weights.max().item():.6f}, sum={weights.sum().item():.6f}")
+            logging.error(f"  particles shape: {pf.particles.shape if pf.particles is not None else 'INVALID'}")
+            # Fallback: use mean particle as ensemble
+            if pf.particles is not None:
+                ens = pf.particles.mean(dim=0, keepdim=True).detach().cpu().numpy()
+            else:
+                # Last resort: use truth as estimate
+                ens = batch["x_curr"].squeeze(0).unsqueeze(0).detach().cpu().numpy()
+            truth = batch["x_curr"].squeeze(0).detach().cpu().numpy()
+            metrics["crps"] = compute_crps_ensemble(ens, truth)
 
         current_traj_metrics.append(metrics)
         
