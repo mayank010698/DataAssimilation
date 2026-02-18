@@ -349,7 +349,15 @@ def evaluate(args):
             name=run_name,
             entity=args.wandb_entity,
             dir=str(wandb_dir),
+            reinit=True,
         )
+        
+        # Define metrics to match eval.py conventions
+        wandb.define_metric("time_step")
+        wandb.define_metric("mean_rmse_over_time", step_metric="time_step")
+        wandb.define_metric("std_rmse_over_time", step_metric="time_step")
+        wandb.define_metric("mean_crps_over_time", step_metric="time_step")
+        wandb.define_metric("std_crps_over_time", step_metric="time_step")
         
     # Data structure to hold detailed results for plotting
     trajectory_results = {}
@@ -363,6 +371,12 @@ def evaluate(args):
     
     # H5 file for saving results
     save_path = results_dir / "eval_results.h5"
+    
+    # Delete existing file if it exists to avoid locking issues
+    if save_path.exists():
+        save_path.unlink()
+        logging.info(f"Removed existing file: {save_path}")
+    
     with h5py.File(save_path, 'w') as f_out:
         
         for i in tqdm(range(num_trajs), desc="Evaluating"):
@@ -499,10 +513,7 @@ def evaluate(args):
             grp.create_dataset("est", data=est_traj_phys_stack.cpu().numpy())
             grp.create_dataset("obs", data=observations.cpu().numpy())
             
-            # Log final traj RMSE
-            traj_rmse = trajectory_results[i]["rmse_sum"] / max(1, trajectory_results[i]["count"])
-            if args.use_wandb and wandb is not None:
-                wandb.log({"rmse": traj_rmse, "traj_idx": i})
+            # Log final traj RMSE (matching eval.py style - no per-trajectory logging during loop)
                 
                 # Visualizations for first few trajectories
             if i < args.n_vis_trajectories:
@@ -519,8 +530,8 @@ def evaluate(args):
 
                     if args.use_wandb and wandb is not None:
                         try:
-                            # Use path string for robustness
-                            wandb.log({f"eval/trajectory_{i}": wandb.Image(str(local_plot_path))})
+                            # Use path string for robustness - match eval.py naming
+                            wandb.log({f"visualizations/traj_{i}": wandb.Image(str(local_plot_path))})
                         except Exception as e:
                             logging.error(f"Failed to log plot to wandb: {e}")
                     
@@ -528,9 +539,10 @@ def evaluate(args):
                 else:
                     logging.warning(f"Plot generation returned None for trajectory {i}")
 
-    # Compute Global Aggregates
-    all_rmses = []
-    all_crps = []
+    # Compute Global Aggregates (matching eval.py structure)
+    all_mean_rmse = []
+    all_mean_crps = []
+    all_rmse_values = []  # All per-step RMSE values
     rmse_per_timestep = {} # Map time_idx -> list of rmses
     crps_per_timestep = {} # Map time_idx -> list of crps
     
@@ -539,8 +551,8 @@ def evaluate(args):
         traj_rmse = trajectory_results[i]["rmse_sum"] / max(1, trajectory_results[i]["count"])
         traj_crps = trajectory_results[i].get("crps_sum", 0.0) / max(1, trajectory_results[i]["count"])
         
-        all_rmses.append(traj_rmse)
-        all_crps.append(traj_crps)
+        all_mean_rmse.append(traj_rmse)
+        all_mean_crps.append(traj_crps)
         
         for d in traj_data:
             t = d["time_idx"]
@@ -549,26 +561,30 @@ def evaluate(args):
                 crps_per_timestep[t] = []
             rmse_per_timestep[t].append(d["rmse"])
             crps_per_timestep[t].append(d.get("crps", 0.0))
+            all_rmse_values.append(d["rmse"])
             
-    avg_rmse = np.mean(all_rmses)
-    avg_crps = np.mean(all_crps)
+    # Compute aggregated metrics matching eval.py
+    mean_rmse_across_trajectories = np.mean(all_mean_rmse)
+    std_rmse_across_trajectories = np.std(all_mean_rmse)
+    mean_crps_across_trajectories = np.mean(all_mean_crps)
+    std_crps_across_trajectories = np.std(all_mean_crps)
+    overall_mean_rmse = np.mean(all_rmse_values) if all_rmse_values else 0.0
+    overall_std_rmse = np.std(all_rmse_values) if all_rmse_values else 0.0
     
-    std_rmse = np.std(all_rmses)
-    std_crps = np.std(all_crps)
-    
-    logging.info(f"Global Average RMSE: {avg_rmse:.4f}")
-    logging.info(f"Global Average CRPS: {avg_crps:.4f}")
+    logging.info(f"Mean RMSE across trajectories: {mean_rmse_across_trajectories:.4f} ± {std_rmse_across_trajectories:.4f}")
+    logging.info(f"Mean CRPS across trajectories: {mean_crps_across_trajectories:.4f} ± {std_crps_across_trajectories:.4f}")
+    logging.info(f"Overall mean RMSE: {overall_mean_rmse:.4f} ± {overall_std_rmse:.4f}")
     
     if args.use_wandb and wandb is not None:
+        # Log aggregated scalars (matching eval.py naming)
         wandb.log({
-            "eval/global_mean_rmse": avg_rmse,
-            "eval/global_mean_crps": avg_crps,
-            "eval/global_std_rmse": std_rmse,
-            "eval/global_std_crps": std_crps
+            "mean_rmse": mean_rmse_across_trajectories,
+            "std_rmse": std_rmse_across_trajectories,
+            "mean_crps": mean_crps_across_trajectories,
+            "std_crps": std_crps_across_trajectories,
         })
         
-        # Log RMSE/CRPS over time
-        # Sort timesteps
+        # Log RMSE/CRPS over time (matching eval.py naming - no eval/ prefix)
         sorted_times = sorted(rmse_per_timestep.keys())
         for t in sorted_times:
             mean_rmse_t = np.mean(rmse_per_timestep[t])
@@ -576,12 +592,14 @@ def evaluate(args):
             std_rmse_t = np.std(rmse_per_timestep[t])
             std_crps_t = np.std(crps_per_timestep[t])
             wandb.log({
-                "eval/mean_rmse_over_time": mean_rmse_t,
-                "eval/std_rmse_over_time": std_rmse_t,
-                "eval/mean_crps_over_time": mean_crps_t,
-                "eval/std_crps_over_time": std_crps_t,
+                "mean_rmse_over_time": mean_rmse_t,
+                "std_rmse_over_time": std_rmse_t,
+                "mean_crps_over_time": mean_crps_t,
+                "std_crps_over_time": std_crps_t,
                 "time_step": t
             })
+        
+        wandb.finish()
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate FlowDAS Model")

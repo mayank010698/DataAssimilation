@@ -12,7 +12,7 @@ from datetime import datetime
 # =============================================================================
 
 # GPUs to use (excluding 0 and 1 as they might be reserved or busy, using 2-7)
-AVAILABLE_GPUS = [1, 2, 3, 4, 5, 6, 7]
+AVAILABLE_GPUS = [1, 2, 3, 4]
 
 # Memory buffer (MiB)
 MEMORY_BUFFER = 2000 

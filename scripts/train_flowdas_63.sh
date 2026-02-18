@@ -11,121 +11,94 @@ export PYTHONPATH=$(pwd)
 # Create logs directory if it doesn't exist
 mkdir -p logs
 
+# ============================================================================
+# Configuration: Available GPUs
+# ============================================================================
+# List of available GPU IDs to use for training
+# The script will rotate through these GPUs for each experiment
+AVAILABLE_GPUS=(0 1 2 3)
+
+# ============================================================================
+# Common parameters
+# ============================================================================
+BATCH_SIZE=64
+LR=1e-3
+EPOCHS=500
+WIDTH=128  # Embedding/Hidden dimension (equivalent to RF's hidden_dim)
+DEPTH=4   # Network depth (matching RF's depth)
+
+# ============================================================================
+# Data directories
+# ============================================================================
+DATA_DIR_NOISE="/data/da_outputs/datasets/lorenz63_n1024_len1000_dt0p0100_obs0p250_freq1_comp0,1,2_arctan_pnoise0p250"
+DATA_DIR_NO_NOISE="/data/da_outputs/datasets/lorenz63_n1024_len1000_dt0p0100_obs0p250_freq1_comp0,1,2_arctan"
+
+# ============================================================================
+# Experiment configurations
+# ============================================================================
+# Define experiments as: "exp_name:data_dir:run_dir:obs_components:log_file"
+declare -a EXPERIMENTS=(
+    "L63, 0 noise, all 3 dims obs:$DATA_DIR_NO_NOISE:/data/da_outputs/runs_flowdas/l63_nonoise_all3:0,1,2:flowdas_l63_nonoise_all3.log"
+    "L63, 0 noise, only 1st dim obs:$DATA_DIR_NO_NOISE:/data/da_outputs/runs_flowdas/l63_nonoise_dim0:0:flowdas_l63_nonoise_dim0.log"
+    "L63, 0.25 pnoise, all 3 dims obs:$DATA_DIR_NOISE:/data/da_outputs/runs_flowdas/l63_pnoise0p250_all3:0,1,2:flowdas_l63_pnoise0p250_all3.log"
+    "L63, 0.25 pnoise, only 1st dim obs:$DATA_DIR_NOISE:/data/da_outputs/runs_flowdas/l63_pnoise0p250_dim0:0:flowdas_l63_pnoise0p250_dim0.log"
+)
+
 echo "=========================================="
-echo "Starting Parallel Training for FlowDAS (Lorenz 63)"
+echo "Lorenz 63 FlowDAS Training Experiments"
+echo "=========================================="
+echo "Configuration:"
+echo "- 4 Experiments total (2 No Noise, 2 With Noise)"
+echo "- Training: NO observations (unconditional)"
+echo "- Inference: Will use guidance with observations (all 3 dims or 1st dim)"
+echo "- Architecture: MLP (matching RF training)"
+echo "Available GPUs: ${AVAILABLE_GPUS[*]}"
+echo "Number of experiments: ${#EXPERIMENTS[@]}"
 echo "=========================================="
 
-# 1. Lorenz 63, 0 noise, 1 dim observed (GPU 0)
-echo "Starting Exp 1: L63, 0 noise, 1 dim obs on GPU 0..."
-CUDA_VISIBLE_DEVICES=0 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0_arctan/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0_arctan" \
-    --run_dir "runs_flowdas/lorenz63_comp0_arctan" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp0.log 2>&1 &
-PID1=$!
-echo "Started PID $PID1"
+# Array to store PIDs
+declare -a PIDS=()
 
-# 2. Lorenz 63, 0 noise, 2 dim observed (GPU 1)
-echo "Starting Exp 2: L63, 0 noise, 2 dim obs on GPU 1..."
-CUDA_VISIBLE_DEVICES=1 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1_arctan/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1_arctan" \
-    --run_dir "runs_flowdas/lorenz63_comp01_arctan" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp01.log 2>&1 &
-PID2=$!
-echo "Started PID $PID2"
-
-# 3. Lorenz 63, 0 noise, 3 dim observed (GPU 2)
-echo "Starting Exp 3: L63, 0 noise, 3 dim obs on GPU 2..."
-CUDA_VISIBLE_DEVICES=2 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1,2_arctan/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1,2_arctan" \
-    --run_dir "runs_flowdas/lorenz63_comp012_arctan" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp012.log 2>&1 &
-PID3=$!
-echo "Started PID $PID3"
-
-# 4. Lorenz 63, 0.25 pnoise, 1 dim observed (GPU 3)
-echo "Starting Exp 4: L63, 0.25 pnoise, 1 dim obs on GPU 3..."
-CUDA_VISIBLE_DEVICES=3 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0_arctan_pnoise0p250/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0_arctan_pnoise0p250" \
-    --run_dir "runs_flowdas/lorenz63_comp0_arctan_pnoise0p250" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp0_pnoise.log 2>&1 &
-PID4=$!
-echo "Started PID $PID4"
-
-# 5. Lorenz 63, 0.25 pnoise, 2 dim observed (GPU 4)
-echo "Starting Exp 5: L63, 0.25 pnoise, 2 dim obs on GPU 4..."
-CUDA_VISIBLE_DEVICES=4 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1_arctan_pnoise0p250/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1_arctan_pnoise0p250" \
-    --run_dir "runs_flowdas/lorenz63_comp01_arctan_pnoise0p250" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp01_pnoise.log 2>&1 &
-PID5=$!
-echo "Started PID $PID5"
-
-# 6. Lorenz 63, 0.25 pnoise, 3 dim observed (GPU 5)
-echo "Starting Exp 6: L63, 0.25 pnoise, 3 dim obs on GPU 5..."
-CUDA_VISIBLE_DEVICES=5 nohup python scripts/train_flowdas.py \
-    --config "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1,2_arctan_pnoise0p250/config.yaml" \
-    --data_dir "datasets/lorenz63_n1024_len100_dt0p0100_obs0p250_freq1_comp0,1,2_arctan_pnoise0p250" \
-    --run_dir "runs_flowdas/lorenz63_comp012_arctan_pnoise0p250" \
-    --architecture mlp \
-    --width 128 \
-    --depth 2 \
-    --batch_size 64 \
-    --epochs 500 \
-    --lr 1e-3 \
-    --device cuda \
-    --use_wandb \
-    > logs/train_flowdas_l63_comp012_pnoise.log 2>&1 &
-PID6=$!
-echo "Started PID $PID6"
+# Launch each experiment
+for i in "${!EXPERIMENTS[@]}"; do
+    IFS=':' read -r exp_name data_dir run_dir obs_components log_file <<< "${EXPERIMENTS[$i]}"
+    
+    # Get GPU for this experiment (rotate through available GPUs)
+    gpu_idx=$((i % ${#AVAILABLE_GPUS[@]}))
+    gpu_id=${AVAILABLE_GPUS[$gpu_idx]}
+    
+    exp_num=$((i + 1))
+    echo "Starting Exp $exp_num: $exp_name on GPU $gpu_id..."
+    
+    # Build command arguments
+    # NOTE: We do NOT use --use_observations during training
+    # Observations will be used only at inference time via guidance
+    cmd_args=(
+        --config "$data_dir/config.yaml"
+        --data_dir "$data_dir"
+        --run_dir "$run_dir"
+        --architecture mlp
+        --width $WIDTH
+        --depth $DEPTH
+        --batch_size $BATCH_SIZE
+        --lr $LR
+        --epochs $EPOCHS
+        --use_wandb
+        --wandb_project "flowdas-train-63"
+        --evaluate
+    )
+    
+    CUDA_VISIBLE_DEVICES=$gpu_id nohup python scripts/train_flowdas.py "${cmd_args[@]}" \
+        > logs/"$log_file" 2>&1 &
+    
+    pid=$!
+    PIDS+=($pid)
+    echo "Started PID $pid"
+done
 
 echo "=========================================="
 echo "All FlowDAS training experiments started in background."
+echo "Started PIDs: ${PIDS[*]}"
 echo "Logs are being written to logs/"
-echo "You can monitor them with: tail -f logs/train_flowdas_*.log"
+echo "You can monitor them with: tail -f logs/flowdas_l63_*.log"
 echo "=========================================="
-

@@ -13,34 +13,17 @@ cd "$SCRIPT_DIR/.." || exit
 export PYTHONPATH=$(pwd)
 
 echo "=========================================="
-echo "Generating 6 Lorenz 63 Datasets"
+echo "Generating Lorenz 63 Datasets"
 echo "=========================================="
 
-# 1. Lorenz 63, no process noise
-echo ""
-echo "Dataset 1: Lorenz 63, no process noise"
-echo "----------------------------------------"
+# Generate multiple variations with shared initial states
+# This will save to /data/da_outputs/datasets/ by default
 python generate.py \
     --system lorenz63 \
     --num-trajectories 1024 \
-    --len-trajectory 100 \
+    --len-trajectory 1000 \
     --obs-frequency 1 \
     --observation-operator arctan \
-    --process-noise-std 0.0 \
+    --process-noise-variations "0.0,0.25" \
     --seed 42 \
     --force
-
-# 2. Lorenz 63, process noise 0.25
-echo ""
-echo "Dataset 2: Lorenz 63, process noise 0.25"
-echo "----------------------------------------"
-python generate.py \
-    --system lorenz63 \
-    --num-trajectories 1024 \
-    --len-trajectory 100 \
-    --obs-frequency 1 \
-    --observation-operator arctan \
-    --process-noise-std 0.25 \
-    --seed 42 \
-    --force
-
