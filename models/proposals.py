@@ -15,9 +15,13 @@ class ProposalDistribution(ABC):
 
     @abstractmethod
     def sample(
-        self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Sample x_t ~ q(x_t | x_{t-1}, y_t)"""
+        """Sample x_t ~ q(x_t | x_{t-1}, y_t). t is optional time step (e.g. for time-conditioned RF)."""
         pass
 
     @abstractmethod
@@ -27,8 +31,9 @@ class ProposalDistribution(ABC):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor],
         dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute log q(x_t | x_{t-1}, y_t)"""
+        """Compute log q(x_t | x_{t-1}, y_t). t is optional time step (e.g. for time-conditioned RF)."""
         pass
 
 
@@ -48,9 +53,13 @@ class TransitionProposal(ProposalDistribution):
         # TransitionProposal ALWAYS operates in physical space
 
     def sample(
-        self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Sample from transition dynamics with process noise"""
+        """Sample from transition dynamics with process noise. t ignored."""
         # Supports both single particle (D,) and batch (N, D)
         is_batch = x_prev.ndim > 1
         
@@ -77,8 +86,9 @@ class TransitionProposal(ProposalDistribution):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor],
         dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Compute log probability under transition dynamics"""
+        """Compute log probability under transition dynamics. t ignored."""
         # For bootstrap proposal, this is the process noise likelihood
         # Supports batch (N, D)
         is_batch = x_prev.ndim > 1
@@ -163,7 +173,11 @@ class LearnedNeuralProposal(ProposalDistribution, nn.Module):
         )
 
     def sample(
-        self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Neural network proposal sampling - IMPROVED stub"""
         # TODO: Implement learned proposal
@@ -186,6 +200,7 @@ class LearnedNeuralProposal(ProposalDistribution, nn.Module):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor],
         dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Neural network proposal log probability - IMPROVED stub"""
         # TODO: Implement learned proposal log probability
@@ -215,7 +230,11 @@ class GaussianMixtureProposal(ProposalDistribution):
         # These could be learned from data or adapted online
 
     def sample(
-        self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """GMM proposal sampling - IMPROVED stub"""
         # TODO: Implement GMM proposal
@@ -236,6 +255,7 @@ class GaussianMixtureProposal(ProposalDistribution):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor],
         dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """GMM proposal log probability - IMPROVED stub"""
         # TODO: Implement GMM proposal log probability
@@ -371,28 +391,33 @@ class RectifiedFlowProposal(ProposalDistribution):
         self.state_dim = self.rf_model.state_dim
         
     def sample(
-        self, x_prev: torch.Tensor, y_curr: Optional[torch.Tensor], dt: float
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample from RF proposal q(x_t | x_{t-1})
-        
+
         Args:
-            x_prev: Previous state, shape (state_dim,)
+            x_prev: Previous state, shape (state_dim,) or (batch, state_dim)
             y_curr: Observation
             dt: Time step (unused by RF, kept for interface compatibility)
-            
+            t: Optional time step index; required when RF was trained with use_time_step=True.
+
         Returns:
-            Sampled next state, shape (state_dim,)
+            Sampled next state, shape (state_dim,) or (batch, state_dim)
         """
         # Ensure x_prev is on correct device
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
-            
+
         # Handle observation
         if y_curr is not None:
             if y_curr.device != self.device:
                 y_curr = y_curr.to(self.device)
-            
+
             # Preprocess observation if needed
             if self.obs_mean is not None and self.obs_std is not None:
                 y_curr = (y_curr - self.obs_mean) / self.obs_std
@@ -401,13 +426,20 @@ class RectifiedFlowProposal(ProposalDistribution):
         if self.system is not None:
             x_prev = self.system.preprocess(x_prev)
 
+        # When RF is time-conditioned, t must be provided by the caller (e.g. BPF passes time_idx).
+        if getattr(self.rf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "RF model has use_time_step=True but t was not provided to sample(). "
+                "Callers must pass the trajectory time step (e.g. from the filter step)."
+            )
+
         # RF model's sample method already handles the interface
-        # RF expects and produces scaled data
-        # Pass observation_fn if needed for guidance
         if self.rf_model.mc_guidance and self.observation_fn is not None:
-            x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt, observation_fn=self.observation_fn)
+            x_curr_scaled = self.rf_model.sample(
+                x_prev, y_curr, dt, observation_fn=self.observation_fn, t=t
+            )
         else:
-            x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt)
+            x_curr_scaled = self.rf_model.sample(x_prev, y_curr, dt, t=t)
         
         # Postprocess output (scaled -> unscaled)
         if self.system is not None:
@@ -421,53 +453,45 @@ class RectifiedFlowProposal(ProposalDistribution):
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor],
         dt: float,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute log probability log q(x_curr | x_prev)
-        
-        Args:
-            x_curr: Current state, shape (state_dim,)
-            x_prev: Previous state, shape (state_dim,)
-            y_curr: Observation
-            dt: Time step (unused by RF, kept for interface compatibility)
-            
-        Returns:
-            Log probability, scalar tensor
+
+        t: Optional time step index; required when RF was trained with use_time_step=True.
         """
         # Ensure tensors are on correct device
         if x_curr.device != self.device:
             x_curr = x_curr.to(self.device)
         if x_prev.device != self.device:
             x_prev = x_prev.to(self.device)
-            
+
         # Handle observation
         if y_curr is not None:
             if y_curr.device != self.device:
                 y_curr = y_curr.to(self.device)
-            
-            # Preprocess observation if needed
             if self.obs_mean is not None and self.obs_std is not None:
                 y_curr = (y_curr - self.obs_mean) / self.obs_std
-        
+
         # Preprocess inputs (unscaled -> scaled)
         if self.system is not None:
             x_prev = self.system.preprocess(x_prev)
             x_curr = self.system.preprocess(x_curr)
-            
-        # RF model's log_prob method already handles the interface
-        # We compute log probability in scaled space.
-        
-        # Pass configured trace estimator settings
-        # Note: use_exact_trace=False is implicit if we are using stochastic estimators
-        # But if we want exact trace, we should have a way to configure it.
-        # For now, we assume if we are calling this, we might want the stochastic one unless specified otherwise?
-        # We implicitly assume use_exact_trace=False because exact trace is O(D^2) and we are providing estimator settings.
-        # If someone wants exact trace, they currently can't get it through this wrapper unless we modify it further.
-        # Given the task is to reduce variance of the stochastic estimator, forcing stochastic with improvements is fine.
-        
+
+        # When RF is time-conditioned, t must be provided by the caller.
+        if getattr(self.rf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "RF model has use_time_step=True but t was not provided to log_prob(). "
+                "Callers must pass the trajectory time step (e.g. from the filter step)."
+            )
+
         return self.rf_model.log_prob(
-            x_curr, x_prev, y_curr, dt, 
-            use_exact_trace=self.use_exact_trace, 
+            x_curr,
+            x_prev,
+            y_curr,
+            dt,
+            use_exact_trace=self.use_exact_trace,
             trace_estimator=self.trace_estimator,
-            num_trace_probes=self.num_trace_probes
+            num_trace_probes=self.num_trace_probes,
+            t=t,
         )
