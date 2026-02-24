@@ -92,15 +92,21 @@ def test_rf_log_probs(rf_proposal, system):
         y_curr = torch.randn(1, obs_dim, device=rf_proposal.device)
         print(f"Generated dummy observation (dim={obs_dim}) for testing.")
     
+    # Time step: required when RF was trained with use_time_step=True (e.g. len80 debug)
+    use_time_step = getattr(rf_proposal.rf_model, "use_time_step", False)
+    t_sample = torch.tensor(0.0, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
+    t_log_prob_100 = torch.zeros(100, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
+    t_log_prob_20 = torch.zeros(20, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
+
     # Sample multiple times
-    samples = [rf_proposal.sample(x_prev, y_curr, 0.01) for _ in range(100)]
+    samples = [rf_proposal.sample(x_prev, y_curr, 0.01, t=t_sample) for _ in range(100)]
     samples_tensor = torch.stack(samples).squeeze(1) # (100, D)
     
     # Compute log probs
     x_prev_expanded = x_prev.repeat(100, 1)
     y_curr_expanded = y_curr.repeat(100, 1) if y_curr is not None else None
     
-    log_probs = rf_proposal.log_prob(samples_tensor, x_prev_expanded, y_curr_expanded, 0.01)
+    log_probs = rf_proposal.log_prob(samples_tensor, x_prev_expanded, y_curr_expanded, 0.01, t=t_log_prob_100)
     
     print(f"Log prob stats (across DIFFERENT samples):")
     print(f"  Mean: {log_probs.mean():.4f}")
@@ -117,7 +123,7 @@ def test_rf_log_probs(rf_proposal, system):
     
     # Compute log prob multiple times for the SAME input
     # Since Hutchinson trace estimator is stochastic, these might differ
-    log_probs_same = rf_proposal.log_prob(single_sample, single_prev, single_obs, 0.01)
+    log_probs_same = rf_proposal.log_prob(single_sample, single_prev, single_obs, 0.01, t=t_log_prob_20)
     
     print(f"Log prob stats (across SAME sample):")
     print(f"  Mean: {log_probs_same.mean():.4f}")
