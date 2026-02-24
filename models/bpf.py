@@ -130,9 +130,16 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
         if y_curr is None:
             proposal = self.transition_prior
 
+        # Time step for time-conditioned proposals (e.g. RF use_time_step)
+        t = None
+        if getattr(self, "current_time_idx", None) is not None:
+            t = torch.tensor(
+                float(self.current_time_idx), device=self.device, dtype=torch.float32
+            )
+
         for i in range(self.n_particles):
             # Use the proposal distribution to sample new particles
-            x_new = proposal.sample(self.particles[i], y_curr, dt)
+            x_new = proposal.sample(self.particles[i], y_curr, dt, t=t)
             new_particles.append(x_new)
 
         self.particles = torch.stack(new_particles)
@@ -283,7 +290,11 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
                 self.particles, self.particles_prev, self.system.config.dt
             )
             # Compute proposal log-probabilities: log q(x_t^(i) | x_{t-1}^(i), y_t)
-            # (Can be expensive, so maybe skip if performance is critical, but good for now)
+            t = None
+            if getattr(self, "current_time_idx", None) is not None:
+                t = torch.tensor(
+                    float(self.current_time_idx), device=self.device, dtype=torch.float32
+                )
             proposal_log_probs = torch.zeros(self.n_particles, device=self.device)
             for i in range(self.n_particles):
                 prop_log_prob = self.proposal.log_prob(
@@ -291,21 +302,27 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
                     self.particles_prev[i],
                     observation,
                     self.system.config.dt,
+                    t=t,
                 )
                 proposal_log_probs[i] = prop_log_prob
-            
+
             self.last_proposal_log_probs = proposal_log_probs
-            
+
         else:
             # STANDARD WEIGHT UPDATE BRANCH
             # log w_t^(i) = log w_{t-1}^(i) + log p(y_t | x_t^(i)) + log p(x_t^(i) | x_{t-1}^(i)) - log q(x_t^(i) | x_{t-1}^(i), y_t)
-            
+
             # Compute transition log-probabilities: log p(x_t^(i) | x_{t-1}^(i))
             transition_log_probs = self.compute_transition_log_prob(
                 self.particles, self.particles_prev, self.system.config.dt
             )
 
             # Compute proposal log-probabilities: log q(x_t^(i) | x_{t-1}^(i), y_t)
+            t = None
+            if getattr(self, "current_time_idx", None) is not None:
+                t = torch.tensor(
+                    float(self.current_time_idx), device=self.device, dtype=torch.float32
+                )
             proposal_log_probs = torch.zeros(self.n_particles, device=self.device)
             for i in range(self.n_particles):
                 prop_log_prob = self.proposal.log_prob(
@@ -313,6 +330,7 @@ class BootstrapParticleFilterUnbatched(FilteringMethod):
                     self.particles_prev[i],
                     observation,
                     self.system.config.dt,
+                    t=t,
                 )
                 proposal_log_probs[i] = prop_log_prob
 
@@ -670,10 +688,17 @@ class BootstrapParticleFilter(FilteringMethod):
         proposal = self.proposal
         if y_curr is None:
             proposal = self.transition_prior
-            
-        # proposal.sample should handle the flat batch of particles
-        x_new_flat = proposal.sample(particles_flat, y_curr_flat, dt)
-        
+
+        # Time step index for time-conditioned proposals (e.g. RF use_time_step)
+        time_flat = None
+        if getattr(self, "_current_time_idxs", None) is not None:
+            # (Batch,) -> (Batch, N) -> (Batch*N,); each trajectory's time_idx repeated per particle
+            time_flat = self._current_time_idxs.unsqueeze(1).expand(
+                batch_size, self.n_particles
+            ).reshape(-1).float().to(particles_flat.device)
+
+        x_new_flat = proposal.sample(particles_flat, y_curr_flat, dt, t=time_flat)
+
         # Reshape back to (Batch, N, D)
         self.particles = x_new_flat.reshape(batch_size, self.n_particles, self.state_dim)
 
@@ -794,23 +819,29 @@ class BootstrapParticleFilter(FilteringMethod):
                 self.particles, self.particles_prev, self.system.config.dt
             )
             
-            # Proposal log probs
+            # Proposal log probs (with time index for time-conditioned proposals)
             particles_flat = self.particles.reshape(-1, self.state_dim)
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
             obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
-            
+            time_flat = None
+            if getattr(self, "_current_time_idxs", None) is not None:
+                time_flat = self._current_time_idxs.unsqueeze(1).expand(
+                    batch_size, self.n_particles
+                ).reshape(-1).float().to(particles_flat.device)
+
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
                 particles_prev_flat,
                 obs_flat,
                 self.system.config.dt,
+                t=time_flat,
             )
             proposal_log_probs = proposal_log_probs_flat.reshape(batch_size, self.n_particles)
             self.last_proposal_log_probs = proposal_log_probs
-            
+
         else:
             # STANDARD WEIGHT UPDATE BRANCH
-            
+
             # Compute transition log-probabilities: log p(x_t | x_{t-1})
             transition_log_probs = self.compute_transition_log_prob(
                 self.particles, self.particles_prev, self.system.config.dt
@@ -819,15 +850,21 @@ class BootstrapParticleFilter(FilteringMethod):
             # Compute proposal log-probabilities: log q(x_t | x_{t-1}, y_t)
             particles_flat = self.particles.reshape(-1, self.state_dim)
             particles_prev_flat = self.particles_prev.reshape(-1, self.state_dim)
-            
+
             # Expand observation for proposal: (Batch, Obs_dim) -> (Batch, N, Obs_dim) -> (Batch*N, Obs_dim)
             obs_flat = observation.unsqueeze(1).expand(batch_size, self.n_particles, -1).reshape(batch_size * self.n_particles, self.obs_dim)
-            
+            time_flat = None
+            if getattr(self, "_current_time_idxs", None) is not None:
+                time_flat = self._current_time_idxs.unsqueeze(1).expand(
+                    batch_size, self.n_particles
+                ).reshape(-1).float().to(particles_flat.device)
+
             proposal_log_probs_flat = self.proposal.log_prob(
                 particles_flat,
                 particles_prev_flat,
                 obs_flat,
                 self.system.config.dt,
+                t=time_flat,
             )
             proposal_log_probs = proposal_log_probs_flat.reshape(batch_size, self.n_particles)
 
@@ -988,7 +1025,8 @@ class BootstrapParticleFilter(FilteringMethod):
         """
         start_time = time.perf_counter()
         self.step_count += 1
-        
+        self._current_time_idxs = time_idxs  # for time-conditioned proposals (e.g. RF use_time_step)
+
         # Check for re-initialization (if new trajectories started)
         # Assumes if one changes, all change (based on Sampler logic)
         # Or we rely on external caller to call initialize_filter
