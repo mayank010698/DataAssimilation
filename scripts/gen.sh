@@ -20,8 +20,8 @@ echo "=========================================="
 # This will save to /data/da_outputs/datasets/ by default
 python generate.py \
     --system lorenz63 \
-    --num-trajectories 1024 \
-    --len-trajectory 1000 \
+    --num-trajectories 512 \
+    --len-trajectory 500 \
     --obs-frequency 1 \
     --observation-operator arctan \
     --process-noise-variations "0.0,0.25" \
