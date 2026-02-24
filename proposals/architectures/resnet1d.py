@@ -142,6 +142,7 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         kernel_size: int = 5,
         time_embed_dim: int = 64,
         dropout: float = 0.0,
+        use_time_step: bool = False,
     ):
         # We don't use the base class conditioning_method argument since this architecture is fixed
         super().__init__(state_dim, obs_dim, conditioning_method='adaln')
@@ -150,6 +151,7 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         self.obs_dim = obs_dim
         self.channels = channels
         self.time_embed_dim = time_embed_dim
+        self.use_time_step = use_time_step
         
         # Handle Observation Indices
         if obs_indices is not None:
@@ -165,6 +167,14 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
             nn.SiLU(),
             nn.Linear(time_embed_dim, time_embed_dim),
         )
+        
+        # Trajectory Time Step Embedding
+        if self.use_time_step:
+            self.traj_time_embed = nn.Sequential(
+                nn.Linear(1, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
         
         # Input Projection
         # Channels: 
@@ -206,15 +216,17 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         s: torch.Tensor, 
         x_prev: torch.Tensor,
         y: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute velocity v(x, s | x_prev, y).
+        Compute velocity v(x, s | x_prev, y, t).
         
         Args:
             x: Current state (batch, state_dim)
             s: Time (batch, 1) or (batch,)
             x_prev: Previous state (batch, state_dim)
             y: Observations (batch, obs_dim) or None
+            t: Trajectory time step (normalized), shape (batch, 1) or (batch,) or None
             
         Returns:
             Velocity (batch, state_dim)
@@ -226,7 +238,18 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
             s = s.unsqueeze(1)
         t_embed = self.time_embed(s)  # (B, time_embed_dim)
         
-        # 2. Prepare Observation Channels
+        # 2. Trajectory Time Embedding
+        if self.use_time_step:
+            if t is None:
+                raise ValueError("Model configured with use_time_step=True but t was not provided.")
+            if t.dim() == 1:
+                t = t.unsqueeze(1)
+            traj_t_embed = self.traj_time_embed(t) # (B, time_embed_dim)
+            
+            # Combine embeddings (add)
+            t_embed = t_embed + traj_t_embed
+        
+        # 3. Prepare Observation Channels
         # We need to construct y_full and mask
         
         # Initialize containers

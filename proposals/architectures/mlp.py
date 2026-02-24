@@ -39,6 +39,7 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
         depth: int = 4,
         time_embed_dim: int = 64,
         dropout: float = 0.0,
+        use_time_step: bool = False,
     ):
         # We don't use the generic conditioning_method here
         super().__init__(state_dim, obs_dim, conditioning_method='concat')
@@ -46,6 +47,7 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
         self.state_dim = state_dim
         self.obs_dim = obs_dim
         self.time_embed_dim = time_embed_dim
+        self.use_time_step = use_time_step
         
         # Handle Observation Indices
         if obs_indices is not None:
@@ -60,13 +62,26 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
             nn.Linear(time_embed_dim, time_embed_dim),
         )
         
+        # Trajectory Time Step Embedding
+        if self.use_time_step:
+            self.traj_time_embed = nn.Sequential(
+                nn.Linear(1, time_embed_dim),
+                nn.SiLU(),
+                nn.Linear(time_embed_dim, time_embed_dim),
+            )
+        
         # Input Dimension Calculation
         # If obs_dim > 0: x (state_dim) + x_prev (state_dim) + y_full (state_dim) + mask (state_dim) + time (time_embed_dim)
         # If obs_dim == 0: x (state_dim) + x_prev (state_dim) + time (time_embed_dim)
+        # If use_time_step: + time_embed_dim
+        
         if obs_dim > 0:
             input_dim = 4 * state_dim + time_embed_dim
         else:
             input_dim = 2 * state_dim + time_embed_dim
+            
+        if self.use_time_step:
+            input_dim += time_embed_dim
         
         # Build MLP
         layers = []
@@ -95,15 +110,17 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
         s: torch.Tensor, 
         x_prev: torch.Tensor,
         y: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute velocity v(x, s | x_prev, y).
+        Compute velocity v(x, s | x_prev, y, t).
         
         Args:
             x: Current state (batch, state_dim)
             s: Time (batch, 1) or (batch,)
             x_prev: Previous state (batch, state_dim)
             y: Observations (batch, obs_dim) or None
+            t: Trajectory time step (normalized), shape (batch, 1) or (batch,) or None
             
         Returns:
             Velocity (batch, state_dim)
@@ -115,7 +132,16 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
             s = s.unsqueeze(1)
         t_embed = self.time_embed(s)  # (B, time_embed_dim)
         
-        # 2. Prepare Input based on Observations
+        # 2. Trajectory Time Embedding
+        traj_t_embed = None
+        if self.use_time_step:
+            if t is None:
+                raise ValueError("Model configured with use_time_step=True but t was not provided.")
+            if t.dim() == 1:
+                t = t.unsqueeze(1)
+            traj_t_embed = self.traj_time_embed(t) # (B, time_embed_dim)
+        
+        # 3. Prepare Input based on Observations
         if self.obs_dim > 0:
             y_full = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
             mask = torch.zeros(B, self.state_dim, device=x.device, dtype=x.dtype)
@@ -135,10 +161,15 @@ class MLPVelocityNetwork(BaseVelocityNetwork):
                     mask[:, :y.shape[1]] = 1.0
             
             # [x, x_prev, y_full, mask, t_embed]
-            net_input = torch.cat([x, x_prev, y_full, mask, t_embed], dim=-1)
+            input_list = [x, x_prev, y_full, mask, t_embed]
         else:
             # [x, x_prev, t_embed]
-            net_input = torch.cat([x, x_prev, t_embed], dim=-1)
+            input_list = [x, x_prev, t_embed]
+            
+        if self.use_time_step and traj_t_embed is not None:
+            input_list.append(traj_t_embed)
+            
+        net_input = torch.cat(input_list, dim=-1)
         
         # 4. Forward Pass
         out = self.net(net_input)

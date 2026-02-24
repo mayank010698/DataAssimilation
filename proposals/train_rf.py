@@ -71,6 +71,10 @@ def train_rectified_flow(
     cond_dropout: float = 0.0,
     wandb_project: str = "rf-train-96",
     save_every_n_epochs: int = None,
+    debug_random_obs: bool = False,
+    debug_random_prev_state: bool = False,
+    use_time_step: bool = False,
+    trajectory_length: int = 1000,
 ):
     """
     Train a rectified flow proposal distribution
@@ -103,6 +107,10 @@ def train_rectified_flow(
         cond_dropout: Probability of dropping conditioning during training
         wandb_project: WandB project name
         save_every_n_epochs: Save a checkpoint every N epochs
+        debug_random_obs: If True, replace observations with random vectors (for debugging)
+        debug_random_prev_state: If True, replace previous state with random vectors (for debugging)
+        use_time_step: Whether to condition on trajectory time step
+        trajectory_length: Length of trajectory for time step normalization
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -144,6 +152,11 @@ def train_rectified_flow(
     logger_obj.info(f"Predict delta (residual mode): {predict_delta}")
     logger_obj.info(f"MC Guidance (Inference default): {mc_guidance}")
     logger_obj.info(f"Guidance Scale (Inference default): {guidance_scale}")
+    logger_obj.info(f"Debug: Random observations: {debug_random_obs}")
+    logger_obj.info(f"Debug: Random previous state: {debug_random_prev_state}")
+    logger_obj.info(f"Use time step conditioning: {use_time_step}")
+    if use_time_step:
+        logger_obj.info(f"Trajectory length (for normalization): {trajectory_length}")
     
     # Create data module
     data_module = RFDataModule(
@@ -181,6 +194,10 @@ def train_rectified_flow(
         guidance_scale=guidance_scale,
         obs_indices=obs_indices,
         cond_dropout=cond_dropout,
+        debug_random_obs=debug_random_obs,
+        debug_random_prev_state=debug_random_prev_state,
+        use_time_step=use_time_step,
+        trajectory_length=trajectory_length,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -253,6 +270,10 @@ def train_rectified_flow(
         "guidance_scale": guidance_scale,
         "obs_indices": obs_indices,
         "cond_dropout": cond_dropout,
+        "debug_random_obs": debug_random_obs,
+        "debug_random_prev_state": debug_random_prev_state,
+        "use_time_step": use_time_step,
+        "trajectory_length": trajectory_length,
     })
     
     # Setup trainer
@@ -325,6 +346,10 @@ def main():
                         help='Dimension of time embedding (default: 64 for MLP, typically 32 for ResNet1D)')
     parser.add_argument('--predict_delta', action='store_true',
                         help='Learn increment (x_curr - x_prev) instead of absolute target (residual mode)')
+    parser.add_argument('--use_time_step', action='store_true',
+                        help='Condition on trajectory time step')
+    parser.add_argument('--trajectory_length', type=int, default=None,
+                        help='Length of trajectory (for time step normalization). Defaults to config.yaml value.')
     
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=64,
@@ -365,6 +390,12 @@ def main():
 
     parser.add_argument('--seed', type=int, default=None,
                         help='Random seed for reproducibility')
+    
+    # Debug arguments
+    parser.add_argument('--debug_random_obs', action='store_true',
+                        help='Replace observations with random vectors (for debugging)')
+    parser.add_argument('--debug_random_prev_state', action='store_true',
+                        help='Replace previous state with random vectors (for debugging)')
 
     args = parser.parse_args()
     
@@ -395,6 +426,24 @@ def main():
     # Infer obs_dim from obs_components if provided
     if obs_components is not None:
         args.obs_dim = len(obs_components)
+        
+    # Infer trajectory_length from config if not provided
+    trajectory_length = args.trajectory_length
+    if trajectory_length is None:
+        # Try to load from config.yaml
+        config_path = Path(args.data_dir) / "config.yaml"
+        if config_path.exists():
+             try:
+                 from data import load_config_yaml
+                 config = load_config_yaml(config_path)
+                 trajectory_length = config.len_trajectory
+                 print(f"Loaded trajectory_length from config.yaml: {trajectory_length}")
+             except Exception as e:
+                 print(f"Could not load trajectory_length from config.yaml: {e}")
+    
+    if trajectory_length is None:
+        trajectory_length = 1000 # Default fallback
+        print(f"Using default trajectory_length: {trajectory_length}")
     
     # Set seed if provided
     if args.seed is not None:
@@ -431,6 +480,10 @@ def main():
             cond_dropout=args.cond_dropout,
             wandb_project=args.wandb_project,
             save_every_n_epochs=args.save_every_n_epochs,
+            debug_random_obs=args.debug_random_obs,
+            debug_random_prev_state=args.debug_random_prev_state,
+            use_time_step=args.use_time_step,
+            trajectory_length=trajectory_length,
         )
         checkpoint_to_eval = best_checkpoint
     else:

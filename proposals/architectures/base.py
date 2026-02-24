@@ -48,15 +48,17 @@ class BaseVelocityNetwork(nn.Module, ABC):
         s: torch.Tensor, 
         x_prev: torch.Tensor,
         y: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
-        Compute velocity v_θ(x, s | x_prev, y)
+        Compute velocity v_θ(x, s | x_prev, y, t)
         
         Args:
             x: Current position in flow, shape (batch, state_dim)
             s: Flow time ∈ [0,1], shape (batch, 1) or (batch,)
             x_prev: Conditioning (previous state), shape (batch, state_dim)
             y: Observation conditioning, shape (batch, obs_dim) or None
+            t: Trajectory time step (normalized), shape (batch, 1) or (batch,) or None
             
         Returns:
             Velocity vector, shape (batch, state_dim)

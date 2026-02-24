@@ -73,6 +73,10 @@ class RFProposal(pl.LightningModule):
         guidance_scale: float = 1.0,
         obs_indices: Optional[list] = None,
         cond_dropout: float = 0.0,
+        debug_random_obs: bool = False,
+        debug_random_prev_state: bool = False,
+        use_time_step: bool = False,
+        trajectory_length: int = 1000,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -90,6 +94,10 @@ class RFProposal(pl.LightningModule):
         self.guidance_scale = guidance_scale
         self.obs_indices = obs_indices
         self.cond_dropout = cond_dropout
+        self.debug_random_obs = debug_random_obs
+        self.debug_random_prev_state = debug_random_prev_state
+        self.use_time_step = use_time_step
+        self.trajectory_length = trajectory_length
         
         # Create velocity network using factory
         self.velocity_net = create_velocity_network(
@@ -97,6 +105,7 @@ class RFProposal(pl.LightningModule):
             state_dim=state_dim,
             obs_dim=obs_dim,
             conditioning_method=train_cond_method,
+            use_time_step=use_time_step,
             # MLP-specific
             hidden_dim=hidden_dim,
             depth=depth,
@@ -121,15 +130,68 @@ class RFProposal(pl.LightningModule):
         s: torch.Tensor, 
         x_prev: torch.Tensor,
         y: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Compute velocity field"""
-        return self.velocity_net(x, s, x_prev, y)
+        return self.velocity_net(x, s, x_prev, y, t)
+
+    def _normalize_trajectory_time(
+        self,
+        t: Optional[torch.Tensor],
+        batch_size: int,
+        caller_name: str,
+    ) -> Optional[torch.Tensor]:
+        """
+        Normalize trajectory time conditioning tensor to shape (batch, 1).
+
+        Accepts scalar, (batch,), or (batch, 1). A scalar (or single-element vector)
+        is broadcast across the batch for convenience in inference/sanity checks.
+        """
+        if not self.use_time_step:
+            return None
+
+        if t is None:
+            raise ValueError(f"use_time_step=True but t was not provided to {caller_name}")
+
+        if not torch.is_tensor(t):
+            t = torch.tensor(t, device=self.device, dtype=torch.float32)
+        else:
+            t = t.to(self.device)
+
+        if t.dim() == 0:
+            t = t.reshape(1, 1).expand(batch_size, 1)
+        elif t.dim() == 1:
+            if t.shape[0] == 1 and batch_size != 1:
+                t = t.expand(batch_size)
+            elif t.shape[0] != batch_size:
+                raise ValueError(
+                    f"{caller_name}: expected t with shape ({batch_size},) or scalar, got {tuple(t.shape)}"
+                )
+            t = t.unsqueeze(1)
+        elif t.dim() == 2:
+            if t.shape[1] != 1:
+                raise ValueError(
+                    f"{caller_name}: expected t with second dimension 1, got {tuple(t.shape)}"
+                )
+            if t.shape[0] == 1 and batch_size != 1:
+                t = t.expand(batch_size, 1)
+            elif t.shape[0] != batch_size:
+                raise ValueError(
+                    f"{caller_name}: expected t with first dimension {batch_size}, got {tuple(t.shape)}"
+                )
+        else:
+            raise ValueError(
+                f"{caller_name}: expected scalar, 1D, or 2D t tensor, got {t.dim()}D"
+            )
+
+        return t.float() / self.trajectory_length
     
     def compute_rf_loss(
         self,
         x_prev: torch.Tensor,
         x_curr: torch.Tensor,
         y_curr: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute Rectified Flow training loss
@@ -144,6 +206,7 @@ class RFProposal(pl.LightningModule):
             x_prev: Previous states, shape (batch, state_dim)
             x_curr: Current states, shape (batch, state_dim)
             y_curr: Current observations, shape (batch, obs_dim) or None
+            t: Trajectory time step, shape (batch,) or None
             
         Returns:
             loss: Scalar loss
@@ -171,8 +234,15 @@ class RFProposal(pl.LightningModule):
         # Target velocity (constant along straight line)
         target_velocity = target - z
         
+        # Normalize trajectory time conditioning to shape (batch, 1)
+        t_normalized = self._normalize_trajectory_time(
+            t=t,
+            batch_size=batch_size,
+            caller_name="compute_rf_loss",
+        )
+        
         # Predicted velocity
-        pred_velocity = self.velocity_net(x_s, s, x_prev, y_curr)
+        pred_velocity = self.velocity_net(x_s, s, x_prev, y_curr, t_normalized)
         
         # MSE loss
         loss = torch.mean((pred_velocity - target_velocity) ** 2)
@@ -192,6 +262,13 @@ class RFProposal(pl.LightningModule):
         x_prev = batch['x_prev']
         x_curr = batch['x_curr']
         y_curr = batch.get('y_curr', None)
+        time_idx = batch.get('time_idx', None)
+        
+        # Debug: Replace with random vectors if enabled
+        if self.debug_random_prev_state:
+            x_prev = torch.randn_like(x_prev)
+        if self.debug_random_obs and y_curr is not None:
+            y_curr = torch.randn_like(y_curr)
         
         # Apply Conditioning Dropout (Classifier-Free Guidance)
         if self.training and self.cond_dropout > 0:
@@ -199,7 +276,7 @@ class RFProposal(pl.LightningModule):
                 y_curr = None
         
         # Compute loss
-        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr)
+        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr, t=time_idx)
         
         # Log metrics
         self.log('train_loss', metrics['loss'], on_step=True, on_epoch=True, prog_bar=True)
@@ -214,8 +291,15 @@ class RFProposal(pl.LightningModule):
         x_prev = batch['x_prev']
         x_curr = batch['x_curr']
         y_curr = batch.get('y_curr', None)
+        time_idx = batch.get('time_idx', None)
         
-        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr)
+        # Debug: Replace with random vectors if enabled
+        if self.debug_random_prev_state:
+            x_prev = torch.randn_like(x_prev)
+        if self.debug_random_obs and y_curr is not None:
+            y_curr = torch.randn_like(y_curr)
+        
+        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr, t=time_idx)
         
         # Log metrics
         self.log('val_loss', metrics['loss'], on_step=False, on_epoch=True, prog_bar=True)
@@ -271,6 +355,7 @@ class RFProposal(pl.LightningModule):
         y_curr: torch.Tensor,
         observation_fn: callable,
         create_graph: bool = False,
+        t_normalized: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute guidance gradient for Monte Carlo guidance
@@ -282,6 +367,7 @@ class RFProposal(pl.LightningModule):
             y_curr: Current observation
             observation_fn: Function mapping state to observation space
             create_graph: Whether to create graph for higher-order derivatives
+            t_normalized: Normalized trajectory time step
             
         Returns:
             Gradient of loss with respect to x_s
@@ -292,7 +378,7 @@ class RFProposal(pl.LightningModule):
         
         # 1. Lookahead Prediction: Predict final state \hat{x}_1
         # \hat{x}_1^{delta} = x_s + (1-s) * v_\theta(x_s, s)
-        v = self.velocity_net(x_s, s, x_prev, y_curr)
+        v = self.velocity_net(x_s, s, x_prev, y_curr, t_normalized)
         x_1_delta = x_s + (1.0 - s) * v
         
         # If predict_delta is True, convert to absolute state
@@ -321,6 +407,7 @@ class RFProposal(pl.LightningModule):
         y_curr: Optional[torch.Tensor] = None,
         dt: Optional[float] = None,
         observation_fn: Optional[callable] = None,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Sample x_t ~ q(x_t | x_{t-1}, y_t) using Euler method
@@ -330,6 +417,7 @@ class RFProposal(pl.LightningModule):
             y_curr: Current observation, shape (obs_dim,) or (batch, obs_dim) or None
             dt: Time step (unused, for interface compatibility)
             observation_fn: Optional observation function for guidance
+            t: Trajectory time step (unnormalized), shape (batch,) or scalar or None
             
         Returns:
             Sampled next state, shape same as x_prev
@@ -342,6 +430,13 @@ class RFProposal(pl.LightningModule):
         
         batch_size = x_prev.shape[0]
         
+        # Normalize trajectory time conditioning to shape (batch, 1)
+        t_normalized = self._normalize_trajectory_time(
+            t=t,
+            batch_size=batch_size,
+            caller_name="sample",
+        )
+        
         # Start from noise z ~ N(0, I)
         x = torch.randn(batch_size, self.state_dim, device=self.device)
         
@@ -351,12 +446,12 @@ class RFProposal(pl.LightningModule):
         for i in range(self.num_sampling_steps):
             s = i * ds
             s_tensor = torch.full((batch_size, 1), s, device=self.device)
-            v = self.velocity_net(x, s_tensor, x_prev, y_curr)
+            v = self.velocity_net(x, s_tensor, x_prev, y_curr, t_normalized)
             
             # Apply Monte Carlo Guidance if enabled
             if self.mc_guidance and observation_fn is not None and y_curr is not None:
                 # We need to compute gradient, so we temporarily enable grads
-                grad = self.compute_guidance_grad(x, s_tensor, x_prev, y_curr, observation_fn)
+                grad = self.compute_guidance_grad(x, s_tensor, x_prev, y_curr, observation_fn, t_normalized=t_normalized)
                 v = v - self.guidance_scale * grad
                 
             x = x + v * ds  # Euler step
@@ -379,6 +474,7 @@ class RFProposal(pl.LightningModule):
         use_exact_trace: bool = True,
         trace_estimator: str = 'gaussian',
         num_trace_probes: int = 1,
+        t: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample x_t and compute its log probability, optionally with guidance.
@@ -390,6 +486,7 @@ class RFProposal(pl.LightningModule):
             use_exact_trace: Whether to use exact trace or Hutchinson estimator
             trace_estimator: 'gaussian' or 'rademacher' (only used if use_exact_trace=False)
             num_trace_probes: Number of probes for Hutchinson estimator (only used if use_exact_trace=False)
+            t: Trajectory time step (unnormalized)
             
         Returns:
             Tuple of (sampled_state, log_prob)
@@ -401,6 +498,13 @@ class RFProposal(pl.LightningModule):
                 y_curr = y_curr.unsqueeze(0)
         
         batch_size = x_prev.shape[0]
+        
+        # Normalize trajectory time conditioning to shape (batch, 1)
+        t_normalized = self._normalize_trajectory_time(
+            t=t,
+            batch_size=batch_size,
+            caller_name="sample_and_log_prob",
+        )
         
         # Start from noise z ~ N(0, I)
         x = torch.randn(batch_size, self.state_dim, device=self.device)
@@ -423,7 +527,7 @@ class RFProposal(pl.LightningModule):
                 if use_exact_trace:
                     # EXACT TRACE
                     def v_func(x_in):
-                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr)
+                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr, t_normalized)
                         
                     v = v_func(x_for_grad)
                     
@@ -437,7 +541,7 @@ class RFProposal(pl.LightningModule):
                         divergence += grad_k[:, k]
                 else:
                     # HUTCHINSON TRACE
-                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
+                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr, t_normalized)
                     
                     divergence_sum = torch.zeros(batch_size, device=self.device)
                     for _ in range(num_trace_probes):
@@ -457,7 +561,7 @@ class RFProposal(pl.LightningModule):
                     # Compute guidance gradient
                     # IMPORTANT: create_graph=True for second derivative
                     grad = self.compute_guidance_grad(
-                        x_for_grad, s_tensor, x_prev, y_curr, observation_fn, create_graph=True
+                        x_for_grad, s_tensor, x_prev, y_curr, observation_fn, create_graph=True, t_normalized=t_normalized
                     )
                     
                     # Compute divergence of guidance (Laplacian of Loss)
@@ -490,7 +594,7 @@ class RFProposal(pl.LightningModule):
                     # Update velocity and divergence
                     v = v - self.guidance_scale * grad
                     divergence = divergence - self.guidance_scale * grad_div
-
+            
             # Update state
             x = x + v.detach() * ds
             
@@ -517,6 +621,7 @@ class RFProposal(pl.LightningModule):
         use_exact_trace: bool = True,
         trace_estimator: str = 'gaussian',
         num_trace_probes: int = 1,
+        t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Compute log prob using Euler method.
@@ -530,6 +635,7 @@ class RFProposal(pl.LightningModule):
                              If False, uses Hutchinson trace estimator (stochastic, O(D)).
             trace_estimator: 'gaussian' or 'rademacher' (only used if use_exact_trace=False)
             num_trace_probes: Number of probes for Hutchinson estimator (only used if use_exact_trace=False)
+            t: Trajectory time step (unnormalized)
         
         Returns:
             Log probability, shape () or (batch,)
@@ -542,6 +648,13 @@ class RFProposal(pl.LightningModule):
                 y_curr = y_curr.unsqueeze(0)
         
         batch_size = x_curr.shape[0]
+        
+        # Normalize trajectory time conditioning to shape (batch, 1)
+        t_normalized = self._normalize_trajectory_time(
+            t=t,
+            batch_size=batch_size,
+            caller_name="log_prob",
+        )
         
         # Start from target at s=1, integrate backward to s=0
         # If predict_delta mode, we start from the delta, not x_curr
@@ -565,7 +678,7 @@ class RFProposal(pl.LightningModule):
                 if use_exact_trace:
                     # EXACT TRACE COMPUTATION
                     def v_func(x_in):
-                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr)
+                        return self.velocity_net(x_in, s_tensor, x_prev, y_curr, t_normalized)
 
                     # Compute velocity for the step
                     v = v_func(x_for_grad)
@@ -587,7 +700,7 @@ class RFProposal(pl.LightningModule):
                         
                 else:
                     # HUTCHINSON TRACE ESTIMATOR (Stochastic)
-                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr)
+                    v = self.velocity_net(x_for_grad, s_tensor, x_prev, y_curr, t_normalized)
                     
                     divergence_sum = torch.zeros(batch_size, device=self.device)
                     for j in range(num_trace_probes):
@@ -643,8 +756,16 @@ class RFProposal(pl.LightningModule):
         trajectory = [x_initial.cpu().numpy()]
         x_current = x_initial
         
-        for _ in range(n_steps):
-            x_next = self.sample(x_current)
+        for i in range(n_steps):
+            # Pass time step t = i + 1 (since we are predicting x_{i+1})
+            # Or should it be t = i?
+            # In training, we learn p(x_t | x_{t-1}, t).
+            # So when predicting x_1 from x_0, t should be 1.
+            # When predicting x_{i+1} from x_i, t should be i+1.
+            
+            t = torch.tensor([i + 1], device=self.device, dtype=torch.float32)
+            
+            x_next = self.sample(x_current, t=t)
             trajectory.append(x_next.cpu().numpy())
             x_current = x_next
         
@@ -702,7 +823,7 @@ def test_rectified_flow():
         channels=32,
         num_blocks=4,
         kernel_size=3,
-        conditioning_method='adaln',
+        train_cond_method='adaln',
         num_sampling_steps=20,
         num_likelihood_steps=20,
     )
@@ -755,7 +876,7 @@ def test_rectified_flow():
             architecture='resnet1d',
             channels=32,
             num_blocks=4,
-            conditioning_method=method,
+            train_cond_method=method,
             num_sampling_steps=5,
         )
         x = torch.randn(4, state_dim_l96)
@@ -810,7 +931,7 @@ def test_rectified_flow():
         architecture='resnet1d',
         channels=32,
         num_blocks=4,
-        conditioning_method='adaln',
+        train_cond_method='adaln',
         num_sampling_steps=10,
         predict_delta=True,
     )

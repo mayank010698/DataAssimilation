@@ -25,6 +25,7 @@ def create_velocity_network(
     state_dim: int,
     obs_dim: int = 0,
     conditioning_method: str = 'concat',
+    use_time_step: bool = False,
     **kwargs,
 ) -> BaseVelocityNetwork:
     """
@@ -35,6 +36,7 @@ def create_velocity_network(
         state_dim: Dimension of state space
         obs_dim: Dimension of observations (0 for unconditional)
         conditioning_method: Ignored for current fixed architectures (they use specific methods internally)
+        use_time_step: Whether to condition on trajectory time step
         **kwargs: Additional architecture-specific arguments
         
     Returns:
@@ -65,6 +67,7 @@ def create_velocity_network(
             depth=kwargs.get('depth', 4),
             time_embed_dim=kwargs.get('time_embed_dim', 64),
             dropout=kwargs.get('dropout', 0.0),
+            use_time_step=use_time_step,
         )
     elif architecture == 'resnet1d':
         return ResNet1DVelocityNetwork(
@@ -76,6 +79,7 @@ def create_velocity_network(
             kernel_size=kwargs.get('kernel_size', 5),
             time_embed_dim=kwargs.get('time_embed_dim', 64),
             dropout=kwargs.get('dropout', 0.0),
+            use_time_step=use_time_step,
         )
     else:
         raise ValueError(

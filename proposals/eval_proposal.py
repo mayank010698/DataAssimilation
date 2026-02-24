@@ -92,6 +92,8 @@ def plot_trajectory_comparison(
     x_true = np.array([d["x_true"] for d in trajectory_data])
     x_est = np.array([d["x_est"] for d in trajectory_data])
     rmse_values = np.array([d["rmse"] for d in trajectory_data])
+    obs_error_values = np.array([d.get("obs_error", np.nan) for d in trajectory_data])
+    has_obs_mask = ~np.isnan(obs_error_values)
 
     # Create mapping from time_idx to array position
     time_to_idx = {t: idx for idx, t in enumerate(time_steps)}
@@ -165,6 +167,17 @@ def plot_trajectory_comparison(
     ax5.set_title("RMSE Over Time")
     ax5.set_xlabel("Time Step")
     ax5.set_ylabel("RMSE")
+
+    # Observation error over time
+    ax6 = fig.add_subplot(3, 2, 6)
+    if np.any(has_obs_mask):
+        ax6.plot(time_steps[has_obs_mask], obs_error_values[has_obs_mask], "orange", marker="o", markersize=4)
+        ax6.set_title("Observation Error Over Time")
+        ax6.set_xlabel("Time Step")
+        ax6.set_ylabel("||h(x) - o||²")
+    else:
+        ax6.text(0.5, 0.5, "No observations", ha="center", va="center", transform=ax6.transAxes)
+        ax6.set_title("Observation Error Over Time")
 
     plt.tight_layout()
     return fig
@@ -386,6 +399,8 @@ def run_proposal_eval(
             "trajectory_data": [], 
             "rmse_sum": 0.0, 
             "crps_sum": 0.0,
+            "obs_error_sum": 0.0,
+            "obs_error_count": 0,
             "count": 0
         } for i in range(n_trajectories)
     }
@@ -409,6 +424,7 @@ def run_proposal_eval(
         
         batch_x_prev = []
         batch_y_curr = []
+        batch_time_steps = []
         valid_mask = []
         
         # Prepare inputs
@@ -428,6 +444,9 @@ def run_proposal_eval(
                     # y_curr_input[i] is (D_obs,)
                     y_expanded = y_curr_input[i].unsqueeze(0).repeat(n_samples_per_traj, 1)
                     batch_y_curr.append(y_expanded)
+                # Collect time step for each ensemble member
+                # t is the time index (e.g., 1, 2, 3, ...)
+                batch_time_steps.append(t)
                 valid_mask.append(i)
             else:
                 pass
@@ -460,19 +479,29 @@ def run_proposal_eval(
                 if y_curr_flat.shape[1] > len(indices):
                     y_curr_flat = y_curr_flat[:, indices]
         
+        # Prepare time steps if needed
+        t_flat = None
+        if hasattr(model, 'use_time_step') and model.use_time_step:
+            # Create time step tensor: repeat each time step K times (once per ensemble member)
+            # batch_time_steps is a list of B_eff time indices
+            # We need (B_eff * K,) tensor where each time step is repeated K times
+            t_tensor = torch.tensor(batch_time_steps, device=x_prev_flat.device, dtype=torch.float32) # (B_eff,)
+            t_flat = t_tensor.unsqueeze(1).repeat(1, K).reshape(B_eff * K) # (B_eff * K,)
+        
         # Sample next states
         # x_next ~ p(x_t | x_{t-1}, y_t)
         with torch.no_grad():
             # Model outputs (B*K, D)
             # Pass observation_fn if guidance is enabled
+            # Pass time step if use_time_step is enabled
             if model.mc_guidance and observation_fn is not None:
                 # IMPORTANT: sample() needs observation_fn for guidance
                 # But our wrapper/model.sample signature might not accept it directly in PyTorch Lightning module
                 # Let's check RFProposal.sample signature
-                # It accepts: x_prev, y_curr=None, dt=None, observation_fn=None
-                x_next_flat = model.sample(x_prev_flat, y_curr_flat, observation_fn=observation_fn)
+                # It accepts: x_prev, y_curr=None, dt=None, observation_fn=None, t=None
+                x_next_flat = model.sample(x_prev_flat, y_curr_flat, observation_fn=observation_fn, t=t_flat)
             else:
-                x_next_flat = model.sample(x_prev_flat, y_curr_flat)
+                x_next_flat = model.sample(x_prev_flat, y_curr_flat, t=t_flat)
             
         # Reshape back to (B, K, D)
         x_next_stack = x_next_flat.reshape(B_eff, K, D)
@@ -512,7 +541,40 @@ def run_proposal_eval(
             
             # Store
             has_obs = batch["has_observation"][idx].item()
-            obs = batch["y_curr"][idx].cpu().numpy() if (has_obs and "y_curr" in batch) else None
+            obs = batch["y_curr"][idx] if (has_obs and "y_curr" in batch) else None
+            
+            # Observation error: ||h(x_mean) - o_t||^2
+            obs_error = None
+            if has_obs and obs is not None:
+                # Apply observation operator to predicted state
+                # x_mean_orig is (D,) in physical space
+                obs_pred = system.apply_observation_operator(x_mean_orig.unsqueeze(0))  # (1, obs_dim)
+                obs_pred = obs_pred.squeeze(0)  # (obs_dim,)
+                
+                # obs is already in physical space (from batch["y_curr"])
+                # Ensure it's on the correct device
+                if isinstance(obs, torch.Tensor):
+                    obs_tensor = obs.to(device)
+                else:
+                    obs_tensor = torch.tensor(obs, device=device, dtype=torch.float32)
+                
+                # Ensure shapes match (should match, but add safety check)
+                if obs_pred.shape != obs_tensor.shape:
+                    logger.warning(f"Shape mismatch: obs_pred {obs_pred.shape} vs obs_tensor {obs_tensor.shape}. "
+                                 f"Truncating to match.")
+                    min_dim = min(obs_pred.shape[0], obs_tensor.shape[0])
+                    obs_pred = obs_pred[:min_dim]
+                    obs_tensor = obs_tensor[:min_dim]
+                
+                # Compute MSE: ||h(x_mean) - o_t||^2
+                obs_diff = obs_pred - obs_tensor
+                obs_error = torch.mean(obs_diff**2).item()
+                
+                trajectory_results[tid]["obs_error_sum"] += obs_error
+                trajectory_results[tid]["obs_error_count"] += 1
+            
+            # Convert obs to numpy for storage
+            obs_np = obs.cpu().numpy() if (has_obs and obs is not None and isinstance(obs, torch.Tensor)) else (obs if obs is not None else None)
             
             # For plotting/storage, we store the mean estimate or full ensemble?
             # Storing full ensemble might be heavy if K is large.
@@ -525,10 +587,11 @@ def run_proposal_eval(
                 "x_true": x_true_orig.cpu().numpy(),
                 "x_est": x_mean_orig.cpu().numpy(), # Mean estimate
                 "x_std": torch.std(x_gen_orig_k, dim=0, correction=0).cpu().numpy(), # Std dev for uncertainty
-                "observation": obs,
+                "observation": obs_np,
                 "has_observation": has_obs,
                 "rmse": rmse,
-                "crps": crps
+                "crps": crps,
+                "obs_error": obs_error
             })
             
             trajectory_results[tid]["rmse_sum"] += rmse
@@ -543,6 +606,8 @@ def run_proposal_eval(
     # Aggregate and Log
     total_rmse = 0.0
     total_crps = 0.0
+    total_obs_error = 0.0
+    total_obs_steps = 0
     total_steps = 0
     
     for tid, res in trajectory_results.items():
@@ -552,6 +617,13 @@ def run_proposal_eval(
             
             res["mean_rmse"] = mean_traj_rmse
             res["mean_crps"] = mean_traj_crps
+            
+            if res["obs_error_count"] > 0:
+                res["mean_obs_error"] = res["obs_error_sum"] / res["obs_error_count"]
+                total_obs_error += res["obs_error_sum"]
+                total_obs_steps += res["obs_error_count"]
+            else:
+                res["mean_obs_error"] = None
             
             total_rmse += res["rmse_sum"]
             total_crps += res["crps_sum"]
@@ -573,15 +645,21 @@ def run_proposal_eval(
 
     global_mean_rmse = total_rmse / total_steps if total_steps > 0 else 0.0
     global_mean_crps = total_crps / total_steps if total_steps > 0 else 0.0
+    global_mean_obs_error = total_obs_error / total_obs_steps if total_obs_steps > 0 else None
     
     logger.info(f"Global Mean RMSE (Autoregressive): {global_mean_rmse:.4f}")
     logger.info(f"Global Mean CRPS (Autoregressive): {global_mean_crps:.4f}")
+    if global_mean_obs_error is not None:
+        logger.info(f"Global Mean Observation Error: {global_mean_obs_error:.4f}")
     
     if wandb_run:
-        wandb_run.log({
+        log_dict = {
             "eval/global_mean_rmse": global_mean_rmse,
             "eval/global_mean_crps": global_mean_crps
-        })
+        }
+        if global_mean_obs_error is not None:
+            log_dict["eval/global_mean_obs_error"] = global_mean_obs_error
+        wandb_run.log(log_dict)
         
         # Log metrics over time
         max_t = 0
@@ -592,21 +670,31 @@ def run_proposal_eval(
         for t in range(1, max_t + 1):
             rmses_at_t = []
             crps_at_t = []
+            obs_errors_at_t = []
             for res in trajectory_results.values():
                 for d in res["trajectory_data"]:
                     if d["time_idx"] == t:
                         rmses_at_t.append(d["rmse"])
                         crps_at_t.append(d["crps"])
+                        if d.get("obs_error") is not None:
+                            obs_errors_at_t.append(d["obs_error"])
                         break
             
+            log_dict_t = {}
             if rmses_at_t:
                 mean_rmse_t = sum(rmses_at_t) / len(rmses_at_t)
                 mean_crps_t = sum(crps_at_t) / len(crps_at_t)
-                wandb_run.log({
+                log_dict_t.update({
                     "eval/mean_rmse_over_time": mean_rmse_t, 
                     "eval/mean_crps_over_time": mean_crps_t,
-                    "time_step": t
                 })
+            if obs_errors_at_t:
+                mean_obs_error_t = sum(obs_errors_at_t) / len(obs_errors_at_t)
+                log_dict_t["eval/mean_obs_error_over_time"] = mean_obs_error_t
+            
+            if log_dict_t:
+                log_dict_t["time_step"] = t
+                wandb_run.log(log_dict_t)
 
     return global_mean_rmse
 
