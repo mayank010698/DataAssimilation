@@ -38,6 +38,11 @@ class ObservationOperator:
             return torch.pow(observed, 3)
         elif self.nonlinearity in ["linear_projection", "identity", "none"]:
             return observed
+        elif self.nonlinearity == "quad_capped_10":
+            # DBF-style: h(x) = clamp(x^4, max=10) / 10
+            observed = torch.pow(observed, 4)
+            observed = torch.clamp(observed, max=10.0)
+            return observed / 10.0
         elif hasattr(torch, self.nonlinearity):
             # Allow other torch functions if they exist (e.g. 'tanh', 'sigmoid')
             func = getattr(torch, self.nonlinearity)
@@ -394,7 +399,14 @@ class Lorenz96(DynamicalSystem):
         # F=8 is standard for chaotic behavior
         # dim=40 is standard, but can be scaled up to 1M+ (see arXiv:2309.00983)
         # dt=0.01 is used here, though 0.05 (6 hours) is also common in literature
-        default_params = {"F": 8, "dim": 40, "init_std": 1.0}
+        default_params = {
+            "F": 8,
+            "dim": 40,
+            "init_std": 1.0,
+            "init_sampling": "gaussian",
+            "init_low": -10.0,
+            "init_high": 10.0,
+        }
         if config.system_params is None:
             config.system_params = default_params
         else:
@@ -410,9 +422,17 @@ class Lorenz96(DynamicalSystem):
         super().__init__(config)
         self.forcing = config.system_params["F"]
         self.dim = config.system_params["dim"]
-        
-        self.init_mean = torch.zeros(self.dim)
-        self.init_std = config.system_params["init_std"]
+        self.init_sampling = config.system_params["init_sampling"]
+        self.init_low = config.system_params["init_low"]
+        self.init_high = config.system_params["init_high"]
+
+        if self.init_sampling == "uniform":
+            # For preprocess/postprocess use mean and std of Uniform(low, high)
+            self.init_mean = torch.zeros(self.dim) + (self.init_low + self.init_high) / 2.0
+            self.init_std = (self.init_high - self.init_low) / (12.0 ** 0.5)
+        else:
+            self.init_mean = torch.zeros(self.dim)
+            self.init_std = config.system_params["init_std"]
         self.init_cov = (self.init_std ** 2) * torch.eye(self.dim)
 
     def get_state_dim(self) -> int:
@@ -431,6 +451,14 @@ class Lorenz96(DynamicalSystem):
         return initial_state
         
     def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        if self.init_sampling == "uniform":
+            # DBF-style: Uniform(init_low, init_high) per component
+            if n_samples == 1:
+                u = torch.rand(self.dim, device=self.init_mean.device)
+                return (self.init_low + (self.init_high - self.init_low) * u)
+            else:
+                u = torch.rand(n_samples, self.dim, device=self.init_mean.device)
+                return self.init_low + (self.init_high - self.init_low) * u
         if n_samples == 1:
             return self.init_mean + self.init_std * torch.randn(
                 self.dim, device=self.init_mean.device
@@ -970,6 +998,47 @@ def generate_dataset_splits(system: DynamicalSystem, config: DataAssimilationCon
     }
     
     return splits_unscaled, obs_mask
+
+
+def observations_from_trajectories(
+    system: DynamicalSystem,
+    trajectories: np.ndarray,
+    obs_frequency: int,
+    len_trajectory: int,
+) -> tuple:
+    """
+    Compute observations from state trajectories using the system's observation operator.
+    Used to produce multiple datasets (different obs operators) from the same trajectories.
+
+    Args:
+        system: DynamicalSystem instance (must have the desired obs_nonlinearity and obs_noise_std)
+        trajectories: (N, T, state_dim) state trajectories
+        obs_frequency: observation frequency (every this many steps)
+        len_trajectory: trajectory length T
+
+    Returns:
+        observations: (N, num_obs_times, obs_dim) numpy array
+        obs_mask: (T,) boolean mask of observed time indices
+    """
+    obs_mask = np.zeros(len_trajectory, dtype=bool)
+    obs_mask[::obs_frequency] = True
+    obs_time_indices = np.where(obs_mask)[0]
+
+    if trajectories.size == 0:
+        state_dim = system.state_dim
+        obs_dim = system.obs_dim
+        return (
+            np.zeros((0, len(obs_time_indices), obs_dim)),
+            obs_mask,
+        )
+
+    obs_list = []
+    for t in obs_time_indices:
+        state_t = torch.from_numpy(trajectories[:, t, :].astype(np.float32))
+        obs_t = system.observe(state_t, add_noise=True)
+        obs_list.append(obs_t)
+    observations = torch.stack(obs_list, dim=1).cpu().numpy()
+    return observations, obs_mask
 
 
 def save_generated_data(data_dir: Path, splits_unscaled: Dict, obs_mask: np.ndarray):
@@ -1537,10 +1606,16 @@ def generate_dataset_directory_name(
     if config.process_noise_std > 0:
         parts.append(f"pnoise{config.process_noise_std:.3f}".replace(".", "p"))
 
-    # Add init std to directory name if not one
-    init_std = config.system_params.get("init_std", 1.0)
-    if init_std != 1.0:
-        parts.append(f"init{init_std:.3f}".replace(".", "p"))
+    # Add init std to directory name if not one (Gaussian); uniform ICs get initUni
+    init_sampling = config.system_params.get("init_sampling", "gaussian")
+    if init_sampling == "uniform":
+        init_low = config.system_params.get("init_low", -10.0)
+        init_high = config.system_params.get("init_high", 10.0)
+        parts.append(f"initUni{init_low:.0f}_{init_high:.0f}".replace(".", "p").replace("-", "m"))
+    else:
+        init_std = config.system_params.get("init_std", 1.0)
+        if init_std != 1.0:
+            parts.append(f"init{init_std:.3f}".replace(".", "p"))
 
     # Add KS specific parameters
     if "J" in config.system_params and "L" in config.system_params:
