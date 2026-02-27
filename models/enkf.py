@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, Union, Callable, List
 import logging
 import time
 
-from .base_pf import FilteringMethod
+from .base_pf import FilteringMethod, compute_unweighted_spread
 
 # =============================================================================
 # Utility Functions
@@ -367,6 +367,8 @@ class EnsembleKalmanFilter(FilteringMethod):
         
         # ESS is N for EnKF
         ess = float(self.n_particles)
+        # Ensemble spread (unweighted, analysis ensemble)
+        spread = compute_unweighted_spread(self.particles)  # (Batch,)
         
         for i in range(x_curr.shape[0]):
             metrics = {
@@ -380,6 +382,7 @@ class EnsembleKalmanFilter(FilteringMethod):
                 "resampled": False,
                 "ess_pre_resample": ess,
                 "ess": ess,
+                "ensemble_spread": spread[i].item(),
                 "step_time": elapsed_time,
             }
             results.append(metrics)
@@ -719,6 +722,8 @@ class LocalEnsembleTransformKalmanFilter(FilteringMethod):
         
         # ESS is N for LETKF
         ess = float(self.n_particles)
+        # Ensemble spread (unweighted, analysis ensemble)
+        spread = compute_unweighted_spread(self.particles)  # (Batch,)
         
         for i in range(x_curr.shape[0]):
             metrics = {
@@ -732,6 +737,7 @@ class LocalEnsembleTransformKalmanFilter(FilteringMethod):
                 "resampled": False,
                 "ess_pre_resample": ess,
                 "ess": ess,
+                "ensemble_spread": spread[i].item(),
                 "step_time": elapsed_time,
             }
             results.append(metrics)

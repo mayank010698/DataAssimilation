@@ -477,6 +477,18 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
         all_mean_ess_pre = [r["mean_ess_pre"] for r in trajectory_results]
         all_min_ess_pre = [r["min_ess_pre"] for r in trajectory_results]
     
+    # Aggregate ensemble spread metrics (if available)
+    all_mean_spread = []
+    all_std_spread = []
+    all_min_spread = []
+    all_max_spread = []
+    for r in trajectory_results:
+        if "mean_ensemble_spread" in r:
+            all_mean_spread.append(r["mean_ensemble_spread"])
+            all_std_spread.append(r.get("std_ensemble_spread", 0.0))
+            all_min_spread.append(r.get("min_ensemble_spread", 0.0))
+            all_max_spread.append(r.get("max_ensemble_spread", 0.0))
+    
     # Aggregate timing metrics
     all_total_times = [r["total_time"] for r in trajectory_results if r["total_time"] > 0]
     all_mean_step_times = [r["mean_step_time"] for r in trajectory_results if r["mean_step_time"] > 0]
@@ -523,6 +535,12 @@ def aggregate_metrics_across_trajectories(trajectory_results: List[Dict[str, Any
         
         "mean_ess_pre": np.mean(all_mean_ess_pre) if all_mean_ess_pre else 0.0,
         "min_ess_pre": np.min(all_min_ess_pre) if all_min_ess_pre else 0.0,
+        
+        # Ensemble spread statistics (using per-trajectory means)
+        "mean_ensemble_spread_across_trajectories": np.mean(all_mean_spread) if all_mean_spread else 0.0,
+        "std_ensemble_spread_across_trajectories": np.std(all_mean_spread) if all_mean_spread else 0.0,
+        "min_mean_ensemble_spread": np.min(all_mean_spread) if all_mean_spread else 0.0,
+        "max_mean_ensemble_spread": np.max(all_mean_spread) if all_mean_spread else 0.0,
         
         # Timing statistics
         "mean_total_time": np.mean(all_total_times) if all_total_times else 0.0,
@@ -634,6 +652,7 @@ def parse_args():
     parser.add_argument("--ensf-eps-a", type=float, default=0.5, help="Small time cutoff (alpha_min) for EnSF")
     parser.add_argument("--ensf-score-clip", type=float, default=50.0, help="Score clipping threshold for EnSF")
     parser.add_argument("--ensf-score-type", type=str, default="mixture", choices=["mixture", "diagonal"], help="Prior score approximation type for EnSF")
+    parser.add_argument("--ensf-fallback-physical", action="store_true", help="When set, EnSF with custom proposal uses physical process (TransitionProposal) at steps with no observation")
 
     parser.add_argument(
         "--proposal-type", type=str, choices=["transition", "rf"], default="transition"
@@ -715,7 +734,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         else:
             EnSFClass = EnsembleScoreFilter
 
-        pf = EnSFClass(
+        ensf_kwargs = dict(
             system=system,
             proposal_distribution=proposal,
             n_particles=args.n_particles,
@@ -729,6 +748,9 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             ensf_score_clip=args.ensf_score_clip,
             ensf_score_type=args.ensf_score_type,
         )
+        if EnSFClass is EnsembleScoreFilterWithProposal:
+            ensf_kwargs["fallback_to_physical_when_no_obs"] = args.ensf_fallback_physical
+        pf = EnSFClass(**ensf_kwargs)
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -899,6 +921,18 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         ess_values = [m["ess"] for m in metrics_list]
         resample_counts = [m["resampled"] for m in metrics_list]
         step_times = [m["step_time"] for m in metrics_list]
+        # Ensemble spread (if available). Prefer pre-resample for PF-style methods.
+        spread_values = [
+            m.get("ensemble_spread_pre_resample", m.get("ensemble_spread", 0.0))
+            for m in metrics_list
+            if ("ensemble_spread_pre_resample" in m) or ("ensemble_spread" in m)
+        ]
+        # Ensemble spread (if available). Prefer pre-resample for PF-style methods.
+        spread_values = [
+            m.get("ensemble_spread_pre_resample", m.get("ensemble_spread", 0.0))
+            for m in metrics_list
+            if ("ensemble_spread_pre_resample" in m) or ("ensemble_spread" in m)
+        ]
         
         res_dict = {
             "trajectory_idx": tid,
@@ -919,6 +953,10 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             "trajectory_data": data["trajectory_data"],
             "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in metrics_list]),
             "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in metrics_list]),
+            "mean_ensemble_spread": np.mean(spread_values) if spread_values else 0.0,
+            "std_ensemble_spread": np.std(spread_values) if spread_values else 0.0,
+            "min_ensemble_spread": np.min(spread_values) if spread_values else 0.0,
+            "max_ensemble_spread": np.max(spread_values) if spread_values else 0.0,
         }
         final_results.append(res_dict)
         
@@ -982,7 +1020,7 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
         else:
             EnSFClass = EnsembleScoreFilter
 
-        pf = EnSFClass(
+        ensf_kwargs = dict(
             system=system,
             proposal_distribution=proposal,
             n_particles=args.n_particles,
@@ -996,6 +1034,9 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             ensf_score_clip=args.ensf_score_clip,
             ensf_score_type=args.ensf_score_type,
         )
+        if EnSFClass is EnsembleScoreFilterWithProposal:
+            ensf_kwargs["fallback_to_physical_when_no_obs"] = args.ensf_fallback_physical
+        pf = EnSFClass(**ensf_kwargs)
     else:
         raise ValueError(f"Unknown method: {args.method}")
     
@@ -1177,6 +1218,10 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             "trajectory_data": current_traj_data if do_vis else None,
             "mean_ess_pre": np.mean([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
             "min_ess_pre": np.min([m.get("ess_pre_resample", 0.0) for m in current_traj_metrics]),
+            "mean_ensemble_spread": np.mean(spread_values) if spread_values else 0.0,
+            "std_ensemble_spread": np.std(spread_values) if spread_values else 0.0,
+            "min_ensemble_spread": np.min(spread_values) if spread_values else 0.0,
+            "max_ensemble_spread": np.max(spread_values) if spread_values else 0.0,
         }
         trajectory_results.append(result)
         
@@ -1295,12 +1340,16 @@ def main():
     print(f"  Mean: {system.init_mean}")
     print(f"  Std:  {system.init_std}")
 
-    if args.method == "bpf" and args.proposal_type == "rf":
+    # Build proposal distribution
+    # - If proposal_type == "rf", use RectifiedFlowProposal for any method that supports it
+    #   (currently BPF and EnSF-with-proposal).
+    # - Otherwise fall back to the transition prior.
+    if args.proposal_type == "rf":
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
-                "Rectified Flow proposal selected but checkpoint not found. "
-                "Provide --rf-checkpoint or a valid --rf-config-name."
+                "Rectified Flow proposal selected (--proposal-type rf) but checkpoint not found. "
+                "Provide --rf-checkpoint pointing to a valid RF .ckpt file."
             )
             
         # Attempt to load observation scalers if needed
@@ -1381,6 +1430,7 @@ def main():
         wandb.define_metric("std_crps_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_over_time", step_metric="time_step")
         wandb.define_metric("mean_ess_pre_resample_over_time", step_metric="time_step")
+        wandb.define_metric("mean_ensemble_spread_over_time", step_metric="time_step")
         wandb.define_metric("mean_cumulative_resamples", step_metric="time_step")
         wandb.define_metric("mean_proposal_log_prob", step_metric="time_step")
         wandb.define_metric("mean_obs_log_prob", step_metric="time_step")
@@ -1458,6 +1508,7 @@ def main():
                 crps_vals = []
                 ess_vals = []
                 ess_pre_vals = []
+                spread_vals = []
                 cumulative_resample_vals = []
                 prop_log_vals = []
                 obs_log_vals = []
@@ -1490,6 +1541,12 @@ def main():
                                     # Before first observation, just use current value
                                     ess_pre_vals.append(curr_val)
 
+                        # Ensemble spread (if available). Prefer pre-resample when present.
+                        if "ensemble_spread_pre_resample" in r["metrics"][t]:
+                            spread_vals.append(r["metrics"][t]["ensemble_spread_pre_resample"])
+                        elif "ensemble_spread" in r["metrics"][t]:
+                            spread_vals.append(r["metrics"][t]["ensemble_spread"])
+
                         if r["metrics"][t].get("resampled", False):
                             traj_cumulative_resamples[i] += 1
                         cumulative_resample_vals.append(traj_cumulative_resamples[i])
@@ -1509,6 +1566,7 @@ def main():
                         "std_crps_over_time": np.std(crps_vals) if crps_vals else 0.0,
                         "mean_ess_over_time": np.mean(ess_vals) if ess_vals else 0.0,
                         "mean_ess_pre_resample_over_time": np.mean(ess_pre_vals) if ess_pre_vals else 0.0,
+                        "mean_ensemble_spread_over_time": np.mean(spread_vals) if spread_vals else 0.0,
                         "mean_cumulative_resamples": np.mean(cumulative_resample_vals) if cumulative_resample_vals else 0.0,
                         "mean_proposal_log_prob": np.mean(prop_log_vals) if prop_log_vals else 0.0,
                         "mean_obs_log_prob": np.mean(obs_log_vals) if obs_log_vals else 0.0,

@@ -4,7 +4,7 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 import logging
 import time
 
-from .base_pf import FilteringMethod
+from .base_pf import FilteringMethod, compute_weighted_spread
 from .proposals import ProposalDistribution, TransitionProposal
 
 
@@ -1038,6 +1038,7 @@ class BootstrapParticleFilter(FilteringMethod):
         log_likelihoods = torch.zeros(x_curr.shape[0], device=self.device)
         resampled_flags = [False] * x_curr.shape[0]
         ess_pre = (1.0 / torch.sum(self.weights**2, dim=1))
+        ensemble_spread_pre = torch.zeros(x_curr.shape[0], device=self.device)
         
         if y_curr is not None:
              # Check which indices have observations
@@ -1052,6 +1053,9 @@ class BootstrapParticleFilter(FilteringMethod):
              # For now, assuming uniform observation availability in batch (TimeAlignedSampler helps this)
              log_likelihoods = self.compute_log_likelihood(y_curr)
              self.update_step(y_curr)
+             
+             # Compute weighted ensemble spread BEFORE resampling
+             ensemble_spread_pre = compute_weighted_spread(self.particles, self.weights)
              
              # Resample
              resampled_flags, ess_pre = self.resample()
@@ -1089,6 +1093,7 @@ class BootstrapParticleFilter(FilteringMethod):
                 "resampled": resampled_flags[i],
                 "ess_pre_resample": ess_pre[i].item(),
                 "ess": ess[i].item(),
+                "ensemble_spread_pre_resample": ensemble_spread_pre[i].item() if y_curr is not None else 0.0,
                 "step_time": elapsed_time,
                 "proposal_log_prob_mean": prop_means[i].item(),
                 "obs_log_prob_mean": obs_means[i].item(),

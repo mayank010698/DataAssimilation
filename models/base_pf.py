@@ -5,6 +5,88 @@ from typing import Dict, Any, Optional
 
 
 # =============================================================================
+# Shared utility functions for filtering methods
+# =============================================================================
+
+
+def compute_unweighted_spread(ensemble: torch.Tensor) -> torch.Tensor:
+    """
+    Compute ensemble spread for unweighted ensembles.
+
+    Args:
+        ensemble: Tensor of shape (N, D) or (B, N, D), where N is ensemble size
+                  and D is state dimension. If a 2D tensor is provided, a
+                  batch dimension of size 1 is assumed.
+
+    Returns:
+        Tensor of shape (B,) with the RMS standard deviation over state
+        dimensions for each batch element.
+    """
+    if ensemble.dim() == 2:
+        ensemble = ensemble.unsqueeze(0)  # (1, N, D)
+    elif ensemble.dim() != 3:
+        raise ValueError(f"Expected ensemble with 2 or 3 dims, got {ensemble.shape}")
+
+    # Variance over ensemble members, per state dimension
+    var_per_dim = torch.var(ensemble, dim=1, unbiased=False)  # (B, D)
+    # Mean variance over dimensions, then sqrt to get RMS std
+    mean_var = torch.mean(var_per_dim, dim=1)  # (B,)
+    spread = torch.sqrt(mean_var)
+    return spread
+
+
+def compute_weighted_spread(ensemble: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """
+    Compute ensemble spread for weighted ensembles (e.g. particle filters).
+
+    Args:
+        ensemble: Tensor of shape (N, D) or (B, N, D).
+        weights:  Tensor of shape (N,) or (B, N). Weights are assumed to be
+                  non-negative and will be renormalized internally to sum to 1
+                  along the ensemble dimension.
+
+    Returns:
+        Tensor of shape (B,) with the RMS standard deviation over state
+        dimensions for each batch element.
+    """
+    if ensemble.dim() == 2:
+        ensemble = ensemble.unsqueeze(0)  # (1, N, D)
+    if weights.dim() == 1:
+        weights = weights.unsqueeze(0)  # (1, N)
+
+    if ensemble.dim() != 3 or weights.dim() != 2:
+        raise ValueError(
+            f"Expected ensemble (B, N, D) and weights (B, N), "
+            f"got ensemble {ensemble.shape}, weights {weights.shape}"
+        )
+
+    # Normalize weights along ensemble dimension
+    w = torch.clamp(weights, min=0.0)
+    w_sum = torch.sum(w, dim=1, keepdim=True)  # (B, 1)
+    # Avoid division by zero: if all weights are zero, fall back to uniform
+    zero_mask = (w_sum.squeeze(-1) == 0)
+    if zero_mask.any():
+        # Replace zero-sum rows with uniform weights
+        n_particles = w.shape[1]
+        w[zero_mask] = 1.0
+        w_sum[zero_mask] = float(n_particles)
+
+    w = w / w_sum  # (B, N)
+
+    # Weighted mean over ensemble members
+    w_expanded = w.unsqueeze(-1)  # (B, N, 1)
+    mean = torch.sum(w_expanded * ensemble, dim=1, keepdim=True)  # (B, 1, D)
+
+    # Weighted variance per dimension
+    diff = ensemble - mean  # (B, N, D)
+    var_per_dim = torch.sum(w_expanded * diff * diff, dim=1)  # (B, D)
+
+    mean_var = torch.mean(var_per_dim, dim=1)  # (B,)
+    spread = torch.sqrt(mean_var)
+    return spread
+
+
+# =============================================================================
 # Single Base Class for All Filtering Methods
 # =============================================================================
 
