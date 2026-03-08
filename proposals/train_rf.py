@@ -75,6 +75,18 @@ def train_rectified_flow(
     debug_random_prev_state: bool = False,
     use_time_step: bool = False,
     trajectory_length: int = 1000,
+    # Gated correction args
+    use_gated_obs_correction: bool = False,
+    gate_type: str = 'scalar',
+    gate_hidden_dim: int = 64,
+    gate_init_bias: float = 0.0,
+    prior_zero_init: bool = True,
+    obs_zero_init: bool = False,
+    # Previous-state corruption (training-only, annealed)
+    prev_state_corr_p0: float = 0.0,
+    prev_state_corr_p_min: float = 0.05,
+    prev_state_corr_sigma: float = 0.0,
+    prev_state_corr_mask_ratio: float = 0.0,
 ):
     """
     Train a rectified flow proposal distribution
@@ -111,6 +123,10 @@ def train_rectified_flow(
         debug_random_prev_state: If True, replace previous state with random vectors (for debugging)
         use_time_step: Whether to condition on trajectory time step
         trajectory_length: Length of trajectory for time step normalization
+        prev_state_corr_p0: Initial probability of corrupting x_prev (annealed to p_min)
+        prev_state_corr_p_min: Minimum corruption probability
+        prev_state_corr_sigma: Gaussian noise std for corruption (0 = off)
+        prev_state_corr_mask_ratio: Fraction of state dims to zero (0 = off)
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -157,8 +173,9 @@ def train_rectified_flow(
     logger_obj.info(f"Use time step conditioning: {use_time_step}")
     if use_time_step:
         logger_obj.info(f"Trajectory length (for normalization): {trajectory_length}")
+    logger_obj.info(f"Prev-state corruption: p0={prev_state_corr_p0}, p_min={prev_state_corr_p_min}, sigma={prev_state_corr_sigma}, mask_ratio={prev_state_corr_mask_ratio}")
     
-    # Create data module
+    # Create data module and get total training steps for annealing
     data_module = RFDataModule(
         data_dir=data_dir,
         batch_size=batch_size,
@@ -167,6 +184,10 @@ def train_rectified_flow(
         use_observations=use_observations,
         obs_components=obs_indices,
     )
+    data_module.setup('fit')
+    num_batches = len(data_module.train_dataloader())
+    total_training_steps = num_batches * max_epochs
+    logger_obj.info(f"Training batches per epoch: {num_batches}, total steps: {total_training_steps}")
     
     # Create model
     model = RFProposal(
@@ -198,6 +219,19 @@ def train_rectified_flow(
         debug_random_prev_state=debug_random_prev_state,
         use_time_step=use_time_step,
         trajectory_length=trajectory_length,
+        # Gated correction
+        use_gated_obs_correction=use_gated_obs_correction,
+        gate_type=gate_type,
+        gate_hidden_dim=gate_hidden_dim,
+        gate_init_bias=gate_init_bias,
+        prior_zero_init=prior_zero_init,
+        obs_zero_init=obs_zero_init,
+        # Previous-state corruption
+        prev_state_corr_p0=prev_state_corr_p0,
+        prev_state_corr_p_min=prev_state_corr_p_min,
+        prev_state_corr_total_steps=total_training_steps,
+        prev_state_corr_sigma=prev_state_corr_sigma,
+        prev_state_corr_mask_ratio=prev_state_corr_mask_ratio,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -274,6 +308,15 @@ def train_rectified_flow(
         "debug_random_prev_state": debug_random_prev_state,
         "use_time_step": use_time_step,
         "trajectory_length": trajectory_length,
+        "use_gated_obs_correction": use_gated_obs_correction,
+        "gate_type": gate_type,
+        "gate_hidden_dim": gate_hidden_dim,
+        "prior_zero_init": prior_zero_init,
+        "obs_zero_init": obs_zero_init,
+        "prev_state_corr_p0": prev_state_corr_p0,
+        "prev_state_corr_p_min": prev_state_corr_p_min,
+        "prev_state_corr_sigma": prev_state_corr_sigma,
+        "prev_state_corr_mask_ratio": prev_state_corr_mask_ratio,
     })
     
     # Setup trainer
@@ -351,6 +394,20 @@ def main():
     parser.add_argument('--trajectory_length', type=int, default=None,
                         help='Length of trajectory (for time step normalization). Defaults to config.yaml value.')
     
+    # Gated Obs Correction arguments
+    parser.add_argument('--use-gated-obs-correction', action='store_true',
+                        help='Use gated observation correction branch')
+    parser.add_argument('--gate-type', type=str, default='scalar', choices=['scalar', 'spatial'],
+                        help='Type of gate: scalar (shared) or spatial (ResNet1D only)')
+    parser.add_argument('--gate-hidden-dim', type=int, default=64,
+                        help='Hidden dimension for gate network')
+    parser.add_argument('--gate-init-bias', type=float, default=0.0,
+                        help='Initial bias for gate output (sigmoid(bias) = initial gate value)')
+    parser.add_argument('--prior-zero-init', action=argparse.BooleanOptionalAction, default=True,
+                        help='Zero-initialize prior branch output head (default: True)')
+    parser.add_argument('--obs-zero-init', action=argparse.BooleanOptionalAction, default=False,
+                        help='Zero-initialize obs branch output head (default: False)')
+    
     # Training arguments
     parser.add_argument('--batch_size', type=int, default=64,
                         help='Batch size')
@@ -396,6 +453,16 @@ def main():
                         help='Replace observations with random vectors (for debugging)')
     parser.add_argument('--debug_random_prev_state', action='store_true',
                         help='Replace previous state with random vectors (for debugging)')
+
+    # Previous-state corruption (training-only, annealed)
+    parser.add_argument('--prev_state_corr_p0', type=float, default=0.0,
+                        help='Initial probability of corrupting x_prev (annealed to p_min)')
+    parser.add_argument('--prev_state_corr_p_min', type=float, default=0.05,
+                        help='Minimum corruption probability')
+    parser.add_argument('--prev_state_corr_sigma', type=float, default=0.0,
+                        help='Gaussian noise std for previous-state corruption (0 = off)')
+    parser.add_argument('--prev_state_corr_mask_ratio', type=float, default=0.0,
+                        help='Fraction of state dims to zero when corrupting (0 = off)')
 
     args = parser.parse_args()
     
@@ -484,6 +551,16 @@ def main():
             debug_random_prev_state=args.debug_random_prev_state,
             use_time_step=args.use_time_step,
             trajectory_length=trajectory_length,
+            use_gated_obs_correction=args.use_gated_obs_correction,
+            gate_type=args.gate_type,
+            gate_hidden_dim=args.gate_hidden_dim,
+            gate_init_bias=args.gate_init_bias,
+            prior_zero_init=args.prior_zero_init,
+            obs_zero_init=args.obs_zero_init,
+            prev_state_corr_p0=args.prev_state_corr_p0,
+            prev_state_corr_p_min=args.prev_state_corr_p_min,
+            prev_state_corr_sigma=args.prev_state_corr_sigma,
+            prev_state_corr_mask_ratio=args.prev_state_corr_mask_ratio,
         )
         checkpoint_to_eval = best_checkpoint
     else:

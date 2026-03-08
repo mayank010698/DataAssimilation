@@ -17,9 +17,17 @@ import logging
 
 # Handle both package import and direct script execution
 try:
-    from .architectures import create_velocity_network, BaseVelocityNetwork
+    from .architectures import (
+        create_velocity_network,
+        BaseVelocityNetwork,
+        GatedVelocityNetwork,
+    )
 except ImportError:
-    from architectures import create_velocity_network, BaseVelocityNetwork
+    from architectures import (
+        create_velocity_network,
+        BaseVelocityNetwork,
+        GatedVelocityNetwork,
+    )
 
 
 class RFProposal(pl.LightningModule):
@@ -77,6 +85,20 @@ class RFProposal(pl.LightningModule):
         debug_random_prev_state: bool = False,
         use_time_step: bool = False,
         trajectory_length: int = 1000,
+        # Gated observation-correction branch
+        use_gated_obs_correction: bool = False,
+        gate_type: str = 'scalar',  # 'scalar' | 'spatial'
+        gate_hidden_dim: int = 64,
+        gate_init_bias: float = 0.0,
+        # Output head initialization control (mainly for ResNet1D)
+        prior_zero_init: bool = True,
+        obs_zero_init: bool = False,
+        # Previous-state corruption (training-only, annealed) to force observation usage
+        prev_state_corr_p0: float = 0.0,
+        prev_state_corr_p_min: float = 0.05,
+        prev_state_corr_total_steps: Optional[int] = None,
+        prev_state_corr_sigma: float = 0.0,
+        prev_state_corr_mask_ratio: float = 0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -98,27 +120,73 @@ class RFProposal(pl.LightningModule):
         self.debug_random_prev_state = debug_random_prev_state
         self.use_time_step = use_time_step
         self.trajectory_length = trajectory_length
+        self.use_gated_obs_correction = use_gated_obs_correction
+        self.gate_type = gate_type
+        self.gate_hidden_dim = gate_hidden_dim
+        self.gate_init_bias = gate_init_bias
+        self.prior_zero_init = prior_zero_init
+        self.obs_zero_init = obs_zero_init
+        self.prev_state_corr_p0 = prev_state_corr_p0
+        self.prev_state_corr_p_min = prev_state_corr_p_min
+        self.prev_state_corr_total_steps = prev_state_corr_total_steps
+        self.prev_state_corr_sigma = prev_state_corr_sigma
+        self.prev_state_corr_mask_ratio = prev_state_corr_mask_ratio
+
+        if self.use_gated_obs_correction and self.obs_dim == 0:
+            raise ValueError(
+                "use_gated_obs_correction=True requires obs_dim > 0. "
+                "Enable observations (use_observations) and set obs_dim accordingly."
+            )
         
-        # Create velocity network using factory
-        self.velocity_net = create_velocity_network(
-            architecture=architecture,
-            state_dim=state_dim,
-            obs_dim=obs_dim,
-            conditioning_method=train_cond_method,
-            use_time_step=use_time_step,
-            # MLP-specific
-            hidden_dim=hidden_dim,
-            depth=depth,
-            # ResNet1D-specific
-            channels=channels,
-            num_blocks=num_blocks,
-            kernel_size=kernel_size,
-            # Shared
-            cond_embed_dim=cond_embed_dim,
-            num_attn_heads=num_attn_heads,
-            time_embed_dim=time_embed_dim,
-            obs_indices=obs_indices,
-        )
+        # Create velocity network
+        if self.use_gated_obs_correction:
+            # Wrapper that splits into prior and obs-conditioned branches with a learnable gate
+            self.velocity_net = GatedVelocityNetwork(
+                architecture=architecture,
+                state_dim=state_dim,
+                obs_dim=obs_dim,
+                obs_indices=obs_indices,
+                conditioning_method=train_cond_method,
+                use_time_step=use_time_step,
+                # Gating-specific
+                gate_type=gate_type,
+                gate_hidden_dim=gate_hidden_dim,
+                gate_init_bias=gate_init_bias,
+                prior_zero_init=prior_zero_init,
+                obs_zero_init=obs_zero_init,
+                # MLP-specific
+                hidden_dim=hidden_dim,
+                depth=depth,
+                # ResNet1D-specific
+                channels=channels,
+                num_blocks=num_blocks,
+                kernel_size=kernel_size,
+                # Shared conditioning
+                cond_embed_dim=cond_embed_dim,
+                num_attn_heads=num_attn_heads,
+                time_embed_dim=time_embed_dim,
+            )
+        else:
+            # Original single-branch velocity network
+            self.velocity_net = create_velocity_network(
+                architecture=architecture,
+                state_dim=state_dim,
+                obs_dim=obs_dim,
+                conditioning_method=train_cond_method,
+                use_time_step=use_time_step,
+                # MLP-specific
+                hidden_dim=hidden_dim,
+                depth=depth,
+                # ResNet1D-specific
+                channels=channels,
+                num_blocks=num_blocks,
+                kernel_size=kernel_size,
+                # Shared
+                cond_embed_dim=cond_embed_dim,
+                num_attn_heads=num_attn_heads,
+                time_embed_dim=time_embed_dim,
+                obs_indices=obs_indices,
+            )
         
         # For tracking training progress
         self.training_step_outputs = []
@@ -185,34 +253,83 @@ class RFProposal(pl.LightningModule):
             )
 
         return t.float() / self.trajectory_length
-    
+
+    def _get_corruption_prob(self) -> float:
+        """Current corruption probability p(t) = max(p_min, p_0 * (1 - t/T)). Returns 0 if corruption disabled."""
+        if self.prev_state_corr_total_steps is None or self.prev_state_corr_total_steps <= 0:
+            return 0.0
+        if self.prev_state_corr_p0 <= 0:
+            return 0.0
+        try:
+            step = self.trainer.global_step
+        except RuntimeError:
+            step = 0
+        progress = min(1.0, step / max(1, self.prev_state_corr_total_steps))
+        return max(
+            self.prev_state_corr_p_min,
+            self.prev_state_corr_p0 * (1.0 - progress),
+        )
+
+    def _corrupt_prev_state(self, x_prev: torch.Tensor) -> Tuple[torch.Tensor, float]:
+        """
+        With per-sample probability p(t), corrupt x_prev: add Gaussian noise then optionally mask.
+        Returns (corrupted x_prev, fraction of batch corrupted).
+        """
+        batch_size = x_prev.shape[0]
+        p = self._get_corruption_prob()
+        if p <= 0 or (self.prev_state_corr_sigma <= 0 and self.prev_state_corr_mask_ratio <= 0):
+            return x_prev, 0.0
+
+        out = x_prev.clone()
+        which = torch.rand(batch_size, device=x_prev.device) < p
+        n_corr = which.sum().item()
+        if n_corr == 0:
+            return out, 0.0
+
+        if self.prev_state_corr_sigma > 0:
+            noise = self.prev_state_corr_sigma * torch.randn_like(x_prev, device=x_prev.device)
+            out = out + noise * which.unsqueeze(1).float()
+
+        if self.prev_state_corr_mask_ratio > 0:
+            n_mask = max(1, int(round(self.state_dim * self.prev_state_corr_mask_ratio)))
+            for i in range(batch_size):
+                if which[i]:
+                    idx = torch.randperm(self.state_dim, device=x_prev.device)[:n_mask]
+                    out[i, idx] = 0.0
+
+        return out, n_corr / batch_size
+
     def compute_rf_loss(
         self,
         x_prev: torch.Tensor,
         x_curr: torch.Tensor,
         y_curr: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
+        x_prev_cond: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute Rectified Flow training loss
         
-        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev, y) - (target - z)||^2
-        where x(t) = (1-t)*z + t*target is the straight-line interpolation
+        The loss is: E_{t~U(0,1), z~N(0,I)} ||v_θ(x(t), t | x_prev_cond, y) - (target - z)||^2
+        where x(t) = (1-t)*z + t*target is the straight-line interpolation.
+        Target always uses true x_prev; conditioning uses x_prev_cond if provided else x_prev.
         
         If predict_delta=False (default): target = x_curr
         If predict_delta=True: target = x_curr - x_prev (learn increment)
         
         Args:
-            x_prev: Previous states, shape (batch, state_dim)
+            x_prev: Previous states (used for target), shape (batch, state_dim)
             x_curr: Current states, shape (batch, state_dim)
             y_curr: Current observations, shape (batch, obs_dim) or None
             t: Trajectory time step, shape (batch,) or None
+            x_prev_cond: Conditioning for velocity net (e.g. corrupted); if None, use x_prev
             
         Returns:
             loss: Scalar loss
             metrics: Dictionary of metrics for logging
         """
         batch_size = x_prev.shape[0]
+        x_cond = x_prev if x_prev_cond is None else x_prev_cond
         
         # Sample random times t ~ U(0,1)
         s = torch.rand(batch_size, 1, device=self.device)
@@ -220,7 +337,7 @@ class RFProposal(pl.LightningModule):
         # Sample noise z ~ N(0, I)
         z = torch.randn_like(x_curr)
         
-        # Determine target based on mode
+        # Determine target based on mode (always use true x_prev)
         if self.predict_delta:
             # Learn the increment (residual structure)
             target = x_curr - x_prev
@@ -241,8 +358,8 @@ class RFProposal(pl.LightningModule):
             caller_name="compute_rf_loss",
         )
         
-        # Predicted velocity
-        pred_velocity = self.velocity_net(x_s, s, x_prev, y_curr, t_normalized)
+        # Predicted velocity (conditioned on x_cond, possibly corrupted)
+        pred_velocity = self.velocity_net(x_s, s, x_cond, y_curr, t_normalized)
         
         # MSE loss
         loss = torch.mean((pred_velocity - target_velocity) ** 2)
@@ -274,13 +391,31 @@ class RFProposal(pl.LightningModule):
         if self.training and self.cond_dropout > 0:
             if torch.rand(1, device=self.device).item() < self.cond_dropout:
                 y_curr = None
-        
-        # Compute loss
-        loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr, t=time_idx)
+
+        # Previous-state corruption (training-only, annealed)
+        x_prev_cond = None
+        corr_frac = 0.0
+        corruption_active = (
+            self.prev_state_corr_p0 > 0
+            and self.prev_state_corr_total_steps is not None
+            and self.prev_state_corr_total_steps > 0
+            and (self.prev_state_corr_sigma > 0 or self.prev_state_corr_mask_ratio > 0)
+        )
+        if corruption_active:
+            x_prev_cond, corr_frac = self._corrupt_prev_state(x_prev)
+        p_corr = self._get_corruption_prob() if corruption_active else 0.0
+
+        # Compute loss (target uses true x_prev; velocity net uses x_prev_cond when corrupted)
+        loss, metrics = self.compute_rf_loss(
+            x_prev, x_curr, y_curr, t=time_idx, x_prev_cond=x_prev_cond
+        )
         
         # Log metrics
         self.log('train_loss', metrics['loss'], on_step=True, on_epoch=True, prog_bar=True)
         self.log('train_velocity_norm', metrics['velocity_norm'], on_step=False, on_epoch=True)
+        if corruption_active:
+            self.log('train_corr_prob', p_corr, on_step=True, on_epoch=True)
+            self.log('train_corr_frac', corr_frac, on_step=True, on_epoch=True)
         
         self.training_step_outputs.append(metrics)
         
@@ -987,6 +1122,53 @@ def test_rectified_flow():
     assert x_sample_guided_lp.shape == (batch_size, state_dim)
     assert log_prob_guided.shape == (batch_size,)
     
+    # Test Gated Architecture
+    print("\n=== Testing Gated Architecture ===")
+    rf_gated = RFProposal(
+        state_dim=state_dim,
+        architecture='mlp',
+        hidden_dim=64,
+        depth=3,
+        num_sampling_steps=10,
+        use_gated_obs_correction=True,
+        gate_type='scalar',
+        obs_dim=1, # Need obs_dim > 0
+    )
+    
+    x_prev = torch.randn(batch_size, state_dim)
+    y_curr = torch.randn(batch_size, 1) # obs_dim=1
+    x_curr = torch.randn(batch_size, state_dim)
+    
+    loss_gated, _ = rf_gated.compute_rf_loss(x_prev, x_curr, y_curr)
+    print(f"✓ Gated MLP Loss: {loss_gated.item():.6f}")
+    
+    x_sample_gated = rf_gated.sample(x_prev, y_curr=y_curr)
+    print(f"✓ Gated MLP Sampling: {x_sample_gated.shape}")
+    assert x_sample_gated.shape == (batch_size, state_dim)
+    
+    # Test Spatial Gate (ResNet1D)
+    print("\n=== Testing Gated ResNet1D (Spatial) ===")
+    rf_gated_resnet = RFProposal(
+        state_dim=state_dim_l96,
+        architecture='resnet1d',
+        channels=32,
+        num_blocks=2,
+        use_gated_obs_correction=True,
+        gate_type='spatial',
+        obs_dim=state_dim_l96, # Full obs for simplicity
+    )
+    
+    x_prev_l96 = torch.randn(batch_size, state_dim_l96)
+    y_curr_l96 = torch.randn(batch_size, state_dim_l96)
+    x_curr_l96 = torch.randn(batch_size, state_dim_l96)
+    
+    loss_gated_resnet, _ = rf_gated_resnet.compute_rf_loss(x_prev_l96, x_curr_l96, y_curr_l96)
+    print(f"✓ Gated ResNet1D (Spatial) Loss: {loss_gated_resnet.item():.6f}")
+    
+    x_sample_gated_resnet = rf_gated_resnet.sample(x_prev_l96, y_curr=y_curr_l96)
+    print(f"✓ Gated ResNet1D (Spatial) Sampling: {x_sample_gated_resnet.shape}")
+    assert x_sample_gated_resnet.shape == (batch_size, state_dim_l96)
+
     print("\n✓ All tests passed!")
 
 

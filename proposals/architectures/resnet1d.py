@@ -143,6 +143,7 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         time_embed_dim: int = 64,
         dropout: float = 0.0,
         use_time_step: bool = False,
+        zero_init_output: bool = True,
     ):
         # We don't use the base class conditioning_method argument since this architecture is fixed
         super().__init__(state_dim, obs_dim, conditioning_method='adaln')
@@ -207,8 +208,9 @@ class ResNet1DVelocityNetwork(BaseVelocityNetwork):
         self.output_proj = nn.Conv1d(channels, 1, kernel_size=1)
         
         # Zero-init output projection for "start from identity/zero-velocity" behavior
-        nn.init.constant_(self.output_proj.weight, 0)
-        nn.init.constant_(self.output_proj.bias, 0)
+        if zero_init_output:
+            nn.init.constant_(self.output_proj.weight, 0)
+            nn.init.constant_(self.output_proj.bias, 0)
 
     def forward(
         self, 

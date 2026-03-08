@@ -26,7 +26,7 @@ L96_OPTS=(
     --l96-init-low -10
     --l96-init-high 10
     --num-trajectories 2048
-    --process-noise-variations "0.0,0.1"
+    --process-noise-variations "0.0,0.1,0.2"
     --observation-operators "identity,quad_capped_10"
     --seed 42
     --force

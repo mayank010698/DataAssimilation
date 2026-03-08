@@ -10,6 +10,7 @@ from .base import BaseVelocityNetwork
 from .mlp import MLPVelocityNetwork
 from .resnet1d import ResNet1DVelocityNetwork
 from .resnet1d_deterministic import ResNet1DDeterministic
+from .gated import GatedVelocityNetwork
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -80,6 +81,7 @@ def create_velocity_network(
             time_embed_dim=kwargs.get('time_embed_dim', 64),
             dropout=kwargs.get('dropout', 0.0),
             use_time_step=use_time_step,
+            zero_init_output=kwargs.get('zero_init_output', True),
         )
     else:
         raise ValueError(
@@ -95,6 +97,7 @@ __all__ = [
     # Velocity networks
     'MLPVelocityNetwork',
     'ResNet1DVelocityNetwork',
+    'GatedVelocityNetwork',
     # Deterministic networks
     'ResNet1DDeterministic',
     # Conditioning modules

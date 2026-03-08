@@ -307,6 +307,10 @@ def run_proposal_eval(
             "model/depth": model.hparams.get("depth"),
             "model/channels": model.hparams.get("channels"),
             "model/num_blocks": model.hparams.get("num_blocks"),
+            "model/use_gated_obs_correction": model.hparams.get("use_gated_obs_correction", False),
+            "model/gate_type": model.hparams.get("gate_type", "scalar"),
+            "model/prior_zero_init": model.hparams.get("prior_zero_init", True),
+            "model/obs_zero_init": model.hparams.get("obs_zero_init", False),
         }
         wandb_run.config.update(wandb_config)
     

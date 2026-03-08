@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import random
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -681,6 +682,7 @@ def parse_args():
     parser.add_argument("--wandb-tags", type=str, default="")
     parser.add_argument("--disable-wandb", action="store_true", default=False)
     parser.add_argument("--save-dir", type=str, default=None, help="Directory to save trajectory data (default: auto-generated)")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility (sets numpy, torch, etc.)")
 
     return parser.parse_args()
 
@@ -1238,6 +1240,14 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
 
 def main():
     args = parse_args()
+
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        logging.info(f"Random seed set to {args.seed}")
     
     logging.basicConfig(
         level=getattr(logging, args.log_level.upper(), logging.INFO),
