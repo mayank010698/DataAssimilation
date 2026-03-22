@@ -405,7 +405,8 @@ def run_proposal_eval(
             "crps_sum": 0.0,
             "obs_error_sum": 0.0,
             "obs_error_count": 0,
-            "count": 0
+            "count": 0,
+            "reynolds": None,
         } for i in range(n_trajectories)
     }
     
@@ -517,6 +518,10 @@ def run_proposal_eval(
         for k, idx in enumerate(valid_mask):
             tid = traj_idxs[idx]
             t = time_idxs[idx]
+            if "reynolds" in batch and trajectory_results[tid]["reynolds"] is None:
+                trajectory_results[tid]["reynolds"] = float(batch["reynolds"][idx].item())
+            elif "u" in batch and trajectory_results[tid]["reynolds"] is None:
+                trajectory_results[tid]["reynolds"] = float(batch["u"][idx].item())
             
             # Generated ensemble (Scaled)
             x_gen_k = x_next_stack[k] # (K, D)
@@ -593,6 +598,7 @@ def run_proposal_eval(
                 "x_std": torch.std(x_gen_orig_k, dim=0, correction=0).cpu().numpy(), # Std dev for uncertainty
                 "observation": obs_np,
                 "has_observation": has_obs,
+                "reynolds": trajectory_results[tid]["reynolds"],
                 "rmse": rmse,
                 "crps": crps,
                 "obs_error": obs_error
@@ -621,6 +627,7 @@ def run_proposal_eval(
             
             res["mean_rmse"] = mean_traj_rmse
             res["mean_crps"] = mean_traj_crps
+            res["reynolds"] = res.get("reynolds")
             
             if res["obs_error_count"] > 0:
                 res["mean_obs_error"] = res["obs_error_sum"] / res["obs_error_count"]

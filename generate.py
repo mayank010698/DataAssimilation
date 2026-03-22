@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
 import random
 import torch
@@ -18,9 +19,14 @@ from data import (
     KuramotoSivashinsky,
     generate_dataset_directory_name,
     save_config_yaml,
+    save_kolmogorov_config_yaml,
     generate_dataset_splits,
     save_generated_data,
     observations_from_trajectories,
+    generate_kolmogorov_data,
+    generate_kolmogorov_data_subset,
+    merge_kolmogorov_data_parts,
+    KolmogorovConfig,
 )
 
 
@@ -45,7 +51,7 @@ def parse_args():
     parser.add_argument(
         "--system",
         type=str,
-        choices=["lorenz63", "lorenz96", "ks", "kuramoto-sivashinsky"],
+        choices=["lorenz63", "lorenz96", "ks", "kuramoto-sivashinsky", "kolmogorov"],
         default="lorenz63",
         help="Dynamical system to use",
     )
@@ -120,6 +126,17 @@ def parse_args():
     parser.add_argument("--ks-L", type=float, default=None, help="Domain size L for KS (default: 16*pi or 32*pi depending on usage)")
     parser.add_argument("--ks-init-std", type=float, default=1.0, help="Initial standard deviation for KS")
 
+    # System parameters (Kolmogorov flow) — only used when --system kolmogorov
+    parser.add_argument("--kol-grid-size", type=int, default=150, help="Spatial grid resolution for Kolmogorov (size x size)")
+    parser.add_argument("--kol-num-steps", type=int, default=200, help="Timesteps to save after warmup for Kolmogorov")
+    parser.add_argument("--kol-warmup-steps", type=int, default=100, help="Burn-in steps for Kolmogorov")
+    parser.add_argument("--kol-dt", type=float, default=0.04, help="Time step for Kolmogorov")
+    parser.add_argument("--re-min", type=float, default=500.0, help="Minimum Reynolds number for Kolmogorov")
+    parser.add_argument("--re-max", type=float, default=1500.0, help="Maximum Reynolds number for Kolmogorov")
+    parser.add_argument("--obs-grid-size", type=int, default=150,
+                        help="Observation grid resolution for Kolmogorov (obs_grid_size x obs_grid_size). "
+                             "150 = fully observed; 10 = paper's sparse 100-point grid.")
+
     # Data splits
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -152,6 +169,33 @@ def parse_args():
         help="Random seed for reproducibility (default: None)",
     )
 
+    # Kolmogorov flow: parallel PDE rollout (JAX-based, offline generation)
+    parser.add_argument(
+        "--kol-mode",
+        type=str,
+        choices=["full", "worker", "merge"],
+        default="full",
+        help="Kolmogorov generation mode (internal: use worker/merge with parallel rollout).",
+    )
+    parser.add_argument(
+        "--kol-parallel-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs to use for the Kolmogorov PDE rollout (default: 1).",
+    )
+    parser.add_argument(
+        "--kol-worker-start",
+        type=int,
+        default=None,
+        help="Global trajectory start index for kol-mode=worker.",
+    )
+    parser.add_argument(
+        "--kol-worker-end",
+        type=int,
+        default=None,
+        help="Global trajectory end index (exclusive) for kol-mode=worker.",
+    )
+
     # Logging configuration
     parser.add_argument("--log-level", type=str, default="INFO")
 
@@ -179,6 +223,304 @@ def main():
     print("Dataset Generation for Data Assimilation")
     print("=" * 80)
 
+    # -------------------------------------------------------------------------
+    # Kolmogorov flow — separate pipeline (JAX-based, saves .npz)
+    # -------------------------------------------------------------------------
+    if args.system == "kolmogorov":
+        import math
+
+        base_seed = args.seed if args.seed is not None else 42
+        g = args.kol_grid_size
+        output_base = Path(args.output_dir)
+        output_base.mkdir(parents=True, exist_ok=True)
+
+        dt_str = f"{args.kol_dt:.4f}".replace(".", "p")
+        re_min_str = f"{args.re_min:.1f}".replace(".", "p")
+        re_max_str = f"{args.re_max:.1f}".replace(".", "p")
+        pde_dir_name = (
+            f"kolmogorov_pde_n{args.num_trajectories}"
+            f"_len{args.kol_num_steps}"
+            f"_warm{args.kol_warmup_steps}"
+            f"_dt{dt_str}"
+            f"_re{re_min_str}to{re_max_str}"
+            f"_grid{g}"
+            f"_seed{base_seed}"
+        )
+        pde_dir = output_base / pde_dir_name
+        pde_npz_path = pde_dir / "kolmogorov_data.npz"
+        parts_dir = pde_dir / "parts"
+
+        # ---------------------------------------------------------------------
+        # Internal modes: worker + merge
+        # ---------------------------------------------------------------------
+        if args.kol_mode == "worker":
+            if args.kol_worker_start is None or args.kol_worker_end is None:
+                raise ValueError("kol-mode=worker requires --kol-worker-start and --kol-worker-end")
+
+            start = int(args.kol_worker_start)
+            end = int(args.kol_worker_end)
+            if start < 0 or end <= start or end > args.num_trajectories:
+                raise ValueError(
+                    f"Invalid worker range start={start}, end={end} for num-trajectories={args.num_trajectories}"
+                )
+
+            parts_dir.mkdir(parents=True, exist_ok=True)
+            part_path = parts_dir / f"kolmogorov_data.part_{start:06d}_{end:06d}.npz"
+
+            if part_path.exists() and not args.force:
+                print(f"[worker] Part exists, skipping: {part_path}")
+                return
+
+            print(f"[worker] Generating Kolmogorov subset idx [{start}:{end}) → {part_path}")
+            generate_kolmogorov_data_subset(
+                size=args.kol_grid_size,
+                num_trajectories=args.num_trajectories,
+                num_steps=args.kol_num_steps,
+                warmup_steps=args.kol_warmup_steps,
+                dt=args.kol_dt,
+                re_min=args.re_min,
+                re_max=args.re_max,
+                seed=base_seed,
+                trajectory_indices=np.arange(start, end, dtype=np.int64),
+                output_part_path=part_path,
+            )
+            return
+
+        if args.kol_mode == "merge":
+            if pde_npz_path.exists() and not args.force:
+                print(f"[merge] Final npz exists, skipping: {pde_npz_path}")
+                return
+
+            if not parts_dir.exists():
+                raise FileNotFoundError(f"[merge] parts directory not found: {parts_dir}")
+
+            part_paths = sorted(parts_dir.glob("kolmogorov_data.part_*.npz"))
+            if len(part_paths) == 0:
+                raise FileNotFoundError(f"[merge] No part files found in {parts_dir}")
+
+            print(f"[merge] Merging {len(part_paths)} Kolmogorov parts → {pde_npz_path}")
+            merge_kolmogorov_data_parts(
+                part_paths=[str(p) for p in part_paths],
+                num_trajectories=args.num_trajectories,
+                output_npz_path=pde_npz_path,
+            )
+            return
+
+        # ---------------------------------------------------------------------
+        # Full mode: generate PDE once (optionally parallel), then symlink/copy
+        # into per-dataset directories for different obs-grid / obs-noise variants.
+        # ---------------------------------------------------------------------
+        if args.obs_noise_variations:
+            obs_noise_levels = parse_float_list(args.obs_noise_variations)
+            print(
+                f"Generating Kolmogorov datasets for observation noise std levels: {obs_noise_levels}"
+            )
+        else:
+            obs_noise_levels = [args.obs_noise_std]
+
+        if not pde_npz_path.exists():
+            pde_dir.mkdir(parents=True, exist_ok=True)
+
+            if args.kol_parallel_gpus <= 1:
+                print(f"Generating Kolmogorov PDE rollout (serial) → {pde_npz_path}")
+                generate_kolmogorov_data(
+                    size=args.kol_grid_size,
+                    num_trajectories=args.num_trajectories,
+                    num_steps=args.kol_num_steps,
+                    warmup_steps=args.kol_warmup_steps,
+                    dt=args.kol_dt,
+                    re_min=args.re_min,
+                    re_max=args.re_max,
+                    seed=base_seed,
+                    output_path=pde_dir,
+                )
+            else:
+                # Respect an existing CUDA_VISIBLE_DEVICES mask if the user set one.
+                # JAX workers will see exactly one GPU each after we set CUDA_VISIBLE_DEVICES.
+                visible_env = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+                if visible_env:
+                    visible_gpu_ids = [int(x) for x in visible_env.split(",") if x.strip() != ""]
+                else:
+                    visible_gpu_ids = list(range(int(args.kol_parallel_gpus)))
+
+                world_size = min(len(visible_gpu_ids), int(args.kol_parallel_gpus), args.num_trajectories)
+                chunk_size = int(math.ceil(args.num_trajectories / world_size))
+                parts_dir.mkdir(parents=True, exist_ok=True)
+
+                print(
+                    f"Generating Kolmogorov PDE rollout (parallel across {world_size} GPUs) → {pde_npz_path}"
+                )
+
+                procs = []
+                for rank in range(world_size):
+                    start = rank * chunk_size
+                    end = min((rank + 1) * chunk_size, args.num_trajectories)
+                    if start >= end:
+                        continue
+
+                    # We assume GPU ids 0..world_size-1 exist; CUDA_VISIBLE_DEVICES
+                    # remaps so each worker sees a single GPU as device 0.
+                    env = os.environ.copy()
+                    env["CUDA_VISIBLE_DEVICES"] = str(visible_gpu_ids[rank])
+
+                    cmd = [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--system",
+                        "kolmogorov",
+                        "--kol-mode",
+                        "worker",
+                        "--output-dir",
+                        str(output_base),
+                        "--seed",
+                        str(base_seed),
+                        "--num-trajectories",
+                        str(args.num_trajectories),
+                        "--kol-grid-size",
+                        str(args.kol_grid_size),
+                        "--kol-num-steps",
+                        str(args.kol_num_steps),
+                        "--kol-warmup-steps",
+                        str(args.kol_warmup_steps),
+                        "--kol-dt",
+                        str(args.kol_dt),
+                        "--re-min",
+                        str(args.re_min),
+                        "--re-max",
+                        str(args.re_max),
+                        "--kol-worker-start",
+                        str(start),
+                        "--kol-worker-end",
+                        str(end),
+                    ]
+                    if args.force:
+                        cmd.append("--force")
+
+                    print(f"  [orchestrator] launching worker rank={rank} idx[{start}:{end})")
+                    procs.append(subprocess.Popen(cmd, env=env))
+
+                for p in procs:
+                    ret = p.wait()
+                    if ret != 0:
+                        raise RuntimeError(f"Kolmogorov worker process failed with exit code {ret}")
+
+                # Merge after workers finish.
+                merge_cmd = [
+                    sys.executable,
+                    str(Path(__file__).resolve()),
+                    "--system",
+                    "kolmogorov",
+                    "--kol-mode",
+                    "merge",
+                    "--output-dir",
+                    str(output_base),
+                    "--seed",
+                    str(base_seed),
+                    "--num-trajectories",
+                    str(args.num_trajectories),
+                    "--kol-grid-size",
+                    str(args.kol_grid_size),
+                    "--kol-num-steps",
+                    str(args.kol_num_steps),
+                    "--kol-warmup-steps",
+                    str(args.kol_warmup_steps),
+                    "--kol-dt",
+                    str(args.kol_dt),
+                    "--re-min",
+                    str(args.re_min),
+                    "--re-max",
+                    str(args.re_max),
+                ]
+                if args.force:
+                    merge_cmd.append("--force")
+                subprocess.run(merge_cmd, check=True)
+
+        # Link/copy the shared PDE rollout into each per-observation dataset directory.
+        for obs_noise_idx, obs_noise in enumerate(obs_noise_levels):
+            # Keep backward-compatible directory naming for the common case:
+            # single variant with obs_noise_std == 0.0.
+            single_variant_default_name = (
+                args.dataset_name is not None
+                and len(obs_noise_levels) == 1
+                and abs(obs_noise - obs_noise_levels[0]) < 1e-12
+            )
+
+            if args.dataset_name:
+                if single_variant_default_name:
+                    dataset_dir_name = args.dataset_name
+                else:
+                    dataset_dir_name = f"{args.dataset_name}_obs{obs_noise:.3f}".replace(".", "p")
+            else:
+                dataset_dir_name = (
+                    f"kolmogorov_n{args.num_trajectories}"
+                    f"_len{args.kol_num_steps}"
+                    f"_dt{args.kol_dt:.4f}".replace(".", "p")
+                    + f"_grid{g}"
+                    f"_obs{args.obs_grid_size}x{args.obs_grid_size}"
+                )
+                if (len(obs_noise_levels) > 1) or (obs_noise != 0.0):
+                    dataset_dir_name = (
+                        f"{dataset_dir_name}_obsnoise{obs_noise:.3f}".replace(".", "p")
+                    )
+
+            dataset_dir = output_base / dataset_dir_name
+            npz_path = dataset_dir / "kolmogorov_data.npz"
+
+            kol_config = KolmogorovConfig(
+                grid_size=args.kol_grid_size,
+                num_trajectories=args.num_trajectories,
+                num_steps=args.kol_num_steps,
+                warmup_steps=args.kol_warmup_steps,
+                dt=args.kol_dt,
+                re_min=args.re_min,
+                re_max=args.re_max,
+                seed=base_seed,
+                obs_frequency=args.obs_frequency,
+                obs_grid_size=args.obs_grid_size,
+                obs_noise_std=obs_noise,
+                obs_noise_seed=base_seed + 1000 * obs_noise_idx,
+                train_ratio=args.train_ratio,
+                val_ratio=args.val_ratio,
+                test_ratio=args.test_ratio,
+            )
+
+            if dataset_dir.exists() and npz_path.exists():
+                if args.force:
+                    response = "y"
+                else:
+                    response = input(
+                        f"\nDataset directory {dataset_dir} already exists. Overwrite? (y/N): "
+                    )
+                if response.lower() != "y":
+                    print("Using existing Kolmogorov trajectory data.")
+                else:
+                    import shutil
+
+                    shutil.rmtree(dataset_dir)
+
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+            if not npz_path.exists():
+                try:
+                    # Use absolute target so relative --output-dir still works.
+                    npz_path.symlink_to(pde_npz_path.resolve())
+                except Exception:
+                    import shutil
+
+                    shutil.copy2(pde_npz_path, npz_path)
+
+            config_path = dataset_dir / "config.yaml"
+            save_kolmogorov_config_yaml(kol_config, config_path)
+            print(f"Kolmogorov dataset ready (obs_noise_std={obs_noise}): {npz_path}")
+
+        print("\n" + "=" * 80)
+        print("Kolmogorov dataset generation completed!")
+        print(f"  Output dir: {output_base}")
+        print("=" * 80)
+        return
+
+    # -------------------------------------------------------------------------
+    # ODE systems (Lorenz-63 / 96, Kuramoto-Sivashinsky)
+    # -------------------------------------------------------------------------
     # Determine system class and parameters
     if args.system == "lorenz63":
         system_class = Lorenz63

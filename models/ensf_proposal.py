@@ -140,7 +140,13 @@ class EnsembleScoreFilterWithProposal(FilteringMethod):
         # EnSF uses unweighted samples (weights are uniform)
         self.weights = torch.ones(batch_size, self.n_particles, device=self.device) / self.n_particles
 
-    def predict_step(self, dt: float, y_curr: Optional[torch.Tensor] = None) -> None:
+    def predict_step(
+        self,
+        dt: float,
+        y_curr: Optional[torch.Tensor] = None,
+        time_idxs: Optional[torch.Tensor] = None,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> None:
         """Propagate particles forward"""
         batch_size = self.particles.shape[0]
         
@@ -159,9 +165,38 @@ class EnsembleScoreFilterWithProposal(FilteringMethod):
         else:
             proposal = self.proposal
 
+        time_flat = None
+        if time_idxs is not None:
+            time_flat = (
+                time_idxs.to(self.device)
+                .unsqueeze(1)
+                .expand(batch_size, self.n_particles)
+                .reshape(batch_size * self.n_particles)
+                .float()
+            )
+
+        static_params_flat = None
+        if static_params:
+            static_params_flat = {}
+            for key, val in static_params.items():
+                if val is None:
+                    continue
+                static_params_flat[key] = (
+                    val.to(self.device)
+                    .unsqueeze(1)
+                    .expand(batch_size, self.n_particles, *val.shape[1:])
+                    .reshape(batch_size * self.n_particles, *val.shape[1:])
+                )
+
         # Sample new particles from the proposal q_φ. These samples define the
         # informed predictive prior in the hybrid EnSF–q_φ formulation.
-        x_new_flat = proposal.sample(particles_flat, y_curr_flat, dt)
+        x_new_flat = proposal.sample(
+            particles_flat,
+            y_curr_flat,
+            dt,
+            t=time_flat,
+            static_params=static_params_flat,
+        )
         
         # Reshape back
         self.particles = x_new_flat.reshape(batch_size, self.n_particles, self.state_dim)
@@ -408,6 +443,7 @@ class EnsembleScoreFilterWithProposal(FilteringMethod):
         dt: float,
         trajectory_idxs: torch.Tensor,
         time_idxs: torch.Tensor,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> List[Dict[str, Any]]:
         """
         EnSF step for a BATCH of trajectories.
@@ -416,7 +452,7 @@ class EnsembleScoreFilterWithProposal(FilteringMethod):
         start_time = time.perf_counter()
         
         # Predict
-        self.predict_step(dt, y_curr)
+        self.predict_step(dt, y_curr, time_idxs=time_idxs, static_params=static_params)
         
         # Update
         batch_size = x_curr.shape[0]

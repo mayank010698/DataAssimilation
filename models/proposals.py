@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 import numpy as np
@@ -20,6 +21,7 @@ class ProposalDistribution(ABC):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Sample x_t ~ q(x_t | x_{t-1}, y_t). t is optional time step (e.g. for time-conditioned RF)."""
         pass
@@ -32,6 +34,7 @@ class ProposalDistribution(ABC):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Compute log q(x_t | x_{t-1}, y_t). t is optional time step (e.g. for time-conditioned RF)."""
         pass
@@ -51,6 +54,7 @@ class TransitionProposal(ProposalDistribution):
         self.process_noise_std = process_noise_std
         self.state_dim = system.state_dim
         # TransitionProposal ALWAYS operates in physical space
+        self._warned_offline_fallback = False
 
     def sample(
         self,
@@ -58,17 +62,41 @@ class TransitionProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Sample from transition dynamics with process noise. t ignored."""
         # Supports both single particle (D,) and batch (N, D)
         is_batch = x_prev.ndim > 1
+        if getattr(self.system, "requires_static_params", False):
+            has_re = static_params is not None and (
+                "reynolds" in static_params or "u" in static_params
+            )
+            if not has_re:
+                raise ValueError(
+                    "TransitionProposal requires static Reynolds params for this system "
+                    "(expected static_params['reynolds'] or static_params['u'])."
+                )
         
         # No preprocessing, operate directly in original space
-        integration = self.system.integrate(x_prev, 2, dt)
-        if is_batch:
-            x_next = integration[:, 1, :]
-        else:
-            x_next = integration[1, :]
+        # Some systems (e.g., Kolmogorov) are offline-only and intentionally
+        # do not implement online dynamics integration.
+        try:
+            integration = self.system.integrate(x_prev, 2, dt, static_params=static_params)
+            if is_batch:
+                x_next = integration[:, 1, :]
+            else:
+                x_next = integration[1, :]
+        except NotImplementedError:
+            if not getattr(self.system, "allow_persistence_fallback", True):
+                raise
+            # Optional fallback for legacy/placeholder systems.
+            x_next = x_prev
+            if not self._warned_offline_fallback:
+                logging.warning(
+                    "TransitionProposal: system.integrate() is unavailable. "
+                    "Falling back to persistence proposal x_t = x_{t-1} + noise."
+                )
+                self._warned_offline_fallback = True
             
         noise_std = self.process_noise_std
 
@@ -87,18 +115,34 @@ class TransitionProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Compute log probability under transition dynamics. t ignored."""
         # For bootstrap proposal, this is the process noise likelihood
         # Supports batch (N, D)
         is_batch = x_prev.ndim > 1
+        if getattr(self.system, "requires_static_params", False):
+            has_re = static_params is not None and (
+                "reynolds" in static_params or "u" in static_params
+            )
+            if not has_re:
+                raise ValueError(
+                    "TransitionProposal requires static Reynolds params for this system "
+                    "(expected static_params['reynolds'] or static_params['u'])."
+                )
         
         # No preprocessing, operate in original space
-        integration = self.system.integrate(x_prev, 2, dt)
-        if is_batch:
-            x_expected = integration[:, 1, :]
-        else:
-            x_expected = integration[1, :]
+        try:
+            integration = self.system.integrate(x_prev, 2, dt, static_params=static_params)
+            if is_batch:
+                x_expected = integration[:, 1, :]
+            else:
+                x_expected = integration[1, :]
+        except NotImplementedError:
+            if not getattr(self.system, "allow_persistence_fallback", True):
+                raise
+            # Must match sample() fallback for consistency.
+            x_expected = x_prev
             
         noise_std = self.process_noise_std
 
@@ -178,6 +222,7 @@ class LearnedNeuralProposal(ProposalDistribution, nn.Module):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Neural network proposal sampling - IMPROVED stub"""
         # TODO: Implement learned proposal
@@ -201,6 +246,7 @@ class LearnedNeuralProposal(ProposalDistribution, nn.Module):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """Neural network proposal log probability - IMPROVED stub"""
         # TODO: Implement learned proposal log probability
@@ -235,6 +281,7 @@ class GaussianMixtureProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """GMM proposal sampling - IMPROVED stub"""
         # TODO: Implement GMM proposal
@@ -256,6 +303,7 @@ class GaussianMixtureProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """GMM proposal log probability - IMPROVED stub"""
         # TODO: Implement GMM proposal log probability
@@ -396,6 +444,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Sample from RF proposal q(x_t | x_{t-1})
@@ -454,6 +503,7 @@ class RectifiedFlowProposal(ProposalDistribution):
         y_curr: Optional[torch.Tensor],
         dt: float,
         t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         Compute log probability log q(x_curr | x_prev)

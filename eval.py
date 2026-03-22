@@ -828,12 +828,29 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
              for tid in traj_idxs.tolist():
                  trajectory_results_map[tid] = {
                      "metrics": [], 
-                     "trajectory_data": [] if tid in vis_indices else None
+                    "trajectory_data": [] if tid in vis_indices else None,
+                    "reynolds": None,
                  }
         
         # Step Particle Filter
         dt = config.dt
-        batch_metrics = pf.step(x_prev, x_curr, y_curr, dt, traj_idxs, time_idxs)
+        static_params = None
+        if "reynolds" in batch:
+            static_params = {"reynolds": batch["reynolds"]}
+        elif "u" in batch:
+            static_params = {"reynolds": batch["u"]}
+        step_kwargs = {}
+        if static_params is not None and args.method in {"ensf", "ensf_proposal"}:
+            step_kwargs["static_params"] = static_params
+        batch_metrics = pf.step(
+            x_prev,
+            x_curr,
+            y_curr,
+            dt,
+            traj_idxs,
+            time_idxs,
+            **step_kwargs,
+        )
         
         # Store Results
         for i, metrics in enumerate(batch_metrics):
@@ -841,6 +858,10 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             if tid not in trajectory_results_map:
                  # Should generally be handled by is_start, but safety check could go here
                  continue
+            if "reynolds" in batch and trajectory_results_map[tid]["reynolds"] is None:
+                trajectory_results_map[tid]["reynolds"] = float(batch["reynolds"][i].item())
+            elif "u" in batch and trajectory_results_map[tid]["reynolds"] is None:
+                trajectory_results_map[tid]["reynolds"] = float(batch["u"][i].item())
             
             # Compute CRPS
             # Resample based on weights to get equally weighted ensemble
@@ -901,6 +922,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
                     "x_est": metrics["x_est"],
                     "observation": y_curr_i.cpu().numpy() if (has_obs and y_curr_i is not None) else None,
                     "has_observation": has_obs,
+                    "reynolds": trajectory_results_map[tid]["reynolds"],
                     "rmse": metrics["rmse"],
                     "crps": metrics["crps"],
                 })
@@ -938,6 +960,7 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         
         res_dict = {
             "trajectory_idx": tid,
+            "reynolds": data.get("reynolds"),
             "mean_rmse": np.mean(rmse_values),
             "std_rmse": np.std(rmse_values),
             "min_rmse": np.min(rmse_values),

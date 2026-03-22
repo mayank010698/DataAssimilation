@@ -87,6 +87,13 @@ def train_rectified_flow(
     prev_state_corr_p_min: float = 0.05,
     prev_state_corr_sigma: float = 0.0,
     prev_state_corr_mask_ratio: float = 0.0,
+    # Observation-consistency auxiliary loss (training-only)
+    obs_consistency_weight: float = 0.0,
+    obs_nonlinearity: str = "arctan",
+    state_scaler_mean=None,
+    state_scaler_std=None,
+    obs_scaler_mean=None,
+    obs_scaler_std=None,
 ):
     """
     Train a rectified flow proposal distribution
@@ -127,6 +134,10 @@ def train_rectified_flow(
         prev_state_corr_p_min: Minimum corruption probability
         prev_state_corr_sigma: Gaussian noise std for corruption (0 = off)
         prev_state_corr_mask_ratio: Fraction of state dims to zero (0 = off)
+        obs_consistency_weight: Weight for auxiliary L_obs at predicted endpoint (0 = off)
+        obs_nonlinearity: Observation nonlinearity for scaled-space h (e.g. 'arctan', 'identity')
+        state_scaler_mean, state_scaler_std: State scaling (from data_scaled.h5) for obs-consistency
+        obs_scaler_mean, obs_scaler_std: Observation scaling (from data_scaled.h5) for obs-consistency
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -174,6 +185,7 @@ def train_rectified_flow(
     if use_time_step:
         logger_obj.info(f"Trajectory length (for normalization): {trajectory_length}")
     logger_obj.info(f"Prev-state corruption: p0={prev_state_corr_p0}, p_min={prev_state_corr_p_min}, sigma={prev_state_corr_sigma}, mask_ratio={prev_state_corr_mask_ratio}")
+    logger_obj.info(f"Obs-consistency weight: {obs_consistency_weight} (obs_nonlinearity={obs_nonlinearity})")
     
     # Create data module and get total training steps for annealing
     data_module = RFDataModule(
@@ -232,6 +244,13 @@ def train_rectified_flow(
         prev_state_corr_total_steps=total_training_steps,
         prev_state_corr_sigma=prev_state_corr_sigma,
         prev_state_corr_mask_ratio=prev_state_corr_mask_ratio,
+        # Observation-consistency auxiliary loss
+        obs_consistency_weight=obs_consistency_weight,
+        obs_nonlinearity=obs_nonlinearity,
+        state_scaler_mean=state_scaler_mean,
+        state_scaler_std=state_scaler_std,
+        obs_scaler_mean=obs_scaler_mean,
+        obs_scaler_std=obs_scaler_std,
     )
     
     logger_obj.info(f"\nModel architecture:")
@@ -317,6 +336,8 @@ def train_rectified_flow(
         "prev_state_corr_p_min": prev_state_corr_p_min,
         "prev_state_corr_sigma": prev_state_corr_sigma,
         "prev_state_corr_mask_ratio": prev_state_corr_mask_ratio,
+        "obs_consistency_weight": obs_consistency_weight,
+        "obs_nonlinearity": obs_nonlinearity,
     })
     
     # Setup trainer
@@ -464,12 +485,26 @@ def main():
     parser.add_argument('--prev_state_corr_mask_ratio', type=float, default=0.0,
                         help='Fraction of state dims to zero when corrupting (0 = off)')
 
+    # Observation-consistency auxiliary loss
+    parser.add_argument('--obs-consistency-weight', type=float, default=0.0,
+                        help='Weight for auxiliary observation-consistency loss at predicted endpoint (0 = off)')
+
     args = parser.parse_args()
     
     # Set default output directory
     if args.output_dir is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         args.output_dir = f"/data/da_outputs/rf_runs/run_{timestamp}"
+    
+    # Load config once for obs_components, trajectory_length, obs_nonlinearity
+    config = None
+    config_path = Path(args.data_dir) / "config.yaml"
+    if config_path.exists():
+        try:
+            from data import load_config_yaml
+            config = load_config_yaml(config_path)
+        except Exception as e:
+            print(f"Could not load config from config.yaml: {e}")
     
     # Parse obs_components
     obs_components = None
@@ -478,17 +513,9 @@ def main():
             obs_components = [int(i) for i in args.obs_components.split(',') if i.strip()]
         except ValueError:
             raise ValueError(f"Invalid format for --obs-components: {args.obs_components}. Expected comma-separated integers.")
-    else:
-        # Try to load from config.yaml to get default components
-        config_path = Path(args.data_dir) / "config.yaml"
-        if config_path.exists():
-             try:
-                 from data import load_config_yaml
-                 config = load_config_yaml(config_path)
-                 obs_components = config.obs_components
-                 print(f"Loaded obs_components from config.yaml: {obs_components}")
-             except Exception as e:
-                 print(f"Could not load obs_components from config.yaml: {e}")
+    elif config is not None:
+        obs_components = config.obs_components
+        print(f"Loaded obs_components from config.yaml: {obs_components}")
 
     # Infer obs_dim from obs_components if provided
     if obs_components is not None:
@@ -496,21 +523,51 @@ def main():
         
     # Infer trajectory_length from config if not provided
     trajectory_length = args.trajectory_length
-    if trajectory_length is None:
-        # Try to load from config.yaml
-        config_path = Path(args.data_dir) / "config.yaml"
-        if config_path.exists():
-             try:
-                 from data import load_config_yaml
-                 config = load_config_yaml(config_path)
-                 trajectory_length = config.len_trajectory
-                 print(f"Loaded trajectory_length from config.yaml: {trajectory_length}")
-             except Exception as e:
-                 print(f"Could not load trajectory_length from config.yaml: {e}")
+    if trajectory_length is None and config is not None:
+        trajectory_length = config.len_trajectory
+        print(f"Loaded trajectory_length from config.yaml: {trajectory_length}")
     
     if trajectory_length is None:
-        trajectory_length = 1000 # Default fallback
+        trajectory_length = 1000  # Default fallback
         print(f"Using default trajectory_length: {trajectory_length}")
+    
+    # Obs nonlinearity for observation-consistency loss (scaled-space h)
+    obs_nonlinearity = "arctan"
+    if config is not None:
+        obs_nonlinearity = getattr(config, "obs_nonlinearity", "arctan")
+    
+    # Load state/observation scalers for observation-consistency (from data_scaled.h5 or data.h5)
+    state_scaler_mean = state_scaler_std = obs_scaler_mean = obs_scaler_std = None
+    if args.obs_consistency_weight > 0 and args.use_observations:
+        data_dir = Path(args.data_dir)
+        for fname in ("data_scaled.h5", "data.h5"):
+            data_file = data_dir / fname
+            if data_file.exists():
+                try:
+                    import h5py
+                    with h5py.File(data_file, "r") as f:
+                        if "scaler_mean" in f and "scaler_std" in f:
+                            state_scaler_mean = torch.from_numpy(f["scaler_mean"][:]).float()
+                            state_scaler_std = torch.from_numpy(f["scaler_std"][:]).float()
+                        if "obs_scaler_mean" in f and "obs_scaler_std" in f:
+                            obs_mean = f["obs_scaler_mean"][:]
+                            obs_std = f["obs_scaler_std"][:]
+                            if obs_components is not None and len(obs_mean) > len(obs_components):
+                                obs_mean = obs_mean[obs_components]
+                                obs_std = obs_std[obs_components]
+                            obs_scaler_mean = torch.from_numpy(obs_mean).float()
+                            obs_scaler_std = torch.from_numpy(obs_std).float()
+                    print(f"Loaded scalers from {fname} for obs-consistency loss")
+                except Exception as e:
+                    print(f"Could not load scalers from {fname}: {e}")
+                break
+        if state_scaler_mean is None and args.obs_consistency_weight > 0:
+            print("Warning: obs_consistency_weight > 0 but scalers not found; observation-consistency loss will be disabled.")
+            args.obs_consistency_weight = 0.0
+    
+    # Disable obs-consistency when not using observations
+    if not args.use_observations or args.obs_dim == 0:
+        args.obs_consistency_weight = 0.0
     
     # Set seed if provided
     if args.seed is not None:
@@ -561,6 +618,12 @@ def main():
             prev_state_corr_p_min=args.prev_state_corr_p_min,
             prev_state_corr_sigma=args.prev_state_corr_sigma,
             prev_state_corr_mask_ratio=args.prev_state_corr_mask_ratio,
+            obs_consistency_weight=args.obs_consistency_weight,
+            obs_nonlinearity=obs_nonlinearity,
+            state_scaler_mean=state_scaler_mean,
+            state_scaler_std=state_scaler_std,
+            obs_scaler_mean=obs_scaler_mean,
+            obs_scaler_std=obs_scaler_std,
         )
         checkpoint_to_eval = best_checkpoint
     else:

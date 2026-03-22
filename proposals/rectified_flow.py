@@ -99,6 +99,13 @@ class RFProposal(pl.LightningModule):
         prev_state_corr_total_steps: Optional[int] = None,
         prev_state_corr_sigma: float = 0.0,
         prev_state_corr_mask_ratio: float = 0.0,
+        # Observation-consistency auxiliary loss (training-only)
+        obs_consistency_weight: float = 0.0,
+        obs_nonlinearity: str = "arctan",
+        state_scaler_mean: Optional[torch.Tensor] = None,
+        state_scaler_std: Optional[torch.Tensor] = None,
+        obs_scaler_mean: Optional[torch.Tensor] = None,
+        obs_scaler_std: Optional[torch.Tensor] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -131,6 +138,12 @@ class RFProposal(pl.LightningModule):
         self.prev_state_corr_total_steps = prev_state_corr_total_steps
         self.prev_state_corr_sigma = prev_state_corr_sigma
         self.prev_state_corr_mask_ratio = prev_state_corr_mask_ratio
+        self.obs_consistency_weight = obs_consistency_weight
+        self.obs_nonlinearity = obs_nonlinearity or "arctan"
+        self._state_scaler_mean = state_scaler_mean
+        self._state_scaler_std = state_scaler_std
+        self._obs_scaler_mean = obs_scaler_mean
+        self._obs_scaler_std = obs_scaler_std
 
         if self.use_gated_obs_correction and self.obs_dim == 0:
             raise ValueError(
@@ -299,6 +312,68 @@ class RFProposal(pl.LightningModule):
 
         return out, n_corr / batch_size
 
+    def _apply_obs_operator_scaled(self, x_scaled: torch.Tensor) -> torch.Tensor:
+        """
+        Apply observation operator in scaled space: unscale state -> select -> nonlinearity -> scale obs.
+        Mirrors dataset construction so predicted y is comparable to y_curr from the dataloader.
+        """
+        device = x_scaled.device
+        if self._state_scaler_mean is not None and self._state_scaler_std is not None:
+            mean = self._state_scaler_mean.to(device)
+            std = self._state_scaler_std.to(device)
+            x_phys = x_scaled * std + mean
+        else:
+            x_phys = x_scaled
+
+        indices = self.obs_indices if self.obs_indices is not None else list(range(self.obs_dim))
+        if x_phys.ndim == 1:
+            observed = x_phys[indices]
+        else:
+            observed = x_phys[..., indices]
+
+        nl = self.obs_nonlinearity or "arctan"
+        if nl == "arctan":
+            y_phys = torch.arctan(observed)
+        elif nl == "square":
+            y_phys = torch.square(observed)
+        elif nl == "cube":
+            y_phys = torch.pow(observed, 3)
+        elif nl in ["linear_projection", "identity", "none"]:
+            y_phys = observed
+        elif nl == "quad_capped_10":
+            y_phys = torch.pow(observed, 4)
+            y_phys = torch.clamp(y_phys, max=10.0) / 10.0
+        elif hasattr(torch, nl):
+            y_phys = getattr(torch, nl)(observed)
+        else:
+            raise ValueError(f"Unknown nonlinearity: {nl}")
+
+        if self._obs_scaler_mean is not None and self._obs_scaler_std is not None:
+            omean = self._obs_scaler_mean.to(device)
+            ostd = self._obs_scaler_std.to(device)
+            y_scaled = (y_phys - omean) / ostd
+        else:
+            y_scaled = y_phys
+        return y_scaled
+
+    def _predict_endpoint_and_obs(
+        self,
+        x_s: torch.Tensor,
+        s: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        t_normalized: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """One-step lookahead to s=1: compute predicted endpoint x_1 and its scaled observation y_hat."""
+        v = self.velocity_net(x_s, s, x_prev, y_curr, t_normalized)
+        x_1_delta = x_s + (1.0 - s) * v
+        if self.predict_delta:
+            x_1 = x_prev + x_1_delta
+        else:
+            x_1 = x_1_delta
+        y_hat_scaled = self._apply_obs_operator_scaled(x_1)
+        return x_1, y_hat_scaled
+
     def compute_rf_loss(
         self,
         x_prev: torch.Tensor,
@@ -361,17 +436,32 @@ class RFProposal(pl.LightningModule):
         # Predicted velocity (conditioned on x_cond, possibly corrupted)
         pred_velocity = self.velocity_net(x_s, s, x_cond, y_curr, t_normalized)
         
-        # MSE loss
-        loss = torch.mean((pred_velocity - target_velocity) ** 2)
+        # RF MSE loss
+        loss_rf = torch.mean((pred_velocity - target_velocity) ** 2)
+        loss_obs = torch.tensor(0.0, device=loss_rf.device, dtype=loss_rf.dtype)
+        if (
+            self.obs_consistency_weight > 0
+            and y_curr is not None
+            and self._state_scaler_mean is not None
+            and self._obs_scaler_mean is not None
+        ):
+            _, y_hat_scaled = self._predict_endpoint_and_obs(
+                x_s, s, x_cond, y_curr, t_normalized
+            )
+            obs_resid = y_hat_scaled - y_curr
+            loss_obs = torch.mean(obs_resid ** 2)
+        total_loss = loss_rf + self.obs_consistency_weight * loss_obs
         
-        # Additional metrics
         metrics = {
-            'loss': loss.item(),
+            'loss': total_loss.item(),
+            'loss_rf': loss_rf.item(),
+            'loss_obs': loss_obs.item(),
+            'loss_total': total_loss.item(),
             'velocity_norm': torch.mean(torch.norm(pred_velocity, dim=-1)).item(),
             'target_velocity_norm': torch.mean(torch.norm(target_velocity, dim=-1)).item(),
         }
         
-        return loss, metrics
+        return total_loss, metrics
     
     def training_step(self, batch, batch_idx):
         """Training step"""
@@ -411,7 +501,9 @@ class RFProposal(pl.LightningModule):
         )
         
         # Log metrics
-        self.log('train_loss', metrics['loss'], on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_loss', metrics['loss_total'], on_step=True, on_epoch=True, prog_bar=True)
+        self.log('train_loss_rf', metrics['loss_rf'], on_step=True, on_epoch=True)
+        self.log('train_loss_obs', metrics['loss_obs'], on_step=True, on_epoch=True)
         self.log('train_velocity_norm', metrics['velocity_norm'], on_step=False, on_epoch=True)
         if corruption_active:
             self.log('train_corr_prob', p_corr, on_step=True, on_epoch=True)
@@ -437,7 +529,9 @@ class RFProposal(pl.LightningModule):
         loss, metrics = self.compute_rf_loss(x_prev, x_curr, y_curr, t=time_idx)
         
         # Log metrics
-        self.log('val_loss', metrics['loss'], on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_loss', metrics['loss_total'], on_step=False, on_epoch=True, prog_bar=True)
+        self.log('val_loss_rf', metrics['loss_rf'], on_step=False, on_epoch=True)
+        self.log('val_loss_obs', metrics['loss_obs'], on_step=False, on_epoch=True)
         self.log('val_velocity_norm', metrics['velocity_norm'], on_step=False, on_epoch=True)
         
         self.validation_step_outputs.append(metrics)
@@ -1168,6 +1262,54 @@ def test_rectified_flow():
     x_sample_gated_resnet = rf_gated_resnet.sample(x_prev_l96, y_curr=y_curr_l96)
     print(f"✓ Gated ResNet1D (Spatial) Sampling: {x_sample_gated_resnet.shape}")
     assert x_sample_gated_resnet.shape == (batch_size, state_dim_l96)
+
+    # Test observation-consistency auxiliary loss
+    print("\n=== Testing Observation-Consistency Loss ===")
+    state_dim = 3
+    obs_dim = 1
+    batch_size = 8
+    scaler_mean = torch.zeros(state_dim)
+    scaler_std = torch.ones(state_dim)
+    obs_scaler_mean = torch.zeros(obs_dim)
+    obs_scaler_std = torch.ones(obs_dim)
+    rf_obs_cons = RFProposal(
+        state_dim=state_dim,
+        obs_dim=obs_dim,
+        architecture='mlp',
+        hidden_dim=32,
+        depth=2,
+        num_sampling_steps=5,
+        obs_indices=[0],
+        obs_consistency_weight=0.1,
+        obs_nonlinearity='identity',
+        state_scaler_mean=scaler_mean,
+        state_scaler_std=scaler_std,
+        obs_scaler_mean=obs_scaler_mean,
+        obs_scaler_std=obs_scaler_std,
+    )
+    x_prev = torch.randn(batch_size, state_dim)
+    x_curr = torch.randn(batch_size, state_dim)
+    y_curr = torch.randn(batch_size, obs_dim)
+    total_loss, metrics = rf_obs_cons.compute_rf_loss(x_prev, x_curr, y_curr=y_curr)
+    assert 'loss_rf' in metrics and 'loss_obs' in metrics and 'loss_total' in metrics
+    assert metrics['loss_obs'] >= 0
+    assert metrics['loss_total'] >= metrics['loss_rf']
+    assert total_loss.requires_grad
+    print(f"✓ Obs-consistency loss: loss_rf={metrics['loss_rf']:.6f}, loss_obs={metrics['loss_obs']:.6f}, total={metrics['loss_total']:.6f}")
+
+    # Without obs-consistency weight, loss_obs should be 0
+    rf_no_obs = RFProposal(
+        state_dim=state_dim,
+        obs_dim=obs_dim,
+        architecture='mlp',
+        hidden_dim=32,
+        depth=2,
+        obs_indices=[0],
+        obs_consistency_weight=0.0,
+    )
+    _, metrics_no = rf_no_obs.compute_rf_loss(x_prev, x_curr, y_curr=y_curr)
+    assert metrics_no['loss_obs'] == 0.0
+    print("✓ Obs-consistency disabled: loss_obs=0")
 
     print("\n✓ All tests passed!")
 

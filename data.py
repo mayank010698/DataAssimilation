@@ -10,6 +10,8 @@ from dataclasses import dataclass, asdict
 import logging
 import yaml
 
+from dynamics.kolmogorov_backend import KolmogorovBackend
+
 
 class ObservationOperator:
     """Observation operator y = phi(Hx)"""
@@ -138,7 +140,13 @@ class DynamicalSystem(ABC):
         return x + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6
     
     def integrate(
-        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
+        self,
+        x0: torch.Tensor,
+        n_steps: int,
+        dt: float = None,
+        process_noise_std: float = 0.0,
+        step_start: int = 0,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Integrate the system forward in time.
         
@@ -260,7 +268,13 @@ class DoubleWell(DynamicalSystem):
             return default.unsqueeze(0) + 0.02 * torch.randn(n_samples, *default.shape)
             
     def integrate(
-        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
+        self,
+        x0: torch.Tensor,
+        n_steps: int,
+        dt: float = None,
+        process_noise_std: float = 0.0,
+        step_start: int = 0,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """
         Integrate with manual jumps to match original experiment.
@@ -647,7 +661,13 @@ class KuramotoSivashinsky(DynamicalSystem):
         return -0.5 * ik * u2_hat
 
     def integrate(
-        self, x0: torch.Tensor, n_steps: int, dt: float = None, process_noise_std: float = 0.0, step_start: int = 0
+        self,
+        x0: torch.Tensor,
+        n_steps: int,
+        dt: float = None,
+        process_noise_std: float = 0.0,
+        step_start: int = 0,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
     ) -> torch.Tensor:
         """Integrate using ETD-RK4."""
         if dt is None:
@@ -1637,6 +1657,560 @@ def load_config_yaml(path: Path) -> DataAssimilationConfig:
     with open(path, "r") as f:
         config_dict = yaml.safe_load(f)
     return dict_to_config(config_dict)
+
+
+# =============================================================================
+# Kolmogorov Flow (2D Navier-Stokes)
+# =============================================================================
+
+
+def generate_kolmogorov_data(
+    size: int = 150,
+    num_trajectories: int = 200,
+    num_steps: int = 200,
+    warmup_steps: int = 100,
+    dt: float = 0.04,
+    re_min: float = 500.0,
+    re_max: float = 1500.0,
+    seed: int = 42,
+    output_path: Union[str, Path] = None,
+) -> Path:
+    """Generate Kolmogorov flow trajectories using the shared backend."""
+    np.random.seed(seed)
+    reynoldses = np.random.uniform(re_min, re_max, num_trajectories).astype(np.float32)
+    backend = KolmogorovBackend(grid_size=size)
+    x0_flat = backend.sample_initial_state(seed=seed)
+    coords = backend.get_coords()
+
+    y = np.zeros((num_trajectories, num_steps, 2, size, size), dtype=np.float32)
+
+    for ni in range(num_trajectories):
+        reynolds = float(reynoldses[ni])
+        traj_flat = backend.rollout(x0_flat, reynolds=reynolds, n_steps=warmup_steps + num_steps, dt=dt)
+        y[ni] = traj_flat[warmup_steps:].reshape(num_steps, 2, size, size)
+        logging.info(f"Trajectory {ni + 1}/{num_trajectories} done (Re={reynolds:.1f})")
+
+    # Resolve output path
+    output_path = Path(output_path) if output_path is not None else Path(".")
+    if output_path.suffix == "":
+        output_path.mkdir(parents=True, exist_ok=True)
+        save_path = output_path / "kolmogorov_data.npz"
+    else:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        save_path = output_path
+
+    np.savez(
+        save_path,
+        y=y,
+        u=reynoldses.astype(np.float32),
+        x=coords,
+        dt=np.float32(dt),
+    )
+    logging.info(f"Kolmogorov data saved to {save_path} — shape: {y.shape}")
+    return save_path
+
+
+def generate_kolmogorov_data_subset(
+    size: int = 150,
+    num_trajectories: int = 200,
+    num_steps: int = 200,
+    warmup_steps: int = 100,
+    dt: float = 0.04,
+    re_min: float = 500.0,
+    re_max: float = 1500.0,
+    seed: int = 42,
+    trajectory_indices: Union[List[int], np.ndarray] = None,
+    output_part_path: Union[str, Path] = None,
+) -> Path:
+    """Generate a subset of Kolmogorov flow trajectories (by global trajectory index).
+
+    This is designed for schedule-independent parallelization: each trajectory index
+    is computed deterministically from (seed, trajectory_index) by reproducing the
+    same Reynolds-number sampling used in `generate_kolmogorov_data`.
+    """
+    if trajectory_indices is None:
+        raise ValueError("trajectory_indices must be provided")
+    if output_part_path is None:
+        raise ValueError("output_part_path must be provided (path to the part .npz file)")
+
+    trajectory_indices = np.asarray(trajectory_indices, dtype=np.int64)
+    if trajectory_indices.ndim != 1:
+        raise ValueError("trajectory_indices must be a 1D array of global indices")
+
+    output_part_path = Path(output_part_path)
+    output_part_path.parent.mkdir(parents=True, exist_ok=True)
+
+    np.random.seed(seed)
+    reynoldses = np.random.uniform(re_min, re_max, num_trajectories).astype(np.float32)
+    backend = KolmogorovBackend(grid_size=size)
+    x0_flat = backend.sample_initial_state(seed=seed)
+    coords = backend.get_coords()
+
+    y_part = np.zeros((len(trajectory_indices), num_steps, 2, size, size), dtype=np.float32)
+    u_part = reynoldses[trajectory_indices].astype(np.float32)
+
+    for local_ni, global_ni in enumerate(trajectory_indices.tolist()):
+        reynolds = float(reynoldses[global_ni])
+        traj_flat = backend.rollout(x0_flat, reynolds=reynolds, n_steps=warmup_steps + num_steps, dt=dt)
+        y_part[local_ni] = traj_flat[warmup_steps:].reshape(num_steps, 2, size, size)
+
+        logging.info(
+            f"Kolmogorov subset traj {local_ni + 1}/{len(trajectory_indices)} "
+            f"(global idx={global_ni}) done (Re={reynolds:.1f})"
+        )
+
+    np.savez(
+        output_part_path,
+        y=y_part,
+        u=u_part,
+        trajectory_indices=trajectory_indices.astype(np.int64),
+        x=coords,
+        dt=np.float32(dt),
+    )
+    logging.info(
+        f"Kolmogorov subset saved to {output_part_path} — shape: {y_part.shape}"
+    )
+    return output_part_path
+
+
+def merge_kolmogorov_data_parts(
+    part_paths: List[Union[str, Path]],
+    num_trajectories: int,
+    output_npz_path: Union[str, Path],
+) -> Path:
+    """Merge per-index Kolmogorov `.npz` parts into a single final `kolmogorov_data.npz`.
+
+    Expects each part to contain:
+      - `y`: [Ni_part, num_steps, 2, size, size]
+      - `u`: [Ni_part]
+      - `trajectory_indices`: global indices for each part entry
+      - `x`: coordinates array
+      - `dt`: scalar dt
+    """
+    if len(part_paths) == 0:
+        raise ValueError("part_paths must contain at least one part .npz")
+
+    output_npz_path = Path(output_npz_path)
+    output_npz_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Load shape/metadata from the first part.
+    first = np.load(str(part_paths[0]), allow_pickle=True)
+    y0 = first["y"].astype(np.float32)
+    num_steps = int(y0.shape[1])
+    size = int(y0.shape[3])
+    x = first["x"].astype(np.float32)
+    dt = np.float32(first["dt"])
+
+    y_full = np.zeros((num_trajectories, num_steps, 2, size, size), dtype=np.float32)
+    u_full = np.zeros((num_trajectories,), dtype=np.float32)
+
+    covered = np.zeros((num_trajectories,), dtype=bool)
+
+    for part_path in part_paths:
+        part = np.load(str(part_path), allow_pickle=True)
+        y_part = part["y"].astype(np.float32)
+        u_part = part["u"].astype(np.float32)
+        idx_part = part["trajectory_indices"].astype(np.int64)
+
+        if y_part.shape[1:] != (num_steps, 2, size, size):
+            raise ValueError(
+                f"Part {part_path} has incompatible shape {y_part.shape}; "
+                f"expected (?, {num_steps}, 2, {size}, {size})"
+            )
+        if len(idx_part) != y_part.shape[0] or len(idx_part) != len(u_part):
+            raise ValueError(
+                f"Part {part_path} has mismatched trajectory_indices/u/y lengths."
+            )
+
+        if np.any(covered[idx_part]):
+            dupes = np.where(covered[idx_part])[0]
+            raise ValueError(
+                f"Part overlap detected while merging: {len(dupes)} duplicate indices."
+            )
+
+        y_full[idx_part] = y_part
+        u_full[idx_part] = u_part
+        covered[idx_part] = True
+
+    missing = np.where(~covered)[0]
+    if len(missing) != 0:
+        raise ValueError(
+            f"Missing trajectories while merging Kolmogorov parts: {len(missing)} indices "
+            f"e.g. {missing[:10].tolist()}"
+        )
+
+    np.savez(
+        output_npz_path,
+        y=y_full,
+        u=u_full,
+        x=x,
+        dt=dt,
+    )
+    logging.info(
+        f"Merged Kolmogorov data to {output_npz_path} — shape: {y_full.shape}"
+    )
+    return output_npz_path
+
+
+@dataclass
+class KolmogorovConfig:
+    """Configuration for Kolmogorov flow (2D Navier-Stokes) experiments."""
+
+    # Simulation / generation parameters
+    grid_size: int = 150
+    num_trajectories: int = 200
+    num_steps: int = 200
+    warmup_steps: int = 100
+    dt: float = 0.04
+    re_min: float = 500.0
+    re_max: float = 1500.0
+    seed: int = 42
+
+    # Observation parameters
+    obs_frequency: int = 5       # observe every N steps → num_steps//obs_frequency assimilation steps
+    obs_grid_size: int = 150     # obs_grid_size x obs_grid_size equispaced grid;
+                                 # 150 = fully observed, 10 = paper's sparse 100-point grid
+    obs_noise_std: float = 0.0   # noise-free by default (paper uses 0 for encoder training)
+    # RNG seed used to generate deterministic observation noise in `KolmogorovDataset`.
+    # If left as None, it falls back to `seed`.
+    obs_noise_seed: Optional[int] = None
+
+    # Data splits (applied in trajectory-index order)
+    train_ratio: float = 0.6
+    val_ratio: float = 0.2
+    test_ratio: float = 0.2
+
+    def __post_init__(self):
+        if self.grid_size % self.obs_grid_size != 0:
+            raise ValueError(
+                f"obs_grid_size ({self.obs_grid_size}) must evenly divide "
+                f"grid_size ({self.grid_size})"
+            )
+        if self.obs_noise_seed is None:
+            self.obs_noise_seed = int(self.seed)
+
+
+def save_kolmogorov_config_yaml(config: KolmogorovConfig, path: Path):
+    """Save KolmogorovConfig as YAML file."""
+    config_dict = asdict(config)
+    with open(path, "w") as f:
+        yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False)
+
+
+class KolmogorovSystem(DynamicalSystem):
+    """Kolmogorov flow (2D incompressible Navier-Stokes) system wrapper.
+
+    The physical state is the 2D velocity field (u, v) on a periodic
+    (grid_size x grid_size) domain, stored as a flat vector of length
+    2 * grid_size^2. Layout: [u-channel (grid_size^2 values), v-channel (grid_size^2 values)],
+    where within each channel the spatial ordering is C-order row-major
+    (index k = x * grid_size + y).
+
+    Online PDE simulation requires JAX + jax-cfd; calling dynamics() raises
+    NotImplementedError. Use generate_kolmogorov_data() to produce data offline.
+
+    The observation operator is a reused ObservationOperator with precomputed flat
+    indices for an equispaced obs_grid_size x obs_grid_size subsampling grid.
+    Observation layout: [u at grid pts (obs_grid_size^2), v at grid pts (obs_grid_size^2)],
+    matching the observ_idx convention in CODEBASE_ld-ensf/kolmogorov_flow/observation_data.py.
+    """
+
+    def __init__(self, config: KolmogorovConfig):
+        # Bypass DynamicalSystem.__init__: it expects DataAssimilationConfig and builds
+        # an ObservationOperator from integer component indices, which doesn't fit here.
+        # We set all required attributes manually instead.
+        self.config = config
+        self.grid_size = config.grid_size
+        self.obs_grid_size = config.obs_grid_size
+        self.state_dim = self.get_state_dim()
+
+        # Build obs indices matching observ_idx() in observation_data.py:
+        #   flat_idx = grid_inx_y + grid_inx_x * Ny  (= y + x * grid_size = x*grid_size + y)
+        stride = config.grid_size // config.obs_grid_size
+        gx, gy = np.meshgrid(
+            np.arange(0, config.grid_size, stride),
+            np.arange(0, config.grid_size, stride),
+        )
+        flat_idx = (gy + gx * config.grid_size).ravel()  # (obs_grid_size^2,) spatial indices
+        obs_components = np.concatenate(
+            [flat_idx, flat_idx + config.grid_size ** 2]
+        ).tolist()  # u-channel then v-channel → 2 * obs_grid_size^2 total
+
+        self.obs_dim = len(obs_components)
+        self.observation_operator = ObservationOperator(
+            obs_components, nonlinearity="identity"
+        )
+        self.requires_static_params = True
+        self.allow_persistence_fallback = False
+        self.backend = KolmogorovBackend(grid_size=self.grid_size)
+
+    def get_state_dim(self) -> int:
+        return 2 * self.config.grid_size * self.config.grid_size
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "KolmogorovSystem online dynamics use JAX/jax-cfd. "
+            "Use generate_kolmogorov_data() to produce trajectory data offline."
+        )
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        return torch.zeros(self.state_dim)
+
+    def integrate(
+        self,
+        x0: torch.Tensor,
+        n_steps: int,
+        dt: float = None,
+        process_noise_std: float = 0.0,
+        step_start: int = 0,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        if dt is None:
+            dt = self.config.dt
+        if n_steps < 1:
+            raise ValueError("n_steps must be >= 1")
+
+        if not isinstance(x0, torch.Tensor):
+            x0 = torch.tensor(x0, dtype=torch.float32)
+        is_batch = x0.ndim > 1
+        if not is_batch:
+            x0 = x0.unsqueeze(0)
+
+        if static_params is None:
+            raise ValueError(
+                "KolmogorovSystem.integrate requires static_params with Reynolds "
+                "(key 'reynolds' or 'u')."
+            )
+        reynolds = static_params.get("reynolds", static_params.get("u"))
+        if reynolds is None:
+            raise ValueError("Missing Reynolds static param ('reynolds' or 'u').")
+        if process_noise_std > 0:
+            # Keep stochastic semantics: additive noise after each transition
+            # should affect all subsequent states.
+            re = torch.as_tensor(reynolds, dtype=torch.float32, device=x0.device).reshape(-1)
+            if re.numel() == 1 and x0.shape[0] > 1:
+                re = re.expand(x0.shape[0])
+            if re.numel() != x0.shape[0]:
+                raise ValueError(
+                    f"Reynolds batch size ({re.numel()}) does not match x0 batch size ({x0.shape[0]})."
+                )
+
+            states = [x0]
+            x_curr = x0
+            for _ in range(n_steps - 1):
+                x_next = self.backend.step(x_curr, reynolds=re, dt=dt)
+                x_next = x_next + process_noise_std * torch.randn_like(x_next)
+                states.append(x_next)
+                x_curr = x_next
+            result = torch.stack(states, dim=1)
+        else:
+            result = self.backend.rollout(x0, reynolds=reynolds, n_steps=n_steps, dt=dt)
+
+        if not is_batch:
+            return result.squeeze(0)
+        return result
+
+
+class KolmogorovDataset(Dataset):
+    """Dataset for Kolmogorov flow experiments.
+
+    Loads a pre-generated kolmogorov_data.npz file and exposes items in the
+    same format as DataAssimilationDataset for compatibility with EnsembleScoreFilter
+    and other models.
+
+    Observations are pre-computed in __init__ using the system's observation operator
+    and optional Gaussian noise.
+
+    In 'inference' mode, __getitem__ returns per-timestep dicts
+    {trajectory_idx, time_idx, x_prev, x_curr, y_curr, has_observation}.
+    In 'train' mode, __getitem__ returns per-trajectory dicts
+    {trajectory_idx, x, y, u, dt, obs_mask}.
+    """
+
+    def __init__(
+        self,
+        npz_path: Union[str, Path],
+        config: KolmogorovConfig,
+        system: KolmogorovSystem,
+        split: str = "train",
+        mode: str = "inference",
+    ):
+        data = np.load(npz_path, allow_pickle=True)
+        y_all = data["y"].astype(np.float32)  # [Ni, Nt, 2, H, W]
+        u_all = data["u"].astype(np.float32)  # [Ni] Reynolds numbers
+        self.dt = float(data["dt"])
+
+        Ni = y_all.shape[0]
+        n_train = int(config.train_ratio * Ni)
+        n_val = int(config.val_ratio * Ni)
+
+        if split == "train":
+            self.y = y_all[:n_train]
+            self.u = u_all[:n_train]
+        elif split == "val":
+            self.y = y_all[n_train : n_train + n_val]
+            self.u = u_all[n_train : n_train + n_val]
+        else:  # test
+            self.y = y_all[n_train + n_val :]
+            self.u = u_all[n_train + n_val :]
+
+        self.config = config
+        self.system = system
+        self.mode = mode
+
+        Ni_split, Nt, C, H, W = self.y.shape
+        self.n_trajectories = Ni_split
+        self.n_steps = Nt
+        self.state_dim = C * H * W
+
+        # Observation mask and time indices
+        self.obs_mask = np.zeros(Nt, dtype=bool)
+        self.obs_mask[:: config.obs_frequency] = True
+        self.obs_time_indices = np.where(self.obs_mask)[0]  # [Nt_obs]
+
+        # Precompute observations: apply observation operator at every obs timestep.
+        # Flatten (2, H, W) → (2*H*W,) then index with obs_components.
+        flat = self.y.reshape(Ni_split, Nt, -1)             # [Ni, Nt, 2*H*W]
+        obs_flat = flat[:, self.obs_time_indices, :]         # [Ni, Nt_obs, 2*H*W]
+        Ni_s, Nt_obs, D = obs_flat.shape
+
+        obs_tensor = torch.from_numpy(obs_flat.reshape(-1, D))  # [Ni*Nt_obs, 2*H*W]
+        with torch.no_grad():
+            obs_computed = system.apply_observation_operator(obs_tensor)  # [Ni*Nt_obs, obs_dim]
+        if config.obs_noise_std > 0.0:
+            # Deterministic per-dataset observation noise so different dataset
+            # variants (different obs_noise_std / seed) are reproducible.
+            gen = torch.Generator()
+            gen.manual_seed(int(config.obs_noise_seed))
+            noise = torch.randn(
+                obs_computed.shape,
+                dtype=obs_computed.dtype,
+                device=obs_computed.device,
+                generator=gen,
+            )
+            obs_computed = obs_computed + config.obs_noise_std * noise
+        self.observations = obs_computed.numpy().reshape(Ni_s, Nt_obs, -1)  # [Ni, Nt_obs, obs_dim]
+        self.obs_dim = self.observations.shape[-1]
+
+        if mode == "inference":
+            self.items = [
+                (traj_idx, t)
+                for traj_idx in range(Ni_split)
+                for t in range(1, Nt)
+            ]
+
+    def __len__(self):
+        if self.mode == "inference":
+            return len(self.items)
+        return self.n_trajectories
+
+    def __getitem__(self, idx):
+        if self.mode == "inference":
+            return self._get_inference_item(idx)
+        return self._get_train_item(idx)
+
+    def _get_inference_item(self, idx):
+        traj_idx, t = self.items[idx]
+
+        x_prev = self.y[traj_idx, t - 1].ravel()  # [2*H*W]
+        x_curr = self.y[traj_idx, t].ravel()       # [2*H*W]
+
+        has_observation = bool(self.obs_mask[t])
+        if has_observation:
+            obs_pos = int(np.searchsorted(self.obs_time_indices, t))
+            y_curr = self.observations[traj_idx, obs_pos]  # [obs_dim]
+        else:
+            y_curr = np.zeros(self.obs_dim, dtype=np.float32)
+
+        return {
+            "trajectory_idx": torch.LongTensor([traj_idx]),
+            "time_idx": torch.LongTensor([t]),
+            "x_prev": torch.as_tensor(x_prev, dtype=torch.float32),
+            "x_curr": torch.as_tensor(x_curr, dtype=torch.float32),
+            "y_curr": torch.as_tensor(y_curr, dtype=torch.float32),
+            # Keep both names for backward compatibility and clarity.
+            "u": torch.as_tensor(self.u[traj_idx], dtype=torch.float32),
+            "reynolds": torch.as_tensor(self.u[traj_idx], dtype=torch.float32),
+            "has_observation": torch.BoolTensor([has_observation]),
+        }
+
+    def _get_train_item(self, idx):
+        x = self.y[idx].reshape(self.n_steps, -1)  # [Nt, 2*H*W]
+
+        return {
+            "trajectory_idx": torch.LongTensor([idx]),
+            "x": torch.as_tensor(x, dtype=torch.float32),             # [Nt, state_dim]
+            "y": torch.as_tensor(self.observations[idx], dtype=torch.float32),  # [Nt_obs, obs_dim]
+            "u": torch.as_tensor(self.u[idx], dtype=torch.float32),   # scalar Re
+            "dt": torch.as_tensor(self.dt, dtype=torch.float32),
+            "obs_mask": torch.as_tensor(self.obs_mask, dtype=torch.bool),
+        }
+
+
+class KolmogorovDataModule(pl.LightningDataModule):
+    """PyTorch Lightning DataModule for Kolmogorov flow experiments."""
+
+    def __init__(
+        self,
+        npz_path: Union[str, Path],
+        config: KolmogorovConfig,
+        batch_size: int = 4,
+        num_workers: int = 4,
+    ):
+        super().__init__()
+        self.npz_path = Path(npz_path)
+        self.config = config
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        self.system = KolmogorovSystem(config)
+
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+    def setup(self, stage: Optional[str] = None):
+        if stage == "fit" or stage is None:
+            self.train_dataset = KolmogorovDataset(
+                self.npz_path, self.config, self.system, split="train", mode="train"
+            )
+            self.val_dataset = KolmogorovDataset(
+                self.npz_path, self.config, self.system, split="val", mode="train"
+            )
+        if stage == "test" or stage is None:
+            self.test_dataset = KolmogorovDataset(
+                self.npz_path, self.config, self.system, split="test", mode="inference"
+            )
+
+    def train_dataloader(self):
+        if self.train_dataset is None:
+            raise ValueError("Train dataset not set up. Call setup('fit') first.")
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+        )
+
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            raise ValueError("Val dataset not set up. Call setup('fit') first.")
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+        )
+
+    def test_dataloader(self):
+        if self.test_dataset is None:
+            raise ValueError("Test dataset not set up. Call setup('test') first.")
+        return DataLoader(
+            self.test_dataset,
+            batch_size=1,
+            shuffle=False,
+            num_workers=0,
+        )
 
 
 if __name__ == "__main__":
