@@ -15,13 +15,14 @@ echo "=========================================="
 # Shared settings; same state trajectories for identity and quad_capped_10
 L96_OPTS=(
     --system lorenz96
-    --l96-dim 40
+    # --l96-dim 40
+    --l96-dim 20
     --l96-forcing 8
     --dt 0.03
     --len-trajectory 80
     --warmup-steps 1024
     --obs-frequency 1
-    --obs-noise-variations "1,3,5"
+    --obs-noise-variations "1"
     --l96-init-sampling uniform
     --l96-init-low -10
     --l96-init-high 10

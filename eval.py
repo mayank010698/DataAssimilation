@@ -28,6 +28,7 @@ from data import (
 )
 from models.base_pf import FilteringMethod
 from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
+from models.bpf_branching import RFAuxiliaryBranchingParticleFilter
 from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
 from models.ensf import EnsembleScoreFilter
 from models.ensf_proposal import EnsembleScoreFilterWithProposal
@@ -640,7 +641,13 @@ def parse_args():
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
 
     # Particle filter configuration
-    parser.add_argument("--method", type=str, default="bpf", choices=["bpf", "enkf", "letkf", "ensf"], help="Filtering method to use")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="bpf",
+        choices=["bpf", "bpf_abpf", "enkf", "letkf", "ensf"],
+        help="Filtering method to use (bpf_abpf: batched auxiliary branching PF)",
+    )
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
     parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
@@ -670,6 +677,11 @@ def parse_args():
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     parser.add_argument("--use-exact-trace", action="store_true", help="Enable exact trace computation (default: False/Hutchinson)")
     parser.add_argument("--use-opt-weight-update", action="store_true", help="Use optimal weight update approximation")
+    parser.add_argument(
+        "--abpf-first-stage-correction",
+        action="store_true",
+        help="For bpf_abpf: subtract predictive log score per descendant (APF-style first-stage correction)",
+    )
     parser.add_argument("--resampling-threshold", type=float, default=0.33, help="Resampling threshold ratio (default: 0.5)")
     parser.add_argument("--init-mode", type=str, default="truth", choices=["truth", "climatology"], help="Initialization mode: 'truth' (x0 + obs_noise) or 'climatology' (mean + std)")
 
@@ -704,6 +716,19 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             device=args.device,
             use_optimal_weight_update=args.use_opt_weight_update,
             resampling_threshold_ratio=args.resampling_threshold,
+        )
+    elif args.method == "bpf_abpf":
+        pf = RFAuxiliaryBranchingParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            use_optimal_weight_update=args.use_opt_weight_update,
+            resampling_threshold_ratio=args.resampling_threshold,
+            use_apf_first_stage_correction=args.abpf_first_stage_correction,
         )
     elif args.method == "enkf":
         pf = EnsembleKalmanFilter(
@@ -1438,7 +1463,7 @@ def main():
     if not args.disable_wandb:
         tags = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
         tags.extend([args.method])
-        if args.method == "bpf":
+        if args.method in ("bpf", "bpf_abpf"):
             tags.append(args.proposal_type)
         if args.batch_size > 1:
             tags.append("batched")
@@ -1490,7 +1515,11 @@ def main():
     # EnKF and LETKF are implemented as batched filters, so we use run_batched_eval
     # even if batch_size is 1.
     # Climatology initialization is also implemented only in run_batched_eval logic.
-    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf"]) or (args.init_mode == "climatology")
+    use_batched = (
+        (args.batch_size > 1)
+        or (args.method in ["enkf", "letkf", "bpf_abpf"])
+        or (args.init_mode == "climatology")
+    )
 
     if use_batched:
         trajectory_results = run_batched_eval(
