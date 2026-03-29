@@ -545,3 +545,168 @@ class RectifiedFlowProposal(ProposalDistribution):
             num_trace_probes=self.num_trace_probes,
             t=t,
         )
+
+
+# =============================================================================
+# Shortcut + F2D2 Proposal (Stages 2 & 3 of the F2D2 pipeline)
+# =============================================================================
+
+
+class ShortcutF2D2Proposal(ProposalDistribution):
+    """
+    Fast proposal distribution backed by a trained ShortcutProposal (F2D2).
+
+    Replaces RectifiedFlowProposal with a ~25–50× faster alternative:
+    - sample()   : n_sampling_steps  forward Euler steps (default 1 NFE)
+    - log_prob() : n_likelihood_steps backward Euler via divergence head (default 4 NFEs)
+
+    Mirrors the constructor interface of RectifiedFlowProposal so it can be
+    swapped in with minimal changes to eval.py / BPF scripts.
+
+    Args:
+        checkpoint_path:    Path to Stage 2 (shortcut) or Stage 3 (F2D2) checkpoint.
+        device:             Torch device string.
+        n_sampling_steps:   Override inference sampling steps (1 = single NFE).
+        n_likelihood_steps: Override inference log-prob steps (4 NFEs default).
+        system:             DynamicalSystem for pre/post processing (optional).
+        obs_mean:           Observation mean tensor for normalisation.
+        obs_std:            Observation std tensor for normalisation.
+        obs_components:     List of observed state indices (to slice obs scalers).
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        n_sampling_steps: Optional[int] = None,
+        n_likelihood_steps: Optional[int] = None,
+        system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
+        obs_components: Optional[list] = None,
+    ):
+        import sys
+        from pathlib import Path
+
+        proposals_dir = Path(__file__).parent.parent / "proposals"
+        if str(proposals_dir) not in sys.path:
+            sys.path.insert(0, str(proposals_dir))
+
+        from proposals.shortcut_flow import ShortcutProposal
+
+        self.sc_model = ShortcutProposal.load_from_checkpoint(
+            checkpoint_path, map_location=device
+        )
+        self.sc_model.eval()
+        self.sc_model.to(device)
+        for param in self.sc_model.parameters():
+            param.requires_grad = False
+
+        self.device = device
+        self.system = system
+
+        if n_sampling_steps is not None:
+            self.sc_model.n_sampling_steps = n_sampling_steps
+        if n_likelihood_steps is not None:
+            self.sc_model.n_likelihood_steps = n_likelihood_steps
+
+        self.state_dim = self.sc_model.state_dim
+
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+
+    # ---- helpers ----
+
+    def _to_device(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.to(self.device) if x.device.type != self.device else x
+
+    def _scale_obs(self, y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = self._to_device(y)
+        if self.obs_mean is not None and self.obs_std is not None:
+            y = (y - self.obs_mean) / self.obs_std
+        return y
+
+    # ---- ProposalDistribution interface ----
+
+    def sample(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Sample x_t ~ q(x_t | x_{t-1}, y_t) in 1–few forward Euler steps.
+
+        Args:
+            x_prev: (state_dim,) or (B, state_dim), in physical space if system provided.
+            y_curr: Observation or None.
+            dt:     Unused (kept for interface compatibility).
+            t:      Trajectory time step (required if use_time_step=True).
+
+        Returns:
+            Sampled state, same shape as x_prev, in physical space.
+        """
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.sc_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "ShortcutProposal has use_time_step=True but t was not provided."
+            )
+
+        x_curr_scaled = self.sc_model.sample(x_prev, y_curr, t=t)
+
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+        return x_curr_scaled
+
+    def log_prob(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        """
+        Compute log q(x_curr | x_prev, y_curr) via divergence accumulation head.
+
+        Args:
+            x_curr: (state_dim,) or (B, state_dim), physical space.
+            x_prev: same shape.
+            y_curr: Observation or None.
+            dt:     Unused.
+            t:      Trajectory time step (required if use_time_step=True).
+
+        Returns:
+            log-probability, shape () or (B,).
+        """
+        x_curr = self._to_device(x_curr)
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+
+        if getattr(self.sc_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "ShortcutProposal has use_time_step=True but t was not provided."
+            )
+
+        return self.sc_model.log_prob(x_curr, x_prev, y_curr, t=t)

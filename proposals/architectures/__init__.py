@@ -11,6 +11,8 @@ from .mlp import MLPVelocityNetwork
 from .resnet1d import ResNet1DVelocityNetwork
 from .resnet1d_deterministic import ResNet1DDeterministic
 from .gated import GatedVelocityNetwork
+from .shortcut_mlp import ShortcutMLPVelocityNetwork
+from .shortcut_resnet1d import ShortcutResNet1DVelocityNetwork
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -19,6 +21,59 @@ from .conditioning import (
     CrossAttentionConditioning,
     create_conditioning,
 )
+
+
+def create_shortcut_network(
+    architecture: str,
+    state_dim: int,
+    obs_dim: int = 0,
+    use_time_step: bool = False,
+    div_head_active: bool = False,
+    **kwargs,
+):
+    """
+    Factory function for shortcut velocity networks (Stage 2 / Stage 3 of F2D2).
+
+    Args:
+        architecture: 'mlp' or 'resnet1d'
+        state_dim: State dimension.
+        obs_dim: Observation dimension (0 = unconditional).
+        use_time_step: Whether to accept trajectory-time conditioning.
+        div_head_active: If True the divergence head is live (Stage 3).
+        **kwargs: Architecture-specific hyper-parameters (same as create_velocity_network).
+
+    Returns:
+        ShortcutMLPVelocityNetwork or ShortcutResNet1DVelocityNetwork
+    """
+    common = dict(
+        state_dim=state_dim,
+        obs_dim=obs_dim,
+        obs_indices=kwargs.get("obs_indices", None),
+        time_embed_dim=kwargs.get("time_embed_dim", 64),
+        dropout=kwargs.get("dropout", 0.0),
+        use_time_step=use_time_step,
+        div_head_active=div_head_active,
+        div_hidden_dim=kwargs.get("div_hidden_dim", 64),
+    )
+    if architecture in ("mlp", "mlp_fixed"):
+        return ShortcutMLPVelocityNetwork(
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            depth=kwargs.get("depth", 4),
+            **common,
+        )
+    elif architecture == "resnet1d":
+        return ShortcutResNet1DVelocityNetwork(
+            channels=kwargs.get("channels", 64),
+            num_blocks=kwargs.get("num_blocks", 6),
+            kernel_size=kwargs.get("kernel_size", 5),
+            zero_init_output=kwargs.get("zero_init_output", True),
+            **common,
+        )
+    else:
+        raise ValueError(
+            f"Unknown architecture for shortcut network: {architecture}. "
+            "Available: 'mlp', 'resnet1d'"
+        )
 
 
 def create_velocity_network(
@@ -94,10 +149,13 @@ __all__ = [
     # Base classes
     'BaseVelocityNetwork',
     'BaseConditioning',
-    # Velocity networks
+    # Velocity networks (teacher / standard RF)
     'MLPVelocityNetwork',
     'ResNet1DVelocityNetwork',
     'GatedVelocityNetwork',
+    # Shortcut / F2D2 networks (Stages 2 & 3)
+    'ShortcutMLPVelocityNetwork',
+    'ShortcutResNet1DVelocityNetwork',
     # Deterministic networks
     'ResNet1DDeterministic',
     # Conditioning modules
@@ -107,5 +165,6 @@ __all__ = [
     'CrossAttentionConditioning',
     # Factory functions
     'create_velocity_network',
+    'create_shortcut_network',
     'create_conditioning',
 ]

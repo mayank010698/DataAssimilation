@@ -21,6 +21,7 @@ from .proposals import (
     LearnedNeuralProposal,
     GaussianMixtureProposal,
     RectifiedFlowProposal,
+    ShortcutF2D2Proposal,
 )
 
 __all__ = [
@@ -35,4 +36,5 @@ __all__ = [
     "LearnedNeuralProposal",
     "GaussianMixtureProposal",
     "RectifiedFlowProposal",
+    "ShortcutF2D2Proposal",
 ]
