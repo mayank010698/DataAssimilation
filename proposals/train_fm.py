@@ -624,7 +624,7 @@ def main():
 
     # Conditioning / regularization
     parser.add_argument("--use_observations", action="store_true")
-    parser.add_argument("--cond_dropout", type=float, default=0.0)
+    parser.add_argument("--cond_dropout", type=float, default=0.1)
     parser.add_argument("--obs_components", type=str, default=None)
     parser.add_argument("--prev_state_corr_p0", type=float, default=0.0)
     parser.add_argument("--prev_state_corr_p_min", type=float, default=0.05)
@@ -761,6 +761,9 @@ def main():
     )
 
     if args.evaluate and run_proposal_eval is not None:
+        wandb_run = None
+        if wandb_logger and hasattr(wandb_logger, "experiment"):
+            wandb_run = wandb_logger.experiment
         run_proposal_eval(
             checkpoint_path=best_ckpt,
             data_dir=args.data_dir,
@@ -768,6 +771,7 @@ def main():
             n_vis_trajectories=10,
             batch_size=args.batch_size,
             device="cuda" if (args.gpus > 0 and torch.cuda.is_available()) else "cpu",
+            wandb_run=wandb_run,
         )
 
 

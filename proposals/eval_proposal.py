@@ -28,6 +28,104 @@ from data import (
 )
 from proposals.rectified_flow import RFProposal
 
+
+def _apply_ema_params(model, checkpoint_path: str) -> bool:
+    """Load EMA params from checkpoint and apply them to the model's meanflow_net.
+
+    MeanFlowEMACallback stores EMA weights under 'meanflow_ema_params' in the
+    checkpoint dict.  The keys are parameter names relative to meanflow_net
+    (e.g. 'layers.0.weight'), while the model state_dict saved by Lightning
+    contains the raw (non-EMA) training weights.  This function swaps the EMA
+    weights in so that inference uses the smoothed parameters.
+
+    Returns True if EMA params were found and applied.
+    """
+    load_kw = {"map_location": "cpu"}
+    try:
+        raw = torch.load(checkpoint_path, weights_only=False, **load_kw)
+    except TypeError:
+        raw = torch.load(checkpoint_path, **load_kw)
+
+    ema_params = raw.get("meanflow_ema_params")
+    if not ema_params:
+        return False
+
+    net = model.meanflow_net
+    applied = 0
+    for name, param in net.named_parameters():
+        if name in ema_params:
+            param.data.copy_(ema_params[name])
+            applied += 1
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Applied {applied} EMA params from checkpoint (out of {len(ema_params)} stored)")
+    return applied > 0
+
+
+def load_proposal_from_checkpoint(checkpoint_path: str):
+    """
+    Load Stage 1 RF/FM (RFProposal), Stage 2/3 shortcut (ShortcutProposal),
+    or Stage 2/3 MeanFlow (MeanFlowProposal) from a Lightning checkpoint.
+
+    Detection logic:
+      - hparams has 'tr_sampler' -> MeanFlowProposal
+      - hparams has 'teacher_ckpt_path' (but no 'tr_sampler') -> ShortcutProposal
+      - otherwise -> RFProposal
+
+    For MeanFlow checkpoints, EMA params (stored by MeanFlowEMACallback) are
+    automatically applied if present, since the state_dict contains the raw
+    training weights while val_loss was measured with EMA weights.
+    """
+    load_kw = {"map_location": "cpu"}
+    try:
+        raw = torch.load(checkpoint_path, weights_only=False, **load_kw)
+    except TypeError:
+        raw = torch.load(checkpoint_path, **load_kw)
+    hparams = raw.get("hyper_parameters")
+
+    if isinstance(hparams, dict) and "tr_sampler" in hparams:
+        from proposals.meanflow_proposal import MeanFlowProposal
+
+        model = MeanFlowProposal.load_from_checkpoint(checkpoint_path, strict=False)
+        _apply_ema_params(model, checkpoint_path)
+        return model
+
+    if isinstance(hparams, dict) and "teacher_ckpt_path" in hparams:
+        from proposals.shortcut_flow import ShortcutProposal
+
+        return ShortcutProposal.load_from_checkpoint(checkpoint_path, strict=False)
+
+    return RFProposal.load_from_checkpoint(checkpoint_path)
+
+
+def _get_inference_sampling_steps(model) -> int:
+    """RFProposal uses ``num_sampling_steps``; Shortcut/MeanFlow use ``n_sampling_steps``."""
+    return int(getattr(model, "num_sampling_steps", getattr(model, "n_sampling_steps", 1)))
+
+
+def _set_inference_sampling_steps(model, value: int) -> None:
+    if hasattr(model, "num_sampling_steps"):
+        model.num_sampling_steps = value
+    elif hasattr(model, "n_sampling_steps"):
+        model.n_sampling_steps = value
+    else:
+        raise AttributeError("Model has no sampling step count attribute")
+
+
+def _get_inference_likelihood_steps(model) -> int:
+    """RFProposal uses ``num_likelihood_steps``; Shortcut/MeanFlow use ``n_likelihood_steps``."""
+    return int(getattr(model, "num_likelihood_steps", getattr(model, "n_likelihood_steps", 4)))
+
+
+def _set_inference_likelihood_steps(model, value: int) -> None:
+    if hasattr(model, "num_likelihood_steps"):
+        model.num_likelihood_steps = value
+    elif hasattr(model, "n_likelihood_steps"):
+        model.n_likelihood_steps = value
+    else:
+        raise AttributeError("Model has no likelihood step count attribute")
+
+
 def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
     """
     Compute CRPS for an ensemble.
@@ -240,8 +338,12 @@ def run_proposal_eval(
     config_path = data_path / "config.yaml"
     config = load_config_yaml(config_path)
     
-    # Load Model
-    model = RFProposal.load_from_checkpoint(checkpoint_path)
+    # Load Model (RF/FM or Shortcut / F2D2)
+    model = load_proposal_from_checkpoint(checkpoint_path)
+    if not hasattr(model, "mc_guidance"):
+        model.mc_guidance = False
+    if not hasattr(model, "guidance_scale"):
+        model.guidance_scale = 1.0
 
     # Determine system class
     config_lower = str(config_path).lower()
@@ -267,14 +369,18 @@ def run_proposal_eval(
         
     # Override sampling/likelihood steps if provided
     if num_sampling_steps is not None:
-        logger.info(f"Overriding num_sampling_steps: {model.num_sampling_steps} -> {num_sampling_steps}")
-        model.num_sampling_steps = num_sampling_steps
+        logger.info(
+            f"Overriding num_sampling_steps: {_get_inference_sampling_steps(model)} -> {num_sampling_steps}"
+        )
+        _set_inference_sampling_steps(model, num_sampling_steps)
     if num_likelihood_steps is not None:
-        logger.info(f"Overriding num_likelihood_steps: {model.num_likelihood_steps} -> {num_likelihood_steps}")
-        model.num_likelihood_steps = num_likelihood_steps
-    
-    logger.info(f"Using num_sampling_steps: {model.num_sampling_steps}")
-    logger.info(f"Using num_likelihood_steps: {model.num_likelihood_steps}")
+        logger.info(
+            f"Overriding num_likelihood_steps: {_get_inference_likelihood_steps(model)} -> {num_likelihood_steps}"
+        )
+        _set_inference_likelihood_steps(model, num_likelihood_steps)
+
+    logger.info(f"Using num_sampling_steps: {_get_inference_sampling_steps(model)}")
+    logger.info(f"Using num_likelihood_steps: {_get_inference_likelihood_steps(model)}")
 
     # Extract training process noise from checkpoint path
     train_has_pnoise = False
@@ -322,7 +428,7 @@ def run_proposal_eval(
     # but DataModule loads all. We will limit via Sampler or just stop early.
     data_module = DataAssimilationDataModule(
         config=config,
-        system_class=Lorenz63,
+        system_class=system_class,
         data_dir=str(data_dir),
         batch_size=batch_size,
     )

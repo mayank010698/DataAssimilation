@@ -31,7 +31,7 @@ from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
 from models.ensf import EnsembleScoreFilter
 from models.ensf_proposal import EnsembleScoreFilterWithProposal
-from models.proposals import RectifiedFlowProposal, TransitionProposal
+from models.proposals import RectifiedFlowProposal, ShortcutF2D2Proposal, MeanFlowF2D2Proposal, TransitionProposal
 
 
 def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
@@ -80,21 +80,25 @@ def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
 
 
 def test_rf_log_probs(rf_proposal, system):
-    """Test if RF is returning meaningful log probabilities"""
+    """Test if RF / shortcut proposal is returning meaningful log probabilities"""
     print("\nTesting RF Proposal Log Probs...")
     # Create dummy data
     state_dim = system.state_dim
     x_prev = torch.randn(1, state_dim, device=rf_proposal.device)
-    
+    inner = getattr(rf_proposal, "rf_model", None) or getattr(rf_proposal, "sc_model", None)
+    if inner is None:
+        print("Skipping log-prob smoke test: proposal has no rf_model/sc_model.")
+        return
+
     # Check if model expects observations
-    obs_dim = getattr(rf_proposal.rf_model, "obs_dim", 0)
+    obs_dim = getattr(inner, "obs_dim", 0)
     y_curr = None
     if obs_dim > 0:
         y_curr = torch.randn(1, obs_dim, device=rf_proposal.device)
         print(f"Generated dummy observation (dim={obs_dim}) for testing.")
     
     # Time step: required when RF was trained with use_time_step=True (e.g. len80 debug)
-    use_time_step = getattr(rf_proposal.rf_model, "use_time_step", False)
+    use_time_step = getattr(inner, "use_time_step", False)
     t_sample = torch.tensor(0.0, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
     t_log_prob_100 = torch.zeros(100, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
     t_log_prob_20 = torch.zeros(20, device=rf_proposal.device, dtype=torch.float32) if use_time_step else None
@@ -609,7 +613,9 @@ def log_config_to_wandb(
         "batch_size": args.batch_size,
     }
 
-    if hasattr(pf, "proposal") and isinstance(pf.proposal, RectifiedFlowProposal):
+    if hasattr(pf, "proposal") and isinstance(
+        pf.proposal, (RectifiedFlowProposal, ShortcutF2D2Proposal, MeanFlowF2D2Proposal)
+    ):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
 
     wandb.config.update(wandb_config)
@@ -656,7 +662,13 @@ def parse_args():
     parser.add_argument("--ensf-fallback-physical", action="store_true", help="When set, EnSF with custom proposal uses physical process (TransitionProposal) at steps with no observation")
 
     parser.add_argument(
-        "--proposal-type", type=str, choices=["transition", "rf"], default="transition"
+        "--proposal-type",
+        type=str,
+        choices=["transition", "rf", "shortcut", "meanflow"],
+        default="transition",
+        help="'rf' = RectifiedFlowProposal (FM/RF teacher); "
+        "'shortcut' = ShortcutF2D2Proposal (Stage 2/3 shortcut ckpt); "
+        "'meanflow' = MeanFlowF2D2Proposal (Stage 2/3 MeanFlow ckpt).",
     )
     parser.add_argument("--rf-checkpoint", type=str, default=None)
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
@@ -1374,23 +1386,25 @@ def main():
     print(f"  Std:  {system.init_std}")
 
     # Build proposal distribution
-    # - If proposal_type == "rf", use RectifiedFlowProposal for any method that supports it
-    #   (currently BPF and EnSF-with-proposal).
-    # - Otherwise fall back to the transition prior.
-    if args.proposal_type == "rf":
+    # - "rf": RectifiedFlowProposal (FM/RF teacher checkpoint)
+    # - "shortcut": ShortcutF2D2Proposal (Stage 2 / F2D2 shortcut checkpoint)
+    # - "meanflow": MeanFlowF2D2Proposal (Stage 2 / F2D2 MeanFlow checkpoint)
+    # - Otherwise: transition prior.
+    rf_checkpoint = None
+    if args.proposal_type in ("rf", "shortcut", "meanflow"):
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
-                "Rectified Flow proposal selected (--proposal-type rf) but checkpoint not found. "
-                "Provide --rf-checkpoint pointing to a valid RF .ckpt file."
+                f"{args.proposal_type} proposal selected but checkpoint not found. "
+                "Provide --rf-checkpoint pointing to a valid .ckpt file."
             )
-            
+
         # Attempt to load observation scalers if needed
         obs_mean = None
         obs_std = None
-        
-        # We need to check if data_scaled.h5 exists and load from it
+
         import h5py
+
         data_scaled_path = data_dir / "data_scaled.h5"
         if data_scaled_path.exists():
             with h5py.File(data_scaled_path, "r") as f:
@@ -1399,29 +1413,48 @@ def main():
                     obs_std = torch.from_numpy(f["obs_scaler_std"][:]).float()
                     print(f"Loaded observation scalers from {data_scaled_path}")
 
-        proposal = RectifiedFlowProposal(
-            rf_checkpoint,
-            device=args.device,
-            num_likelihood_steps=args.rf_likelihood_steps,
-            num_sampling_steps=args.rf_sampling_steps,
-            system=system,
-            obs_mean=obs_mean,
-            obs_std=obs_std,
-            mc_guidance=args.mc_guidance,
-            guidance_scale=args.guidance_scale,
-            obs_components=config.obs_components, # Needed to construct observation_fn
-            use_exact_trace=args.use_exact_trace,
-            trace_estimator=args.rf_trace_estimator,
-            num_trace_probes=args.rf_num_probes,
-        )
-        
+        if args.proposal_type == "rf":
+            proposal = RectifiedFlowProposal(
+                rf_checkpoint,
+                device=args.device,
+                num_likelihood_steps=args.rf_likelihood_steps,
+                num_sampling_steps=args.rf_sampling_steps,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                mc_guidance=args.mc_guidance,
+                guidance_scale=args.guidance_scale,
+                obs_components=config.obs_components,
+                use_exact_trace=args.use_exact_trace,
+                trace_estimator=args.rf_trace_estimator,
+                num_trace_probes=args.rf_num_probes,
+            )
+        elif args.proposal_type == "meanflow":
+            proposal = MeanFlowF2D2Proposal(
+                rf_checkpoint,
+                device=args.device,
+                n_sampling_steps=args.rf_sampling_steps,
+                n_likelihood_steps=args.rf_likelihood_steps,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                obs_components=config.obs_components,
+            )
+        else:
+            proposal = ShortcutF2D2Proposal(
+                rf_checkpoint,
+                device=args.device,
+                n_sampling_steps=args.rf_sampling_steps,
+                n_likelihood_steps=args.rf_likelihood_steps,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                obs_components=config.obs_components,
+            )
+
         test_rf_log_probs(proposal, system)
 
-        # RF Proposal wrapper handles scaling internally. 
-        # The filter receives unscaled particles and operates in unscaled space.
-        
     else:
-        rf_checkpoint = None
         proposal = TransitionProposal(system, process_noise_std=args.process_noise_std)
 
     # Setup Weights & Biases
@@ -1443,8 +1476,8 @@ def main():
         if args.batch_size > 1:
             tags.append("batched")
             
-        # Ensure wandb dir exists
-        wandb_dir = Path("/data/da_outputs/wandb")
+        # Writable wandb cache dir (avoid hardcoded /data/... from other hosts).
+        wandb_dir = Path(os.environ.get("WANDB_DIR", str(Path.home() / "wandb")))
         wandb_dir.mkdir(parents=True, exist_ok=True)
 
         wandb_run = wandb.init(

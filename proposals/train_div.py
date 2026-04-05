@@ -1,11 +1,15 @@
 """
 Stage 3: Divergence Head Training (F2D2 Likelihood)
 
-Resumes from a Stage 2 shortcut checkpoint, activates the divergence head,
-and trains the full network (velocity + divergence) using the F2D2 likelihood loss.
+Resumes from a Stage 2 shortcut or MeanFlow checkpoint, activates the
+divergence head, and trains the full network (velocity + divergence) using
+the F2D2 likelihood loss.
 
-After Stage 3 the checkpoint can be loaded as ShortcutProposal and used for
-fast log_prob() evaluation (4 NFEs instead of 50 × D Jacobian passes).
+Supports both Shortcut and MeanFlow Stage 2 checkpoints.  The checkpoint
+type is auto-detected from hyperparameters ('tr_sampler' present => MeanFlow).
+
+After Stage 3 the checkpoint can be loaded as ShortcutProposal or
+MeanFlowProposal and used for fast log_prob() evaluation.
 
 Usage:
     python proposals/train_div.py \
@@ -34,7 +38,24 @@ if __name__ == "__main__":
     sys.path.append(str(Path(__file__).parent.parent))
 
 from shortcut_flow import ShortcutProposal, ShortcutEMACallback
+from meanflow_proposal import MeanFlowProposal, MeanFlowEMACallback
 from rf_dataset import RFDataModule
+
+try:
+    from eval_proposal import run_proposal_eval, _derive_eval_run_name
+except ImportError:
+    from proposals.eval_proposal import run_proposal_eval, _derive_eval_run_name
+
+
+def _is_meanflow_checkpoint(ckpt_path: str) -> bool:
+    """Detect whether a Stage 2 checkpoint is MeanFlow (vs Shortcut)."""
+    load_kw = {"map_location": "cpu"}
+    try:
+        raw = torch.load(ckpt_path, weights_only=False, **load_kw)
+    except TypeError:
+        raw = torch.load(ckpt_path, **load_kw)
+    hparams = raw.get("hyper_parameters", {})
+    return isinstance(hparams, dict) and "tr_sampler" in hparams
 
 
 def setup_logging(log_dir: Path):
@@ -73,9 +94,15 @@ def train_divergence(
     save_every_n_epochs: Optional[int] = None,
     debug_random_obs: bool = False,
     debug_random_prev_state: bool = False,
+    # MeanFlow-specific: freeze backbone+velocity_head so Stage 3 only trains
+    # the divergence head, preserving the coarse-step structure from Stage 2.
+    freeze_velocity: bool = True,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not use_observations:
+        obs_dim = 0
 
     logger_obj = setup_logging(output_dir)
     logger_obj.info("=" * 80)
@@ -98,30 +125,59 @@ def train_divergence(
     total_steps = num_batches * max_epochs
     logger_obj.info(f"  Batches/epoch: {num_batches}, total steps: {total_steps}")
 
-    # Load Stage 2 checkpoint, overriding training stage
-    # Lightning's load_from_checkpoint passes extra kwargs as hparam overrides.
-    model = ShortcutProposal.load_from_checkpoint(
-        shortcut_ckpt,
-        training_stage="f2d2",
-        teacher_ckpt_path=teacher_ckpt,
-        teacher_div_estimator=teacher_div_estimator,
-        div_scale=div_scale,
-        learning_rate=learning_rate,
-        denoise_timesteps=denoise_timesteps,
-        lr_warmup_steps=lr_warmup_steps,
-        debug_random_obs=debug_random_obs,
-        debug_random_prev_state=debug_random_prev_state,
-    )
+    # Detect checkpoint type and load the correct class
+    is_meanflow = _is_meanflow_checkpoint(shortcut_ckpt)
+    logger_obj.info(f"  Checkpoint type:  {'MeanFlow' if is_meanflow else 'Shortcut'}")
 
-    # Activate the divergence head
-    model.shortcut_net.div_head_active = True
-    model.training_stage = "f2d2"
+    if is_meanflow:
+        model = MeanFlowProposal.load_from_checkpoint(
+            shortcut_ckpt,
+            strict=False,
+            training_stage="mf_f2d2",
+            teacher_ckpt_path=teacher_ckpt,
+            teacher_div_estimator=teacher_div_estimator,
+            div_scale=div_scale,
+            learning_rate=learning_rate,
+            denoise_timesteps=denoise_timesteps,
+            lr_warmup_steps=lr_warmup_steps,
+            debug_random_obs=debug_random_obs,
+            debug_random_prev_state=debug_random_prev_state,
+            freeze_velocity=freeze_velocity,
+        )
+        model.meanflow_net.div_head_active = True
+        model.training_stage = "mf_f2d2"
+        if freeze_velocity:
+            # Hard-freeze backbone + velocity_head so Stage 3 cannot overwrite
+            # the coarse-step mean-field structure trained in Stage 2.
+            for name, param in model.meanflow_net.named_parameters():
+                if "div_head" not in name:
+                    param.requires_grad_(False)
+            logger_obj.info(
+                "  freeze_velocity=True: backbone and velocity_head are frozen. "
+                "Only div_head will be trained."
+            )
+        ema_callback = MeanFlowEMACallback(ema_beta=ema_beta)
+    else:
+        model = ShortcutProposal.load_from_checkpoint(
+            shortcut_ckpt,
+            strict=False,
+            training_stage="f2d2",
+            teacher_ckpt_path=teacher_ckpt,
+            teacher_div_estimator=teacher_div_estimator,
+            div_scale=div_scale,
+            learning_rate=learning_rate,
+            denoise_timesteps=denoise_timesteps,
+            lr_warmup_steps=lr_warmup_steps,
+            debug_random_obs=debug_random_obs,
+            debug_random_prev_state=debug_random_prev_state,
+        )
+        model.shortcut_net.div_head_active = True
+        model.training_stage = "f2d2"
+        ema_callback = ShortcutEMACallback(ema_beta=ema_beta)
 
     logger_obj.info(
         f"  Parameters: {sum(p.numel() for p in model.parameters()):,}"
     )
-
-    ema_callback = ShortcutEMACallback(ema_beta=ema_beta)
     checkpoint_callback = ModelCheckpoint(
         dirpath=output_dir / "checkpoints",
         filename="f2d2-{epoch:03d}-{val_loss:.6f}",
@@ -180,12 +236,12 @@ def train_divergence(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage 3: Train divergence head (F2D2 likelihood) from Stage 2 shortcut ckpt"
+        description="Stage 3: Train divergence head (F2D2 likelihood) from Stage 2 shortcut or MeanFlow ckpt"
     )
 
     # Required
     parser.add_argument("--shortcut_ckpt", type=str, required=True,
-                        help="Path to Stage 2 ShortcutProposal checkpoint")
+                        help="Path to Stage 2 ShortcutProposal or MeanFlowProposal checkpoint")
     parser.add_argument("--teacher_ckpt", type=str, required=True,
                         help="Path to frozen teacher RFProposal checkpoint (for divergence targets)")
     parser.add_argument("--data_dir", type=str, required=True)
@@ -225,6 +281,48 @@ def main():
     parser.add_argument("--debug_random_obs", action="store_true")
     parser.add_argument("--debug_random_prev_state", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--freeze_velocity",
+        action="store_true",
+        default=True,
+        help="(MeanFlow only) Freeze backbone+velocity_head; only train div_head. "
+             "Recommended — prevents Stage 3 from erasing Stage 2 coarse-step structure.",
+    )
+    parser.add_argument(
+        "--no_freeze_velocity",
+        dest="freeze_velocity",
+        action="store_false",
+        help="Disable velocity freezing (trains full network, as in Shortcut F2D2).",
+    )
+
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help="After training, run autoregressive eval (eval_proposal); logs to the same W&B run",
+    )
+    parser.add_argument(
+        "--no_wandb_eval",
+        action="store_true",
+        help="With --evaluate only when no training W&B run exists, skip starting eval W&B (unused after training)",
+    )
+    parser.add_argument(
+        "--eval_run_name",
+        type=str,
+        default=None,
+        help="W&B run name for eval if a new run must be started (default: derived from checkpoint path)",
+    )
+    parser.add_argument(
+        "--eval_num_sampling_steps",
+        type=int,
+        default=None,
+        help="Override Euler steps for autoregressive sampling in --evaluate (Shortcut: default from checkpoint)",
+    )
+    parser.add_argument(
+        "--eval_num_likelihood_steps",
+        type=int,
+        default=None,
+        help="Override likelihood integration steps in --evaluate (default: checkpoint)",
+    )
 
     args = parser.parse_args()
 
@@ -238,10 +336,22 @@ def main():
     if obs_components is not None:
         args.obs_dim = len(obs_components)
 
+    config_path = Path(args.data_dir) / "config.yaml"
+    if config_path.exists():
+        try:
+            from data import load_config_yaml
+            config = load_config_yaml(config_path)
+            if obs_components is None:
+                obs_components = getattr(config, "obs_components", None)
+                if obs_components is not None:
+                    args.obs_dim = len(obs_components)
+        except Exception:
+            pass
+
     if args.seed is not None:
         pl.seed_everything(args.seed, workers=True)
 
-    train_divergence(
+    _, best_checkpoint, wandb_logger = train_divergence(
         shortcut_ckpt=args.shortcut_ckpt,
         teacher_ckpt=args.teacher_ckpt,
         data_dir=args.data_dir,
@@ -267,7 +377,60 @@ def main():
         save_every_n_epochs=args.save_every_n_epochs,
         debug_random_obs=args.debug_random_obs,
         debug_random_prev_state=args.debug_random_prev_state,
+        freeze_velocity=args.freeze_velocity,
     )
+
+    if args.evaluate:
+        import wandb
+
+        out = Path(args.output_dir)
+        checkpoint_to_eval = best_checkpoint
+        if not checkpoint_to_eval:
+            last_ckpt = out / "checkpoints" / "last.ckpt"
+            if last_ckpt.is_file():
+                checkpoint_to_eval = str(last_ckpt)
+            else:
+                final_ckpt = out / "f2d2_final.ckpt"
+                checkpoint_to_eval = str(final_ckpt) if final_ckpt.is_file() else None
+
+        if not checkpoint_to_eval:
+            raise RuntimeError("--evaluate set but no checkpoint path (best/last/final missing)")
+
+        wandb_run = None
+        wandb_started_for_eval_only = False
+        if wandb_logger is not None and hasattr(wandb_logger, "experiment"):
+            wandb_run = wandb_logger.experiment
+        elif not args.no_wandb_eval:
+            ckpt = Path(checkpoint_to_eval).resolve()
+            try:
+                wandb_dir = ckpt.parents[1] / "wandb"
+            except IndexError:
+                wandb_dir = Path(".") / "wandb"
+            wandb_dir.mkdir(parents=True, exist_ok=True)
+            run_name = args.eval_run_name or _derive_eval_run_name(str(ckpt))
+            wandb_run = wandb.init(
+                entity="ml-climate",
+                project=args.wandb_project,
+                name=run_name,
+                dir=str(wandb_dir),
+            )
+            wandb_started_for_eval_only = True
+
+        try:
+            run_proposal_eval(
+                checkpoint_path=checkpoint_to_eval,
+                data_dir=args.data_dir,
+                n_trajectories=None,
+                n_vis_trajectories=10,
+                batch_size=args.batch_size,
+                device="cuda" if (args.gpus > 0 and torch.cuda.is_available()) else "cpu",
+                wandb_run=wandb_run,
+                num_sampling_steps=args.eval_num_sampling_steps,
+                num_likelihood_steps=args.eval_num_likelihood_steps,
+            )
+        finally:
+            if wandb_started_for_eval_only:
+                wandb.finish()
 
 
 if __name__ == "__main__":

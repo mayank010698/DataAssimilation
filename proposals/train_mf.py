@@ -1,24 +1,23 @@
 """
-Stage 2: Shortcut Distillation Training
+Stage 2 (MeanFlow): MeanFlow Training
 
-Distils a frozen teacher RFProposal (from train_rf.py or train_fm.py) into a
-ShortcutProposal using the shortcut self-consistency loss.
+Trains a MeanFlowProposal using the JVP-based self-consistency loss.
+No teacher checkpoint is needed for this stage.
 
-After training you can proceed to Stage 3 (train_div.py) using the best checkpoint.
+After training you can proceed to Stage 3 (train_div.py) using the best
+checkpoint, which will add a divergence head for fast log_prob evaluation.
 
 Usage:
-    python proposals/train_sc.py \
-        --teacher_ckpt /path/to/teacher.ckpt \
+    python proposals/train_mf.py \
         --data_dir /path/to/data \
         --output_dir /path/to/output \
         --state_dim 40 --obs_dim 20 --architecture resnet1d \
-        --denoise_timesteps 1024 --max_epochs 200 \
-        --evaluate
+        --max_epochs 300 --evaluate
 
-    Eval-only (same as train_rf.py --checkpoint pattern):
-    python proposals/train_sc.py --data_dir /path/to/data \
-        --checkpoint /path/to/sc.ckpt --evaluate \
-        --eval_num_sampling_steps 4
+    Eval-only (same pattern as train_sc.py / train_rf.py):
+    python proposals/train_mf.py --data_dir /path/to/data \
+        --checkpoint /path/to/mf.ckpt --evaluate \
+        --eval_num_sampling_steps 1
 """
 
 import torch
@@ -36,7 +35,7 @@ if __name__ == "__main__":
     sys.path.append(str(Path(__file__).parent))
     sys.path.append(str(Path(__file__).parent.parent))
 
-from shortcut_flow import ShortcutProposal, ShortcutEMACallback
+from meanflow_proposal import MeanFlowProposal, MeanFlowEMACallback
 from rf_dataset import RFDataModule
 
 try:
@@ -55,8 +54,7 @@ def setup_logging(log_dir: Path):
     return logging.getLogger(__name__)
 
 
-def train_shortcut(
-    teacher_ckpt: str,
+def train_meanflow(
     data_dir: str,
     output_dir: str,
     state_dim: int = 3,
@@ -79,11 +77,10 @@ def train_shortcut(
     predict_delta: bool = False,
     use_time_step: bool = False,
     trajectory_length: int = 1000,
-    denoise_timesteps: int = 1024,
     ema_beta: float = 0.9999,
     lr_warmup_steps: int = 0,
     grad_clip_val: float = 0.01,
-    wandb_project: str = "rf-shortcut",
+    wandb_project: str = "rf-meanflow",
     save_every_n_epochs: Optional[int] = None,
     debug_random_obs: bool = False,
     debug_random_prev_state: bool = False,
@@ -94,6 +91,15 @@ def train_shortcut(
     div_hidden_dim: int = 64,
     n_sampling_steps: int = 1,
     n_likelihood_steps: int = 4,
+    # MeanFlow-specific
+    tr_sampler: str = "v1",
+    P_mean_s: float = -0.6,
+    P_std_s: float = 1.6,
+    P_mean_r: float = -4.0,
+    P_std_r: float = 1.6,
+    ratio: float = 0.9,
+    norm_p: float = 0.75,
+    norm_eps: float = 1e-3,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,11 +109,11 @@ def train_shortcut(
 
     logger_obj = setup_logging(output_dir)
     logger_obj.info("=" * 80)
-    logger_obj.info("Stage 2: Shortcut Distillation")
+    logger_obj.info("Stage 2: MeanFlow Training (JVP self-consistency)")
     logger_obj.info("=" * 80)
-    logger_obj.info(f"  Teacher:         {teacher_ckpt}")
     logger_obj.info(f"  Architecture:    {architecture}, state_dim={state_dim}, obs_dim={obs_dim}")
-    logger_obj.info(f"  denoise_timesteps: {denoise_timesteps}")
+    logger_obj.info(f"  Time sampler:    {tr_sampler}, ratio={ratio}")
+    logger_obj.info(f"  Adaptive weight: norm_p={norm_p}, norm_eps={norm_eps}")
     logger_obj.info(f"  EMA beta:        {ema_beta}")
     logger_obj.info(f"  LR warmup steps: {lr_warmup_steps}")
 
@@ -124,10 +130,9 @@ def train_shortcut(
     total_steps = num_batches * max_epochs
     logger_obj.info(f"  Batches/epoch: {num_batches}, total steps: {total_steps}")
 
-    model = ShortcutProposal(
+    model = MeanFlowProposal(
         state_dim=state_dim,
-        teacher_ckpt_path=teacher_ckpt,
-        training_stage="sc",
+        training_stage="mf",
         architecture=architecture,
         hidden_dim=hidden_dim,
         depth=depth,
@@ -149,8 +154,15 @@ def train_shortcut(
         prev_state_corr_sigma=prev_state_corr_sigma,
         prev_state_corr_mask_ratio=prev_state_corr_mask_ratio,
         learning_rate=learning_rate,
-        denoise_timesteps=denoise_timesteps,
         lr_warmup_steps=lr_warmup_steps,
+        tr_sampler=tr_sampler,
+        P_mean_s=P_mean_s,
+        P_std_s=P_std_s,
+        P_mean_r=P_mean_r,
+        P_std_r=P_std_r,
+        ratio=ratio,
+        norm_p=norm_p,
+        norm_eps=norm_eps,
         n_sampling_steps=n_sampling_steps,
         n_likelihood_steps=n_likelihood_steps,
         div_hidden_dim=div_hidden_dim,
@@ -160,10 +172,10 @@ def train_shortcut(
         f"  Parameters: {sum(p.numel() for p in model.parameters()):,}"
     )
 
-    ema_callback = ShortcutEMACallback(ema_beta=ema_beta)
+    ema_callback = MeanFlowEMACallback(ema_beta=ema_beta)
     checkpoint_callback = ModelCheckpoint(
         dirpath=output_dir / "checkpoints",
-        filename="sc-{epoch:03d}-{val_loss:.6f}",
+        filename="mf-{epoch:03d}-{val_loss:.6f}",
         monitor="val_loss",
         mode="min",
         save_top_k=3,
@@ -177,7 +189,7 @@ def train_shortcut(
     if save_every_n_epochs is not None and save_every_n_epochs > 0:
         periodic_ckpt = ModelCheckpoint(
             dirpath=output_dir / "checkpoints",
-            filename="sc-periodic-{epoch:03d}",
+            filename="mf-periodic-{epoch:03d}",
             every_n_epochs=save_every_n_epochs,
             save_top_k=-1,
             save_on_train_epoch_end=True,
@@ -202,15 +214,19 @@ def train_shortcut(
         precision=32,
     )
 
-    logger_obj.info("Starting Stage 2 (shortcut) training …")
+    logger_obj.info("Starting Stage 2 (MeanFlow) training ...")
     trainer.fit(model, data_module)
-    logger_obj.info("Stage 2 training completed.")
+    logger_obj.info("Stage 2 (MeanFlow) training completed.")
     logger_obj.info(f"Best checkpoint: {checkpoint_callback.best_model_path}")
 
-    final_path = output_dir / "sc_final.ckpt"
+    final_path = output_dir / "mf_final.ckpt"
     trainer.save_checkpoint(final_path)
 
-    return model, checkpoint_callback.best_model_path, wandb_logger
+    # Prefer the best val_loss checkpoint (EMA params are embedded and will be
+    # applied automatically by load_proposal_from_checkpoint).
+    best_ckpt = checkpoint_callback.best_model_path
+
+    return model, best_ckpt, wandb_logger
 
 
 # ---------------------------------------------------------------------------
@@ -219,19 +235,13 @@ def train_shortcut(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Stage 2: Shortcut distillation from a flow-matching teacher"
+        description="Stage 2: MeanFlow training (JVP self-consistency, no teacher needed)"
     )
 
-    parser.add_argument(
-        "--teacher_ckpt",
-        type=str,
-        default=None,
-        help="Path to frozen teacher RFProposal checkpoint (required for training; omit if only --checkpoint + --evaluate)",
-    )
     parser.add_argument("--data_dir", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default=None)
 
-    # Architecture (must match teacher)
+    # Architecture
     parser.add_argument("--state_dim", type=int, default=3)
     parser.add_argument("--obs_dim", type=int, default=0)
     parser.add_argument("--architecture", type=str, default="mlp", choices=["mlp", "resnet1d"])
@@ -252,9 +262,26 @@ def main():
                         help="Comma-separated observed state indices, e.g. '0,2,4'")
     parser.add_argument("--cond_dropout", type=float, default=0.0)
 
-    # Shortcut-specific
-    parser.add_argument("--denoise_timesteps", type=int, default=1024,
-                        help="Number of discrete time steps for uniform t-sampling")
+    # MeanFlow time sampling
+    parser.add_argument("--tr_sampler", type=str, default="v1", choices=["v0", "v1"],
+                        help="Joint (s,r) sampling strategy: 'v0' (paper) or 'v1' (improved)")
+    parser.add_argument("--P_mean_s", type=float, default=-0.6,
+                        help="Logit-normal mean for s sampling")
+    parser.add_argument("--P_std_s", type=float, default=1.6,
+                        help="Logit-normal std for s sampling")
+    parser.add_argument("--P_mean_r", type=float, default=-4.0,
+                        help="Logit-normal mean for r sampling")
+    parser.add_argument("--P_std_r", type=float, default=1.6,
+                        help="Logit-normal std for r sampling")
+    parser.add_argument("--ratio", type=float, default=0.9,
+                        help="Probability that s != r (non-degenerate interval)")
+    parser.add_argument("--norm_p", type=float, default=0.75,
+                        help="Adaptive loss reweighting exponent (py-meanflow default: 0.75, "
+                             "gives effective loss ~ L^0.25 to compress outliers)")
+    parser.add_argument("--norm_eps", type=float, default=1e-3,
+                        help="Adaptive loss reweighting epsilon")
+
+    # EMA / training
     parser.add_argument("--ema_beta", type=float, default=0.9999)
     parser.add_argument("--lr_warmup_steps", type=int, default=0)
     parser.add_argument("--grad_clip_val", type=float, default=0.01)
@@ -277,61 +304,37 @@ def main():
     parser.add_argument("--prev_state_corr_mask_ratio", type=float, default=0.0)
 
     # Logging
-    parser.add_argument("--wandb_project", type=str, default="rf-shortcut")
-    parser.add_argument(
-        "--no_wandb_eval",
-        action="store_true",
-        help="With --checkpoint --evaluate, skip starting a new W&B run for eval-only (no effect after training)",
-    )
-    parser.add_argument(
-        "--eval_run_name",
-        type=str,
-        default=None,
-        help="W&B run name for eval-only mode; default derives from checkpoint path",
-    )
+    parser.add_argument("--wandb_project", type=str, default="rf-meanflow")
+    parser.add_argument("--no_wandb_eval", action="store_true",
+                        help="With --checkpoint --evaluate, skip starting a new W&B run")
+    parser.add_argument("--eval_run_name", type=str, default=None,
+                        help="W&B run name for eval-only mode")
     parser.add_argument("--save_every_n_epochs", type=int, default=None)
     parser.add_argument("--debug_random_obs", action="store_true")
     parser.add_argument("--debug_random_prev_state", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
 
-    parser.add_argument(
-        "--evaluate",
-        action="store_true",
-        help="Run autoregressive eval (eval_proposal): after training, logs to the same W&B run; with --checkpoint only, starts a new W&B run unless --no_wandb_eval",
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Skip training and only run --evaluate on this shortcut checkpoint (same pattern as train_rf.py)",
-    )
-    parser.add_argument(
-        "--eval_num_sampling_steps",
-        type=int,
-        default=None,
-        help="Override Euler steps for autoregressive sampling in --evaluate (Shortcut: matches oracle n_steps; default: checkpoint)",
-    )
-    parser.add_argument(
-        "--eval_num_likelihood_steps",
-        type=int,
-        default=None,
-        help="Override likelihood integration steps in --evaluate (default: checkpoint)",
-    )
+    parser.add_argument("--evaluate", action="store_true",
+                        help="Run autoregressive eval after training (or with --checkpoint)")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Skip training and only run --evaluate on this checkpoint")
+    parser.add_argument("--eval_num_sampling_steps", type=int, default=None,
+                        help="Override Euler steps for autoregressive sampling in --evaluate")
+    parser.add_argument("--eval_num_likelihood_steps", type=int, default=None,
+                        help="Override likelihood integration steps in --evaluate")
 
     args = parser.parse_args()
 
     if args.output_dir is None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        args.output_dir = f"/data/da_outputs/sc_runs/run_{ts}"
+        args.output_dir = f"/data/da_outputs/mf_runs/run_{ts}"
 
-    # Parse obs_components
     obs_components = None
     if args.obs_components is not None:
         obs_components = [int(i) for i in args.obs_components.split(",") if i.strip()]
     if obs_components is not None:
         args.obs_dim = len(obs_components)
 
-    # Try loading trajectory_length from config
     config_path = Path(args.data_dir) / "config.yaml"
     if config_path.exists():
         try:
@@ -349,13 +352,9 @@ def main():
     if args.seed is not None:
         pl.seed_everything(args.seed, workers=True)
 
-    if args.checkpoint is None and not args.teacher_ckpt:
-        parser.error("--teacher_ckpt is required when training (omit only for eval-only: --checkpoint with --evaluate)")
-
     wandb_logger = None
     if args.checkpoint is None:
-        _, best_checkpoint, wandb_logger = train_shortcut(
-            teacher_ckpt=args.teacher_ckpt,
+        _, best_checkpoint, wandb_logger = train_meanflow(
             data_dir=args.data_dir,
             output_dir=args.output_dir,
             state_dim=args.state_dim,
@@ -378,7 +377,6 @@ def main():
             predict_delta=args.predict_delta,
             use_time_step=args.use_time_step,
             trajectory_length=args.trajectory_length,
-            denoise_timesteps=args.denoise_timesteps,
             ema_beta=args.ema_beta,
             lr_warmup_steps=args.lr_warmup_steps,
             grad_clip_val=args.grad_clip_val,
@@ -393,6 +391,14 @@ def main():
             div_hidden_dim=args.div_hidden_dim,
             n_sampling_steps=args.n_sampling_steps,
             n_likelihood_steps=args.n_likelihood_steps,
+            tr_sampler=args.tr_sampler,
+            P_mean_s=args.P_mean_s,
+            P_std_s=args.P_std_s,
+            P_mean_r=args.P_mean_r,
+            P_std_r=args.P_std_r,
+            ratio=args.ratio,
+            norm_p=args.norm_p,
+            norm_eps=args.norm_eps,
         )
         checkpoint_to_eval = best_checkpoint
     else:

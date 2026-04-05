@@ -595,7 +595,7 @@ class ShortcutF2D2Proposal(ProposalDistribution):
         from proposals.shortcut_flow import ShortcutProposal
 
         self.sc_model = ShortcutProposal.load_from_checkpoint(
-            checkpoint_path, map_location=device
+            checkpoint_path, map_location=device, strict=False
         )
         self.sc_model.eval()
         self.sc_model.to(device)
@@ -710,3 +710,141 @@ class ShortcutF2D2Proposal(ProposalDistribution):
             )
 
         return self.sc_model.log_prob(x_curr, x_prev, y_curr, t=t)
+
+
+# =============================================================================
+# MeanFlow + F2D2 Proposal (MeanFlow Stages 2 & 3 of the F2D2 pipeline)
+# =============================================================================
+
+
+class MeanFlowF2D2Proposal(ProposalDistribution):
+    """
+    Fast proposal distribution backed by a trained MeanFlowProposal (F2D2).
+
+    Same interface as ShortcutF2D2Proposal but loads a MeanFlowProposal
+    checkpoint instead of a ShortcutProposal checkpoint:
+    - sample()   : n_sampling_steps  forward Euler steps (default 1 NFE)
+    - log_prob() : n_likelihood_steps backward Euler via divergence head (default 4 NFEs)
+
+    Args:
+        checkpoint_path:    Path to MeanFlow Stage 2 or Stage 3 (F2D2) checkpoint.
+        device:             Torch device string.
+        n_sampling_steps:   Override inference sampling steps (1 = single NFE).
+        n_likelihood_steps: Override inference log-prob steps (4 NFEs default).
+        system:             DynamicalSystem for pre/post processing (optional).
+        obs_mean:           Observation mean tensor for normalisation.
+        obs_std:            Observation std tensor for normalisation.
+        obs_components:     List of observed state indices (to slice obs scalers).
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        n_sampling_steps: Optional[int] = None,
+        n_likelihood_steps: Optional[int] = None,
+        system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
+        obs_components: Optional[list] = None,
+    ):
+        import sys
+        from pathlib import Path
+
+        proposals_dir = Path(__file__).parent.parent / "proposals"
+        if str(proposals_dir) not in sys.path:
+            sys.path.insert(0, str(proposals_dir))
+
+        from proposals.meanflow_proposal import MeanFlowProposal
+
+        self.mf_model = MeanFlowProposal.load_from_checkpoint(
+            checkpoint_path, map_location=device, strict=False
+        )
+        self.mf_model.eval()
+        self.mf_model.to(device)
+        for param in self.mf_model.parameters():
+            param.requires_grad = False
+
+        self.device = device
+        self.system = system
+
+        if n_sampling_steps is not None:
+            self.mf_model.n_sampling_steps = n_sampling_steps
+        if n_likelihood_steps is not None:
+            self.mf_model.n_likelihood_steps = n_likelihood_steps
+
+        self.state_dim = self.mf_model.state_dim
+
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+
+    # ---- helpers ----
+
+    def _to_device(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.to(self.device) if x.device.type != self.device else x
+
+    def _scale_obs(self, y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = self._to_device(y)
+        if self.obs_mean is not None and self.obs_std is not None:
+            y = (y - self.obs_mean) / self.obs_std
+        return y
+
+    # ---- ProposalDistribution interface ----
+
+    def sample(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.mf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "MeanFlowProposal has use_time_step=True but t was not provided."
+            )
+
+        x_curr_scaled = self.mf_model.sample(x_prev, y_curr, t=t)
+
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+        return x_curr_scaled
+
+    def log_prob(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_curr = self._to_device(x_curr)
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+
+        if getattr(self.mf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "MeanFlowProposal has use_time_step=True but t was not provided."
+            )
+
+        return self.mf_model.log_prob(x_curr, x_prev, y_curr, t=t)
