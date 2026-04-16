@@ -548,6 +548,199 @@ class RectifiedFlowProposal(ProposalDistribution):
 
 
 # =============================================================================
+# Localized Rectified Flow Proposal (patch-based, per-dim log-density)
+# =============================================================================
+
+
+class LocalizedRFProposalWrapper(ProposalDistribution):
+    """
+    Wrapper for a trained LocalizedRFProposal usable as a ProposalDistribution.
+
+    This sibling of RectifiedFlowProposal loads a patch-based local velocity
+    network and exposes:
+
+      - `sample(x_prev, y_curr, dt, ...)`             - standard PF interface
+      - `log_prob(x_curr, x_prev, y_curr, dt, ...)`   - global scalar log-density
+      - `sample_and_per_dim_log_prob(x_prev, y_curr, t=None)` - (x_t, ell) where
+        ell has shape (..., N_x) such that `sum_j ell_j == log q(x_t | x_{t-1}, y_t)`
+
+    The last method is the one exploited by `LocalizedParticleFilter` when
+    `weight_type='full'`. All three methods handle preprocessing/postprocessing
+    (via `system`) and observation scaling in the same way as
+    `RectifiedFlowProposal`.
+
+    Args:
+        checkpoint_path: Path to the trained LocalizedRFProposal checkpoint.
+        device: Torch device string.
+        num_sampling_steps / num_likelihood_steps: Optional overrides.
+        system: DynamicalSystem for pre/post scaling (optional).
+        obs_mean / obs_std: Observation scalers (optional).
+        obs_components: Indices of observed state sites (optional, for scaling).
+        state_dim_override: Override the network's default state_dim at
+            inference time (for zero-shot transfer e.g. L96-40 -> L96-400).
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        num_sampling_steps: Optional[int] = None,
+        num_likelihood_steps: Optional[int] = None,
+        system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
+        obs_components: Optional[list] = None,
+        state_dim_override: Optional[int] = None,
+    ):
+        import sys
+        from pathlib import Path
+
+        proposals_dir = Path(__file__).parent.parent / "proposals"
+        if str(proposals_dir) not in sys.path:
+            sys.path.insert(0, str(proposals_dir))
+
+        from proposals.localized_rf import LocalizedRFProposal
+
+        self.lrf_model = LocalizedRFProposal.load_from_checkpoint(
+            checkpoint_path, map_location=device, strict=False
+        )
+        self.lrf_model.eval()
+        self.lrf_model.to(device)
+        for param in self.lrf_model.parameters():
+            param.requires_grad = False
+
+        self.device = device
+        self.system = system
+
+        if num_sampling_steps is not None:
+            self.lrf_model.num_sampling_steps = num_sampling_steps
+        if num_likelihood_steps is not None:
+            self.lrf_model.num_likelihood_steps = num_likelihood_steps
+
+        self.state_dim = (
+            state_dim_override
+            if state_dim_override is not None
+            else self.lrf_model.state_dim_default
+        )
+        # Zero-shot override: expose a different state_dim without retraining.
+        if state_dim_override is not None:
+            self.lrf_model.state_dim_default = state_dim_override
+
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+            # The model also needs obs_components to scatter sparse obs -> dense
+            if self.lrf_model.obs_components is None:
+                self.lrf_model.obs_components = list(obs_components)
+
+    # ---- helpers ----
+
+    def _to_device(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.to(self.device) if x.device.type != self.device else x
+
+    def _scale_obs(self, y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = self._to_device(y)
+        if self.obs_mean is not None and self.obs_std is not None:
+            y = (y - self.obs_mean) / self.obs_std
+        return y
+
+    # ---- ProposalDistribution interface ----
+
+    def sample(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.lrf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "LocalizedRFProposal has use_time_step=True but t was not provided."
+            )
+
+        x_curr_scaled = self.lrf_model.sample(x_prev, y_curr, dt, t=t)
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+        return x_curr_scaled
+
+    def log_prob(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_curr = self._to_device(x_curr)
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+
+        if getattr(self.lrf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "LocalizedRFProposal has use_time_step=True but t was not provided."
+            )
+
+        return self.lrf_model.log_prob(x_curr, x_prev, y_curr, dt, t=t)
+
+    # ---- Extended interface for LocalizedParticleFilter(weight_type='full') ----
+
+    def sample_and_per_dim_log_prob(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """
+        Return (x_t, ell) where ell has shape (..., N_x) decomposes the
+        log-density site-by-site. `sum(ell, dim=-1) == self.log_prob(x_t, x_prev, ...)`.
+
+        Handles the same pre/post-processing as `sample`. The returned `ell`
+        lives in the model's native (scaled) space — the same space used when
+        computing per-dim transition log-probabilities for the full-weight
+        correction — and the state `x_t` is post-processed back to physical space.
+        """
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.lrf_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "LocalizedRFProposal has use_time_step=True but t was not provided."
+            )
+
+        x_curr_scaled, ell = self.lrf_model.sample_and_per_dim_log_prob(
+            x_prev, y_curr, t=t
+        )
+
+        if self.system is not None:
+            x_curr = self.system.postprocess(x_curr_scaled)
+        else:
+            x_curr = x_curr_scaled
+        return x_curr, ell
+
+
+# =============================================================================
 # Shortcut + F2D2 Proposal (Stages 2 & 3 of the F2D2 pipeline)
 # =============================================================================
 

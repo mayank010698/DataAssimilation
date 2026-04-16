@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import lightning.pytorch as pl
 import numpy as np
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from torchdiffeq import odeint, odeint_adjoint
 import logging
 
@@ -28,6 +28,8 @@ except ImportError:
         BaseVelocityNetwork,
         GatedVelocityNetwork,
     )
+
+logger = logging.getLogger(__name__)
 
 
 class RFProposal(pl.LightningModule):
@@ -106,6 +108,10 @@ class RFProposal(pl.LightningModule):
         state_scaler_std: Optional[torch.Tensor] = None,
         obs_scaler_mean: Optional[torch.Tensor] = None,
         obs_scaler_std: Optional[torch.Tensor] = None,
+        sampling_grid_type: str = 'uniform',
+        sampling_grid_param: Optional[Any] = None,
+        likelihood_grid_type: str = 'uniform',
+        likelihood_grid_param: Optional[Any] = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -144,6 +150,10 @@ class RFProposal(pl.LightningModule):
         self._state_scaler_std = state_scaler_std
         self._obs_scaler_mean = obs_scaler_mean
         self._obs_scaler_std = obs_scaler_std
+        self.sampling_grid_type = sampling_grid_type
+        self.sampling_grid_param = sampling_grid_param
+        self.likelihood_grid_type = likelihood_grid_type
+        self.likelihood_grid_param = likelihood_grid_param
 
         if self.use_gated_obs_correction and self.obs_dim == 0:
             raise ValueError(
@@ -282,6 +292,101 @@ class RFProposal(pl.LightningModule):
             self.prev_state_corr_p_min,
             self.prev_state_corr_p0 * (1.0 - progress),
         )
+
+    def _build_time_grid(
+        self,
+        n_steps: int,
+        grid_type: str = "uniform",
+        grid_kwargs: Optional[Any] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> torch.Tensor:
+        """Build a monotone time grid on [0, 1] with n_steps intervals."""
+        if n_steps <= 0:
+            raise ValueError(f"n_steps must be positive, got {n_steps}")
+
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = torch.float32
+
+        u = torch.linspace(0.0, 1.0, n_steps + 1, device=device, dtype=dtype)
+        grid_type = str(grid_type).lower()
+        grid_kwargs_dict: Dict[str, Any] = {}
+        if isinstance(grid_kwargs, dict):
+            grid_kwargs_dict = grid_kwargs
+
+        if grid_type == "uniform":
+            grid = u
+        elif grid_type == "cosine":
+            grid = 0.5 * (1.0 - torch.cos(torch.pi * u))
+        elif grid_type in {"power_front", "power_back"}:
+            gamma: Optional[float] = None
+            if isinstance(grid_kwargs, (int, float)):
+                gamma = float(grid_kwargs)
+            else:
+                gamma = float(grid_kwargs_dict.get("gamma", 2.0))
+            if gamma <= 1.0:
+                raise ValueError(f"{grid_type} requires gamma > 1, got {gamma}")
+            if grid_type == "power_front":
+                grid = torch.pow(u, gamma)
+            else:
+                grid = 1.0 - torch.pow(1.0 - u, gamma)
+        elif grid_type == "piecewise":
+            boundaries = grid_kwargs_dict.get("boundaries")
+            step_allocations = grid_kwargs_dict.get("step_allocations")
+            if boundaries is None or step_allocations is None:
+                raise ValueError(
+                    "piecewise grid requires grid_kwargs with 'boundaries' and 'step_allocations'"
+                )
+            if len(boundaries) < 2:
+                raise ValueError("piecewise boundaries must contain at least [0.0, 1.0]")
+            if len(step_allocations) != len(boundaries) - 1:
+                raise ValueError(
+                    "piecewise step_allocations length must equal len(boundaries)-1"
+                )
+            if int(sum(step_allocations)) != n_steps:
+                raise ValueError(
+                    f"piecewise step_allocations must sum to n_steps={n_steps}, got {sum(step_allocations)}"
+                )
+            b = torch.tensor(boundaries, device=device, dtype=dtype)
+            if not torch.all(b[1:] > b[:-1]):
+                raise ValueError("piecewise boundaries must be strictly increasing")
+            if not torch.isclose(b[0], torch.tensor(0.0, device=device, dtype=dtype), atol=1e-6):
+                raise ValueError("piecewise boundaries must start at 0.0")
+            if not torch.isclose(b[-1], torch.tensor(1.0, device=device, dtype=dtype), atol=1e-6):
+                raise ValueError("piecewise boundaries must end at 1.0")
+            if any(int(s) <= 0 for s in step_allocations):
+                raise ValueError("piecewise step allocations must all be positive integers")
+
+            segments = [b[:1]]
+            for idx, steps in enumerate(step_allocations):
+                steps = int(steps)
+                local = torch.linspace(
+                    0.0, 1.0, steps + 1, device=device, dtype=dtype
+                )
+                seg = b[idx] + (b[idx + 1] - b[idx]) * local
+                segments.append(seg[1:])
+            grid = torch.cat(segments, dim=0)
+        else:
+            raise ValueError(
+                f"Unknown grid_type '{grid_type}'. Supported: uniform, cosine, power_front, power_back, piecewise"
+            )
+
+        # Enforce exact endpoints for consistency and strict checks.
+        grid[0] = 0.0
+        grid[-1] = 1.0
+        if grid.numel() != n_steps + 1:
+            raise ValueError(f"Expected grid length {n_steps + 1}, got {grid.numel()}")
+        if not torch.all(torch.isfinite(grid)):
+            raise ValueError("Grid contains non-finite values")
+        if not torch.all(grid[1:] > grid[:-1]):
+            raise ValueError("Grid must be strictly increasing")
+        if not torch.isclose(grid[0], torch.tensor(0.0, device=device, dtype=dtype), atol=1e-6):
+            raise ValueError("Grid must start at 0.0")
+        if not torch.isclose(grid[-1], torch.tensor(1.0, device=device, dtype=dtype), atol=1e-6):
+            raise ValueError("Grid must end at 1.0")
+        return grid
 
     def _corrupt_prev_state(self, x_prev: torch.Tensor) -> Tuple[torch.Tensor, float]:
         """
@@ -677,13 +782,20 @@ class RFProposal(pl.LightningModule):
         
         # Start from noise z ~ N(0, I)
         x = torch.randn(batch_size, self.state_dim, device=self.device)
-        
-        # Euler steps from s=0 to s=1
-        ds = 1.0 / self.num_sampling_steps
-        
+
+        grid = self._build_time_grid(
+            n_steps=self.num_sampling_steps,
+            grid_type=self.sampling_grid_type,
+            grid_kwargs=self.sampling_grid_param,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # Euler steps from s=0 to s=1 on a potentially non-uniform grid.
         for i in range(self.num_sampling_steps):
-            s = i * ds
-            s_tensor = torch.full((batch_size, 1), s, device=self.device)
+            s = grid[i]
+            ds = grid[i + 1] - grid[i]
+            s_tensor = s.reshape(1, 1).expand(batch_size, 1)
             v = self.velocity_net(x, s_tensor, x_prev, y_curr, t_normalized)
             
             # Apply Monte Carlo Guidance if enabled
@@ -692,7 +804,7 @@ class RFProposal(pl.LightningModule):
                 grad = self.compute_guidance_grad(x, s_tensor, x_prev, y_curr, observation_fn, t_normalized=t_normalized)
                 v = v - self.guidance_scale * grad
                 
-            x = x + v * ds  # Euler step
+            x = x + v * ds  # Euler step with local interval width
         
         # If predict_delta mode, x is the delta - convert to absolute state
         if self.predict_delta:
@@ -749,13 +861,20 @@ class RFProposal(pl.LightningModule):
         
         # Initial log prob is Gaussian density of x(0)
         log_prob = -0.5 * torch.sum(x ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)
-        
-        # Euler steps from s=0 to s=1
-        ds = 1.0 / self.num_sampling_steps
-        
+
+        grid = self._build_time_grid(
+            n_steps=self.num_sampling_steps,
+            grid_type=self.sampling_grid_type,
+            grid_kwargs=self.sampling_grid_param,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
+        # Euler steps from s=0 to s=1 on a potentially non-uniform grid.
         for i in range(self.num_sampling_steps):
-            s = i * ds
-            s_tensor = torch.full((batch_size, 1), s, device=self.device)
+            s = grid[i]
+            ds = grid[i + 1] - grid[i]
+            s_tensor = s.reshape(1, 1).expand(batch_size, 1)
             
             # Use enable_grad for divergence computation
             with torch.enable_grad():
@@ -902,12 +1021,19 @@ class RFProposal(pl.LightningModule):
             x = x_curr.clone()  # Original: start from x_curr
         log_prob_correction = torch.zeros(batch_size, device=self.device)
         
-        ds = 1.0 / self.num_likelihood_steps
-        
+        grid = self._build_time_grid(
+            n_steps=self.num_likelihood_steps,
+            grid_type=self.likelihood_grid_type,
+            grid_kwargs=self.likelihood_grid_param,
+            device=x.device,
+            dtype=x.dtype,
+        )
+
         # Backward integration: s goes from 1 to 0
-        for i in range(self.num_likelihood_steps):
-            s = 1.0 - i * ds  # Start at s=1, go to s=0
-            s_tensor = torch.full((batch_size, 1), s, device=self.device)
+        for i in range(self.num_likelihood_steps - 1, -1, -1):
+            s = grid[i + 1]  # Start at s=1, move backward using interval [grid[i], grid[i+1]]
+            ds = grid[i + 1] - grid[i]
+            s_tensor = s.reshape(1, 1).expand(batch_size, 1)
             
             # Compute velocity and divergence
             with torch.enable_grad():
@@ -970,6 +1096,231 @@ class RFProposal(pl.LightningModule):
         if was_1d:
             log_prob = log_prob.squeeze(0)
         
+        return log_prob
+
+    @torch.no_grad()
+    def log_prob_discrete_euler(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Evaluation-only log density for the *discrete* Euler sampler map.
+
+        This computes density under the finite-step transport used in `sample()`:
+            x_{k+1} = x_k + ds_k * v_theta(x_k, s_k, cond)
+        by numerically inverting each step with Newton iterations and summing
+        log|det(I + ds_k * J_v(x_k, s_k))|.
+        """
+        was_1d = x_curr.dim() == 1
+        if was_1d:
+            x_curr = x_curr.unsqueeze(0)
+            x_prev = x_prev.unsqueeze(0)
+            if y_curr is not None:
+                y_curr = y_curr.unsqueeze(0)
+
+        batch_size = x_curr.shape[0]
+        device = x_curr.device
+        dtype = x_curr.dtype
+
+        t_normalized = self._normalize_trajectory_time(
+            t=t,
+            batch_size=batch_size,
+            caller_name="log_prob_discrete_euler",
+        )
+
+        # In predict_delta mode, the Euler map is defined in delta space.
+        # Use float64 for Newton arithmetic to avoid float32 precision bottleneck.
+        if self.predict_delta:
+            x_kplus1 = (x_curr - x_prev).double()
+        else:
+            x_kplus1 = x_curr.double()
+
+        grid = self._build_time_grid(
+            n_steps=self.num_sampling_steps,
+            grid_type=self.sampling_grid_type,
+            grid_kwargs=self.sampling_grid_param,
+            device=device,
+            dtype=dtype,
+        )
+
+        max_newton_iters = 50
+        tol = 1e-4
+        fallback_tol = 1e-3
+        regularizer = 1e-6
+        d = self.state_dim
+        eye_d = torch.eye(d, device=device, dtype=torch.float64)
+
+        logdet_sum = torch.zeros(batch_size, device=device, dtype=torch.float64)
+        valid_mask = torch.ones(batch_size, device=device, dtype=torch.bool)
+        newton_failures = 0
+        linear_solve_failures = 0
+        linesearch_failures = 0
+        nonpositive_slogdet = 0
+
+        def velocity_and_jacobian(
+            x_state: torch.Tensor,
+            s_tensor: torch.Tensor,
+            xp_cond: torch.Tensor,
+            yc_cond: Optional[torch.Tensor],
+            t_cond: Optional[torch.Tensor],
+        ) -> Tuple[torch.Tensor, torch.Tensor]:
+            x_f32 = x_state.detach().float().reshape(1, -1).requires_grad_(True)
+            jac_rows = []
+            with torch.enable_grad():
+                v_val = self.velocity_net(x_f32, s_tensor, xp_cond, yc_cond, t_cond)
+                for d_idx in range(d):
+                    grad_row = torch.autograd.grad(
+                        v_val[0, d_idx],
+                        x_f32,
+                        retain_graph=(d_idx < d - 1),
+                        create_graph=False,
+                        allow_unused=False,
+                    )[0].reshape(-1)
+                    jac_rows.append(grad_row)
+            jac = torch.stack(jac_rows, dim=0)
+            return v_val.detach().reshape(-1).double(), jac.detach().double()
+
+        # Invert the forward Euler map step-by-step, last step first.
+        # Forward: x_{k+1} = x_k + ds_k * v(x_k, grid[k], ...)
+        # Inverse: given x_{k+1}, find x_k s.t. x_k + ds_k * v(x_k, grid[k], ...) = x_{k+1}
+        # Time conditioning s = grid[i] matches the forward sampler exactly.
+        for i in range(self.num_sampling_steps - 1, -1, -1):
+            s = grid[i]
+            ds_f64 = (grid[i + 1] - grid[i]).double()
+
+            x_k = x_kplus1.clone()
+            # Fixed-point warmup: 3 cheap iterations (velocity only, no Jacobian)
+            for fp_iter in range(3):
+                for b in range(batch_size):
+                    if not valid_mask[b]:
+                        continue
+                    s_tensor_b = s.reshape(1, 1).to(device=device, dtype=dtype)
+                    xp_b = x_prev[b]
+                    yc_b = y_curr[b] if y_curr is not None else None
+                    t_b = None if t_normalized is None else t_normalized[b].reshape(1, 1)
+                    v_guess = self.velocity_net(
+                        x_k[b:b + 1].float(), s_tensor_b,
+                        xp_b.unsqueeze(0), None if yc_b is None else yc_b.unsqueeze(0), t_b,
+                    )
+                    x_k[b] = x_kplus1[b] - ds_f64 * v_guess.squeeze(0).double()
+
+            for b in range(batch_size):
+                if not valid_mask[b]:
+                    continue
+
+                target = x_kplus1[b]
+                x_b = x_k[b].clone()
+                s_tensor_b = s.reshape(1, 1).to(device=device, dtype=dtype)
+                xp_b = x_prev[b].unsqueeze(0)
+                yc_b = None if y_curr is None else y_curr[b].unsqueeze(0)
+                t_b = None if t_normalized is None else t_normalized[b].reshape(1, 1)
+
+                converged = False
+                best_res = float("inf")
+                best_x = x_b.clone()
+                for _ in range(max_newton_iters):
+                    v_b, j_b = velocity_and_jacobian(
+                        x_b, s_tensor_b, xp_b, yc_b, t_b,
+                    )
+                    f_b = x_b + ds_f64 * v_b - target
+                    res = torch.linalg.vector_norm(f_b).item()
+                    if res < best_res:
+                        best_res = res
+                        best_x = x_b.clone()
+                    if res < tol:
+                        converged = True
+                        break
+                    a_b = eye_d + ds_f64 * j_b
+                    try:
+                        delta = torch.linalg.solve(a_b, f_b)
+                    except RuntimeError:
+                        linear_solve_failures += 1
+                        try:
+                            delta = torch.linalg.solve(a_b + regularizer * eye_d, f_b)
+                        except RuntimeError:
+                            valid_mask[b] = False
+                            break
+                    # Damped Newton: geometric backtracking line search
+                    # Try alpha in {1, 0.5, 0.25, 0.125, 0.0625, 0.03125};
+                    # accept first step that decreases ||F||.
+                    alpha = 1.0
+                    step_accepted = False
+                    for _ls in range(6):
+                        x_cand = x_b - alpha * delta
+                        v_cand = self.velocity_net(
+                            x_cand.float().reshape(1, -1), s_tensor_b,
+                            xp_b, yc_b, t_b,
+                        ).detach().reshape(-1).double()
+                        f_cand = x_cand + ds_f64 * v_cand - target
+                        res_cand = torch.linalg.vector_norm(f_cand).item()
+                        if res_cand < res:
+                            x_b = x_cand
+                            step_accepted = True
+                            break
+                        alpha *= 0.5
+                    if not step_accepted:
+                        linesearch_failures += 1
+                        break
+
+                if not valid_mask[b]:
+                    continue
+                if not converged:
+                    if best_res < fallback_tol:
+                        x_b = best_x
+                    else:
+                        newton_failures += 1
+                        valid_mask[b] = False
+                        continue
+
+                _, j_b = velocity_and_jacobian(
+                    x_b, s_tensor_b, xp_b, yc_b, t_b,
+                )
+                a_b = eye_d + ds_f64 * j_b
+                sign, logabsdet = torch.linalg.slogdet(a_b)
+                if sign.item() <= 0:
+                    nonpositive_slogdet += 1
+                    valid_mask[b] = False
+                    continue
+
+                logdet_sum[b] = logdet_sum[b] + logabsdet
+                x_k[b] = x_b
+
+            x_kplus1 = x_k
+
+        log_prob_base = -0.5 * torch.sum(x_kplus1 ** 2, dim=-1) - 0.5 * self.state_dim * np.log(2 * np.pi)
+        log_prob = (log_prob_base - logdet_sum).float()
+        log_prob = torch.where(valid_mask, log_prob, torch.full_like(log_prob, float("nan")))
+
+        self.last_discrete_euler_stats = {
+            "batch_size": int(batch_size),
+            "valid_count": int(valid_mask.sum().item()),
+            "invalid_count": int((~valid_mask).sum().item()),
+            "invalid_rate": float((~valid_mask).float().mean().item()),
+            "newton_failures": int(newton_failures),
+            "linear_solve_failures": int(linear_solve_failures),
+            "linesearch_failures": int(linesearch_failures),
+            "nonpositive_slogdet": int(nonpositive_slogdet),
+            "max_newton_iters": int(max_newton_iters),
+            "newton_tol": float(tol),
+        }
+
+        if self.last_discrete_euler_stats["invalid_count"] > 0:
+            logger.warning(
+                "Discrete Euler log_prob had %d/%d invalid samples "
+                "(newton=%d, solve=%d, linesearch=%d, slogdet=%d).",
+                self.last_discrete_euler_stats["invalid_count"],
+                batch_size,
+                newton_failures,
+                linear_solve_failures,
+                linesearch_failures,
+                nonpositive_slogdet,
+            )
+
+        if was_1d:
+            log_prob = log_prob.squeeze(0)
         return log_prob
     
     @torch.no_grad()

@@ -20,6 +20,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from data import (
     DataAssimilationConfig,
     DataAssimilationDataModule,
+    LinearGaussian,
     Lorenz63,
     Lorenz96,
     KuramotoSivashinsky,
@@ -86,16 +87,20 @@ def load_proposal_from_checkpoint(checkpoint_path: str):
     if isinstance(hparams, dict) and "tr_sampler" in hparams:
         from proposals.meanflow_proposal import MeanFlowProposal
 
-        model = MeanFlowProposal.load_from_checkpoint(checkpoint_path, strict=False)
+        model = MeanFlowProposal.load_from_checkpoint(
+            checkpoint_path, map_location="cpu", strict=False
+        )
         _apply_ema_params(model, checkpoint_path)
         return model
 
     if isinstance(hparams, dict) and "teacher_ckpt_path" in hparams:
         from proposals.shortcut_flow import ShortcutProposal
 
-        return ShortcutProposal.load_from_checkpoint(checkpoint_path, strict=False)
+        return ShortcutProposal.load_from_checkpoint(
+            checkpoint_path, map_location="cpu", strict=False
+        )
 
-    return RFProposal.load_from_checkpoint(checkpoint_path)
+    return RFProposal.load_from_checkpoint(checkpoint_path, map_location="cpu")
 
 
 def _get_inference_sampling_steps(model) -> int:
@@ -349,7 +354,10 @@ def run_proposal_eval(
     config_lower = str(config_path).lower()
     data_dir_lower = str(data_dir).lower()
     
-    if "ks" in data_dir_lower or "kuramoto" in data_dir_lower or "ks" in config_lower:
+    if config.system_params.get("system_name") == "linear_gaussian":
+        system_class = LinearGaussian
+        logger.info("Detected LinearGaussian system")
+    elif "ks" in data_dir_lower or "kuramoto" in data_dir_lower or "ks" in config_lower:
         system_class = KuramotoSivashinsky
         logger.info("Detected Kuramoto-Sivashinsky system")
     elif "lorenz96" in data_dir_lower or "96" in config_lower or "lorenz96" in config_lower or ("dim" in config.system_params and config.system_params["dim"] > 3):

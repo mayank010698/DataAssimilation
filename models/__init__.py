@@ -13,6 +13,8 @@ This package contains various filtering methods for data assimilation:
 from .base_pf import FilteringMethod
 from .bpf import BootstrapParticleFilter
 from .enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
+from .localized_pf import LocalizedParticleFilter
+from .localization import LocalizedPFConfig, LocalizationGeometry
 from .flow_pf import FlowFilter
 from .score_pf import ScoreFilter
 from .proposals import (
@@ -21,6 +23,7 @@ from .proposals import (
     LearnedNeuralProposal,
     GaussianMixtureProposal,
     RectifiedFlowProposal,
+    LocalizedRFProposalWrapper,
     ShortcutF2D2Proposal,
 )
 
@@ -29,6 +32,9 @@ __all__ = [
     "BootstrapParticleFilter",
     "EnsembleKalmanFilter",
     "LocalEnsembleTransformKalmanFilter",
+    "LocalizedParticleFilter",
+    "LocalizedPFConfig",
+    "LocalizationGeometry",
     "FlowFilter",
     "ScoreFilter",
     "ProposalDistribution",
@@ -36,5 +42,6 @@ __all__ = [
     "LearnedNeuralProposal",
     "GaussianMixtureProposal",
     "RectifiedFlowProposal",
+    "LocalizedRFProposalWrapper",
     "ShortcutF2D2Proposal",
 ]
