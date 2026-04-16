@@ -2,12 +2,12 @@
 #
 #SBATCH --job-name="gen-l96-multidim"
 #SBATCH --partition=dali
-#SBATCH --account=dali
+#SBATCH --account=cnagda2-ic
 #SBATCH --nodes=1
-#SBATCH --ntasks=8
+#SBATCH --ntasks=3
 #SBATCH --cpus-per-task=1
-#SBATCH --mem=80g
-#SBATCH --time=24:00:00
+#SBATCH --mem=32g
+#SBATCH --time=04:00:00
 #SBATCH --output=/projects/illinois/eng/cs/arindamb/cnagda2/slurm_output/%j.log
 
 set -euo pipefail
@@ -36,7 +36,8 @@ echo "Slurm Job ID: ${SLURM_JOB_ID:-N/A}"
 echo "=========================================="
 
 # Keep this list length in sync with #SBATCH --ntasks
-DIMS=(5 10 15 20 25 30 40 50)
+# DIMS=(5 10 15 20 25 30 40 50)
+DIMS=(100 500 1000)
 OUTPUT_DIR="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/datasets/l96_dims"
 
 mkdir -p "$OUTPUT_DIR"

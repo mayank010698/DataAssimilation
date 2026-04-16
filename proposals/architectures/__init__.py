@@ -13,6 +13,8 @@ from .resnet1d_deterministic import ResNet1DDeterministic
 from .gated import GatedVelocityNetwork
 from .shortcut_mlp import ShortcutMLPVelocityNetwork
 from .shortcut_resnet1d import ShortcutResNet1DVelocityNetwork
+from .local_mlp import LocalMLPVelocityNetwork
+from .local_resnet1d import LocalResNet1DVelocityNetwork
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -21,6 +23,69 @@ from .conditioning import (
     CrossAttentionConditioning,
     create_conditioning,
 )
+
+
+def create_local_velocity_network(
+    architecture: str,
+    radius: int,
+    use_obs: bool = True,
+    use_time_step: bool = False,
+    **kwargs,
+):
+    """
+    Factory for patch-based local velocity networks.
+
+    The network returns the scalar velocity at the centre of a 2*radius+1 window.
+
+    Args:
+        architecture: 'local_mlp' or 'local_resnet1d'.
+        radius: Spatial radius r.
+        use_obs: Whether observations are fed into the net.
+        use_time_step: Whether trajectory-time conditioning is used.
+        **kwargs: architecture-specific hyperparameters.
+
+    Architecture-specific kwargs:
+        local_mlp:
+            hidden_dim: int = 128
+            depth: int = 4
+            time_embed_dim: int = 64
+            dropout: float = 0.0
+            zero_init_output: bool = True
+
+        local_resnet1d:
+            channels: int = 32
+            num_blocks: int = 2
+            kernel_size: int = 3
+            time_embed_dim: int = 64
+            zero_init_output: bool = True
+    """
+    if architecture == "local_mlp":
+        return LocalMLPVelocityNetwork(
+            radius=radius,
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            depth=kwargs.get("depth", 4),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            use_obs=use_obs,
+            use_time_step=use_time_step,
+            dropout=kwargs.get("dropout", 0.0),
+            zero_init_output=kwargs.get("zero_init_output", True),
+        )
+    elif architecture == "local_resnet1d":
+        return LocalResNet1DVelocityNetwork(
+            radius=radius,
+            channels=kwargs.get("channels", 32),
+            num_blocks=kwargs.get("num_blocks", 2),
+            kernel_size=kwargs.get("kernel_size", 3),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            use_obs=use_obs,
+            use_time_step=use_time_step,
+            zero_init_output=kwargs.get("zero_init_output", True),
+        )
+    else:
+        raise ValueError(
+            f"Unknown local architecture: {architecture}. "
+            f"Available: 'local_mlp', 'local_resnet1d'"
+        )
 
 
 def create_shortcut_network(
@@ -156,6 +221,9 @@ __all__ = [
     # Shortcut / F2D2 networks (Stages 2 & 3)
     'ShortcutMLPVelocityNetwork',
     'ShortcutResNet1DVelocityNetwork',
+    # Localized (patch-based) networks
+    'LocalMLPVelocityNetwork',
+    'LocalResNet1DVelocityNetwork',
     # Deterministic networks
     'ResNet1DDeterministic',
     # Conditioning modules
@@ -166,5 +234,6 @@ __all__ = [
     # Factory functions
     'create_velocity_network',
     'create_shortcut_network',
+    'create_local_velocity_network',
     'create_conditioning',
 ]

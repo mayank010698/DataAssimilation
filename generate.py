@@ -17,6 +17,8 @@ from data import (
     Lorenz63,
     Lorenz96,
     KuramotoSivashinsky,
+    LinearGaussian,
+    make_lg_benchmark_b,
     generate_dataset_directory_name,
     save_config_yaml,
     save_kolmogorov_config_yaml,
@@ -51,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--system",
         type=str,
-        choices=["lorenz63", "lorenz96", "ks", "kuramoto-sivashinsky", "kolmogorov"],
+        choices=["lorenz63", "lorenz96", "ks", "kuramoto-sivashinsky", "kolmogorov", "linear_gaussian"],
         default="lorenz63",
         help="Dynamical system to use",
     )
@@ -125,6 +127,10 @@ def parse_args():
     parser.add_argument("--ks-J", type=int, default=64, help="Spatial resolution J for KS")
     parser.add_argument("--ks-L", type=float, default=None, help="Domain size L for KS (default: 16*pi or 32*pi depending on usage)")
     parser.add_argument("--ks-init-std", type=float, default=1.0, help="Initial standard deviation for KS")
+
+    # System parameters (Linear-Gaussian) — only used when --system linear_gaussian
+    parser.add_argument("--lg-state-dim", type=int, default=8,
+                        help="State dimension for the LinearGaussian system (default: 8 = Benchmark B)")
 
     # System parameters (Kolmogorov flow) — only used when --system kolmogorov
     parser.add_argument("--kol-grid-size", type=int, default=150, help="Spatial grid resolution for Kolmogorov (size x size)")
@@ -556,6 +562,63 @@ def main():
             "L": L,
             "init_std": args.ks_init_std,
         }
+    elif args.system == "linear_gaussian":
+        # Build Benchmark-B config (d=args.lg_state_dim) and override num_trajectories /
+        # len_trajectory from CLI if provided.
+        _lg_config = make_lg_benchmark_b(
+            d=args.lg_state_dim,
+            num_trajectories=args.num_trajectories,
+            len_trajectory=args.len_trajectory,
+            warmup_steps=args.warmup_steps,
+        )
+        # Carry over split ratios from CLI
+        _lg_config.train_ratio = args.train_ratio
+        _lg_config.val_ratio   = args.val_ratio
+        _lg_config.test_ratio  = args.test_ratio
+
+        system_class  = LinearGaussian
+        system_name   = "linear_gaussian"
+        state_dim     = args.lg_state_dim
+        system_params = _lg_config.system_params
+
+        # Build the system and write the dataset using the same path as ODE systems.
+        # We skip the process-noise / obs-noise variation loops (not applicable for LG)
+        # and delegate directly to generate_dataset_splits + save_generated_data.
+        _lg_system = LinearGaussian(_lg_config)
+        _lg_dataset_name = (
+            args.dataset_name
+            if args.dataset_name
+            else generate_dataset_directory_name(_lg_config, system_name="linear_gaussian")
+        )
+        output_base = Path(args.output_dir)
+        output_base.mkdir(parents=True, exist_ok=True)
+        dataset_dir = output_base / _lg_dataset_name
+
+        if dataset_dir.exists() and (dataset_dir / "data.h5").exists():
+            if args.force:
+                response = "y"
+            else:
+                response = input(
+                    f"\nDataset directory {dataset_dir} already exists. Overwrite? (y/N): "
+                )
+            if response.lower() != "y":
+                print("Skipping LinearGaussian dataset.")
+                import sys; sys.exit(0)
+            import shutil
+            shutil.rmtree(dataset_dir)
+
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Generating LinearGaussian (d={args.lg_state_dim}) dataset → {dataset_dir}")
+        splits_unscaled, obs_mask = generate_dataset_splits(_lg_system, _lg_config)
+        save_generated_data(dataset_dir, splits_unscaled, obs_mask)
+        config_path = dataset_dir / "config.yaml"
+        save_config_yaml(_lg_config, config_path)
+        print(f"  Config saved to {config_path}")
+        print("\n" + "=" * 80)
+        print("LinearGaussian dataset generation completed!")
+        print(f"  Output dir: {dataset_dir}")
+        print("=" * 80)
+        import sys; sys.exit(0)
     else:
         raise ValueError(f"Unknown system: {args.system}")
 

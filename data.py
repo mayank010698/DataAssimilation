@@ -911,6 +911,482 @@ class KuramotoSivashinsky(DynamicalSystem):
         return init_mean + init_std * x
 
 
+class LinearGaussian(DynamicalSystem):
+    """Discrete-time linear-Gaussian state-space model.
+
+    x_t = A x_{t-1} + eta_t,   eta_t ~ N(0, Q)
+    y_t = H x_t     + eps_t,   eps_t ~ N(0, R)
+
+    This is a first-class DynamicalSystem subclass that overrides integrate()
+    and apply_observation_operator() to implement discrete-time dynamics with
+    matrix-valued noise and a dense linear observation operator.  The base-class
+    RK4 / ODE path is not used.
+
+    All oracle quantities (optimal proposal, predictive likelihood, etc.) are
+    available as closed-form methods, making this system ideal for sanity-checking
+    proposal quality and importance-weight accuracy.
+    """
+
+    def __init__(self, config: DataAssimilationConfig):
+        params = config.system_params or {}
+
+        # --- matrices (stored as float32 tensors) ---
+        def _to_tensor(v):
+            if isinstance(v, torch.Tensor):
+                return v.float()
+            return torch.tensor(np.array(v), dtype=torch.float32)
+
+        self._A = _to_tensor(params["A"])          # (d, d)
+        self._H = _to_tensor(params["H"])          # (m, d)
+        self._Q = _to_tensor(params["Q"])          # (d, d)
+        self._R = _to_tensor(params["R"])          # (m, m)
+        self._init_mean = _to_tensor(params.get("init_mean", np.zeros(self._A.shape[0])))
+        self._init_cov  = _to_tensor(params.get("init_cov",  np.eye(self._A.shape[0])))
+
+        self._d = self._A.shape[0]   # state dim
+        self._m = self._H.shape[0]   # obs dim
+
+        # Stamp system_name for detection by eval scripts
+        if config.system_params is None:
+            config.system_params = {}
+        config.system_params["system_name"] = "linear_gaussian"
+        config.system_params["state_dim"]   = self._d
+
+        # obs_components / nonlinearity: set to identity placeholders so the
+        # base-class ObservationOperator is constructed without error; we
+        # override apply_observation_operator() to use H directly.
+        if config.obs_components is None:
+            config.obs_components = list(range(self._m))
+        config.obs_nonlinearity = "identity"
+
+        super().__init__(config)
+
+        # Normalization stats (updated by DataAssimilationDataModule after generation)
+        self.init_mean = torch.zeros(self._d)
+        self.init_std  = torch.ones(self._d)
+
+        # --- precompute oracle quantities (cheap, done once at init) ---
+        self._precompute_oracle()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _precompute_oracle(self):
+        """Precompute fixed matrices needed for the optimal proposal and
+        predictive observation density."""
+        Q = self._Q
+        R = self._R
+        H = self._H
+        A = self._A
+
+        # Cholesky factors for fast sampling
+        self._Q_chol = torch.linalg.cholesky(Q)   # lower-triangular, (d,d)
+        self._R_chol = torch.linalg.cholesky(R)   # lower-triangular, (m,m)
+        self._P0_chol = torch.linalg.cholesky(self._init_cov)
+
+        # Inverses (d and m are small so direct inversion is fine)
+        self._Q_inv = torch.linalg.inv(Q)
+        self._R_inv = torch.linalg.inv(R)
+
+        # Optimal proposal covariance:  Sigma* = (Q^{-1} + H^T R^{-1} H)^{-1}
+        self._Sigma_star = torch.linalg.inv(self._Q_inv + H.T @ self._R_inv @ H)
+        self._Sigma_star_chol = torch.linalg.cholesky(self._Sigma_star)
+
+        # Gain matrices for mu*
+        # mu*(x_{t-1}, y_t) = K1 x_{t-1} + K2 y_t
+        self._K1 = self._Sigma_star @ self._Q_inv @ A     # (d, d)
+        self._K2 = self._Sigma_star @ H.T @ self._R_inv  # (d, m)
+
+        # Predictive observation distribution:
+        # p(y_t | x_{t-1}) = N(H A x_{t-1}, S)  where S = H Q H^T + R
+        self._S = H @ Q @ H.T + R               # (m, m)
+        self._S_inv = torch.linalg.inv(self._S)
+        self._S_chol = torch.linalg.cholesky(self._S)
+
+        # Log-normalisation constants (precomputed for speed)
+        self._log_norm_Sigma_star = self._mvn_log_norm_const(self._Sigma_star)
+        self._log_norm_S          = self._mvn_log_norm_const(self._S)
+
+    @staticmethod
+    def _mvn_log_norm_const(cov: torch.Tensor) -> torch.Tensor:
+        """log Z for N(mu, cov): -0.5*(d*log(2pi) + log|cov|)."""
+        d = cov.shape[0]
+        sign, logdet = torch.linalg.slogdet(cov)
+        return -0.5 * (d * torch.log(torch.tensor(2 * np.pi)) + logdet)
+
+    def _to_device(self, device):
+        """Move all precomputed tensors to device (lazy, called on first use)."""
+        attrs = [
+            "_A", "_H", "_Q", "_R", "_init_mean", "_init_cov",
+            "_Q_chol", "_R_chol", "_P0_chol",
+            "_Q_inv", "_R_inv",
+            "_Sigma_star", "_Sigma_star_chol", "_K1", "_K2",
+            "_S", "_S_inv", "_S_chol",
+            "init_mean", "init_std",
+        ]
+        for attr in attrs:
+            t = getattr(self, attr, None)
+            if t is not None and isinstance(t, torch.Tensor) and t.device != device:
+                setattr(self, attr, t.to(device))
+        # scalars
+        for scalar in ["_log_norm_Sigma_star", "_log_norm_S"]:
+            t = getattr(self, scalar, None)
+            if t is not None and isinstance(t, torch.Tensor) and t.device != device:
+                setattr(self, scalar, t.to(device))
+
+    # ------------------------------------------------------------------
+    # DynamicalSystem interface
+    # ------------------------------------------------------------------
+
+    def get_state_dim(self) -> int:
+        return int(self._A.shape[0])
+
+    def dynamics(self, t: float, x: torch.Tensor) -> torch.Tensor:
+        raise NotImplementedError(
+            "LinearGaussian is a discrete-time system; use integrate() directly."
+        )
+
+    def get_default_initial_state(self) -> torch.Tensor:
+        return self._init_mean.clone()
+
+    def sample_initial_state(self, n_samples: int = 1) -> torch.Tensor:
+        """Sample from the prior N(init_mean, init_cov)."""
+        mean = self._init_mean        # (d,)
+        chol = self._P0_chol          # (d, d)
+        eps  = torch.randn(n_samples, self._d)
+        samples = mean.unsqueeze(0) + (chol @ eps.unsqueeze(-1)).squeeze(-1)  # (n, d)
+        if n_samples == 1:
+            return samples.squeeze(0)
+        return samples
+
+    def integrate(
+        self,
+        x0: torch.Tensor,
+        n_steps: int,
+        dt: float = None,               # ignored for discrete-time system
+        process_noise_std: float = 0.0, # ignored; Q governs process noise
+        step_start: int = 0,
+        static_params: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> torch.Tensor:
+        """Integrate the LG system: x_t = A x_{t-1} + N(0, Q).
+
+        Always uses Q-distributed noise; process_noise_std is ignored.
+        """
+        if not isinstance(x0, torch.Tensor):
+            x0 = torch.tensor(x0, dtype=torch.float32)
+
+        device = x0.device
+        self._to_device(device)
+
+        is_batch = x0.ndim > 1
+        if not is_batch:
+            x0 = x0.unsqueeze(0)
+
+        batch = x0.shape[0]
+        trajectories = [x0]
+        x_curr = x0  # (batch, d)
+
+        A    = self._A.to(device)
+        chol = self._Q_chol.to(device)
+
+        for _ in range(n_steps - 1):
+            eps = torch.randn(batch, self._d, device=device)
+            noise = (chol @ eps.unsqueeze(-1)).squeeze(-1)  # (batch, d)
+            x_curr = (A @ x_curr.unsqueeze(-1)).squeeze(-1) + noise
+            trajectories.append(x_curr)
+
+        result = torch.stack(trajectories, dim=1)  # (batch, n_steps, d)
+
+        if not is_batch:
+            return result.squeeze(0)
+        return result
+
+    def apply_observation_operator(self, x: torch.Tensor) -> torch.Tensor:
+        """Linear observation: H x.  Overrides base-class component-selection."""
+        device = x.device
+        self._to_device(device)
+        H = self._H.to(device)
+        # x: (..., d)  →  (..., m)
+        return (H @ x.unsqueeze(-1)).squeeze(-1)
+
+    def observe(self, x: torch.Tensor, add_noise: bool = True) -> torch.Tensor:
+        """y = H x + N(0, R).  Uses R, not config.obs_noise_std."""
+        y = self.apply_observation_operator(x)
+        if add_noise:
+            device = x.device
+            self._to_device(device)
+            chol = self._R_chol.to(device)
+            shape = y.shape[:-1]  # batch dims
+            eps   = torch.randn(*shape, self._m, device=device)
+            noise = (chol @ eps.unsqueeze(-1)).squeeze(-1)
+            y = y + noise
+        return y
+
+    # ------------------------------------------------------------------
+    # Preprocessing / postprocessing (uses data-driven stats after generation)
+    # ------------------------------------------------------------------
+
+    def preprocess(self, x):
+        if isinstance(x, np.ndarray):
+            return (x - self.init_mean.numpy()) / self.init_std.numpy()
+        device = x.device
+        return (x - self.init_mean.to(device)) / self.init_std.to(device)
+
+    def postprocess(self, x):
+        if isinstance(x, np.ndarray):
+            return self.init_mean.numpy() + self.init_std.numpy() * x
+        device = x.device
+        return self.init_mean.to(device) + self.init_std.to(device) * x
+
+    # ------------------------------------------------------------------
+    # Oracle methods
+    # ------------------------------------------------------------------
+
+    def optimal_proposal_params(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (mu_star, Sigma_star) for q*(x_t | x_{t-1}, y_t).
+
+        mu_star(x_{t-1}, y_t) = K1 x_{t-1} + K2 y_t
+        Sigma_star is constant (independent of conditioning).
+
+        Args:
+            x_prev: (..., d)
+            y_curr: (..., m)
+        Returns:
+            mu:    (..., d)
+            Sigma: (d, d)  — same for all batch elements
+        """
+        device = x_prev.device
+        self._to_device(device)
+        K1 = self._K1.to(device)
+        K2 = self._K2.to(device)
+        mu = (K1 @ x_prev.unsqueeze(-1)).squeeze(-1) + (K2 @ y_curr.unsqueeze(-1)).squeeze(-1)
+        return mu, self._Sigma_star.to(device)
+
+    def sample_optimal_proposal(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+        n_samples: int = 1,
+    ) -> torch.Tensor:
+        """Draw n_samples from q*(· | x_prev, y_curr).
+
+        Args:
+            x_prev: (batch, d) or (d,)
+            y_curr: (batch, m) or (m,)
+        Returns:
+            samples: (batch, n_samples, d)  or (n_samples, d) if unbatched
+        """
+        device = x_prev.device
+        self._to_device(device)
+
+        unbatched = x_prev.ndim == 1
+        if unbatched:
+            x_prev = x_prev.unsqueeze(0)
+            y_curr = y_curr.unsqueeze(0)
+
+        batch = x_prev.shape[0]
+        mu, Sigma = self.optimal_proposal_params(x_prev, y_curr)  # (batch, d), (d,d)
+        chol = self._Sigma_star_chol.to(device)  # (d, d)
+
+        eps = torch.randn(batch, n_samples, self._d, device=device)
+        # mu: (batch, d) -> (batch, 1, d); chol: (d, d)
+        samples = mu.unsqueeze(1) + (chol @ eps.unsqueeze(-1)).squeeze(-1)
+
+        if unbatched:
+            return samples.squeeze(0)  # (n_samples, d)
+        return samples  # (batch, n_samples, d)
+
+    def log_optimal_proposal(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """log q*(x_curr | x_prev, y_curr) — Gaussian log-density.
+
+        Sigma_star^{-1} = Q^{-1} + H^T R^{-1} H  (by definition of Sigma_star).
+
+        Args:
+            x_curr: (..., d)
+            x_prev: (..., d)
+            y_curr: (..., m)
+        Returns:
+            log_prob: (...,)
+        """
+        device = x_curr.device
+        self._to_device(device)
+        mu, _ = self.optimal_proposal_params(x_prev, y_curr)    # (..., d)
+        diff   = x_curr - mu                                     # (..., d)
+        Sigma_star_inv = self._Q_inv.to(device) + self._H.to(device).T @ self._R_inv.to(device) @ self._H.to(device)
+        quad = (diff.unsqueeze(-2) @ Sigma_star_inv @ diff.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        return self._log_norm_Sigma_star.to(device) - 0.5 * quad
+
+    def log_predictive_obs(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """log p(y_curr | x_prev) = log N(y; H A x_prev, S).
+
+        Args:
+            x_prev: (..., d)
+            y_curr: (..., m)
+        Returns:
+            log_prob: (...,)
+        """
+        device = x_prev.device
+        self._to_device(device)
+        A = self._A.to(device)
+        H = self._H.to(device)
+        S_inv = self._S_inv.to(device)
+        mean_y = (H @ (A @ x_prev.unsqueeze(-1))).squeeze(-1)   # (..., m)
+        diff   = y_curr - mean_y
+        quad   = (diff.unsqueeze(-2) @ S_inv @ diff.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        return self._log_norm_S.to(device) - 0.5 * quad
+
+    def oracle_incremental_log_weight(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """Oracle incremental log-weight log p(y_curr | x_prev).
+
+        Under the optimal proposal the incremental importance weight simplifies
+        to p(y_t | x_{t-1}) (up to a constant), so this is the direct oracle
+        target for weight evaluation.
+
+        Args:
+            x_prev: (..., d)
+            y_curr: (..., m)
+        Returns:
+            log_weight: (...,)
+        """
+        return self.log_predictive_obs(x_prev, y_curr)
+
+    def log_transition(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+    ) -> torch.Tensor:
+        """log p(x_curr | x_prev) = log N(x_curr; A x_prev, Q).
+
+        Args:
+            x_curr: (..., d)
+            x_prev: (..., d)
+        Returns:
+            log_prob: (...,)
+        """
+        device = x_curr.device
+        self._to_device(device)
+        A     = self._A.to(device)
+        Q_inv = self._Q_inv.to(device)
+        Q     = self._Q.to(device)
+        _, logdet_Q = torch.linalg.slogdet(Q)
+        log_norm = -0.5 * (self._d * np.log(2 * np.pi) + logdet_Q.item())
+        mean = (A @ x_prev.unsqueeze(-1)).squeeze(-1)
+        diff = x_curr - mean
+        quad = (diff.unsqueeze(-2) @ Q_inv @ diff.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        return log_norm - 0.5 * quad
+
+    def log_likelihood(
+        self,
+        y_curr: torch.Tensor,
+        x_curr: torch.Tensor,
+    ) -> torch.Tensor:
+        """log p(y_curr | x_curr) = log N(y; H x_curr, R).
+
+        Args:
+            y_curr: (..., m)
+            x_curr: (..., d)
+        Returns:
+            log_prob: (...,)
+        """
+        device = x_curr.device
+        self._to_device(device)
+        H     = self._H.to(device)
+        R_inv = self._R_inv.to(device)
+        R     = self._R.to(device)
+        _, logdet_R = torch.linalg.slogdet(R)
+        log_norm = -0.5 * (self._m * np.log(2 * np.pi) + logdet_R.item())
+        mean = (H @ x_curr.unsqueeze(-1)).squeeze(-1)
+        diff = y_curr - mean
+        quad = (diff.unsqueeze(-2) @ R_inv @ diff.unsqueeze(-1)).squeeze(-1).squeeze(-1)
+        return log_norm - 0.5 * quad
+
+
+def make_lg_benchmark_b(
+    d: int = 8,
+    num_trajectories: int = 1024,
+    len_trajectory: int = 200,
+    warmup_steps: int = 50,
+) -> "DataAssimilationConfig":
+    """Construct a DataAssimilationConfig for the Benchmark B linear-Gaussian system.
+
+    Benchmark B: moderately coupled stable system with full but mixed observations.
+
+    State dimension d=8.  All parameters follow the specification in the design
+    document:
+      A = 0.92 I + 0.05 S + 0.02 S^T        (cyclic shift S)
+      H = I + 0.25 S - 0.15 S^T
+      Q = sigma_q^2 (0.7 I + 0.3 C_q),  sigma_q=0.35, alpha_q=0.5  (Toeplitz)
+      R = sigma_r^2 (0.6 I + 0.4 C_r),  sigma_r=0.25, alpha_r=0.7  (Toeplitz)
+      x_0 ~ N(0, I)
+    """
+    I = np.eye(d)
+
+    # Cyclic shift: (S x)_i = x_{i-1 mod d}
+    S = np.roll(I, shift=1, axis=0)   # row i of S is e_{i-1}
+
+    A = 0.92 * I + 0.05 * S + 0.02 * S.T
+
+    H = I + 0.25 * S - 0.15 * S.T
+
+    def toeplitz_corr(alpha, d):
+        idx = np.arange(d)
+        return alpha ** np.abs(idx[:, None] - idx[None, :])
+
+    sigma_q = 0.35
+    C_q     = toeplitz_corr(0.5, d)
+    Q       = sigma_q**2 * (0.7 * I + 0.3 * C_q)
+
+    sigma_r = 0.25
+    C_r     = toeplitz_corr(0.7, d)
+    R       = sigma_r**2 * (0.6 * I + 0.4 * C_r)
+
+    init_mean = np.zeros(d)
+    init_cov  = I.copy()
+
+    system_params = {
+        "A":         A,
+        "H":         H,
+        "Q":         Q,
+        "R":         R,
+        "init_mean": init_mean,
+        "init_cov":  init_cov,
+        "system_name": "linear_gaussian",
+        "state_dim": d,
+    }
+
+    config = DataAssimilationConfig(
+        num_trajectories=num_trajectories,
+        len_trajectory=len_trajectory,
+        warmup_steps=warmup_steps,
+        dt=1.0,                    # discrete-time; dt is meaningless but required
+        obs_noise_std=float(sigma_r),  # informational; R is used directly
+        obs_frequency=1,           # observe every step
+        obs_components=list(range(d)),
+        obs_nonlinearity="identity",
+        process_noise_std=1.0,     # non-zero signals generate_dataset_splits to use stochastic path
+        system_params=system_params,
+    )
+    return config
+
+
 def generate_dataset_splits(system: DynamicalSystem, config: DataAssimilationConfig, initial_states: Optional[Dict[str, torch.Tensor]] = None, precomputed_splits: Optional[Dict[str, Tuple[np.ndarray, np.ndarray]]] = None) -> Tuple[Dict[str, Dict[str, np.ndarray]], np.ndarray]:
     """
     Generate trajectory data (splits).
@@ -1336,10 +1812,12 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
                  num_trajectories: int, 
                  traj_len: int, 
                  batch_size: int,
-                 shuffle: bool = False):
+                 shuffle: bool = False,
+                 max_time_steps: int = None):
         self.data_source_len = data_source_len
         self.num_trajectories = num_trajectories
         self.traj_len = traj_len
+        self.iter_len = min(traj_len, max_time_steps) if max_time_steps is not None else traj_len
         self.batch_size = batch_size
         self.shuffle = shuffle
         
@@ -1360,8 +1838,8 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
             
             current_batch_trajs = list(range(start_traj_idx, end_traj_idx))
             
-            # Iterate through time steps for this group of trajectories
-            for t in range(self.traj_len):
+            # Iterate up to iter_len but index with full traj_len
+            for t in range(self.iter_len):
                 batch_indices = [
                     traj_idx * self.traj_len + t 
                     for traj_idx in current_batch_trajs
@@ -1369,7 +1847,7 @@ class TimeAlignedBatchSampler(Sampler[List[int]]):
                 yield batch_indices
 
     def __len__(self) -> int:
-        return self.num_traj_groups * self.traj_len
+        return self.num_traj_groups * self.iter_len
 
 
 class DataAssimilationDataModule(pl.LightningDataModule):
@@ -1598,6 +2076,18 @@ def generate_dataset_directory_name(
     config: DataAssimilationConfig, system_name: str = "lorenz63"
 ) -> str:
     """Generate comprehensive directory name from config parameters"""
+    # LinearGaussian: use compact name based on state dim only (matrices stored in YAML)
+    if config.system_params and config.system_params.get("system_name") == "linear_gaussian":
+        d = config.system_params.get("state_dim", len(config.obs_components))
+        parts = [
+            "linear_gaussian",
+            f"d{d}",
+            f"n{config.num_trajectories}",
+            f"len{config.len_trajectory}",
+            f"freq{config.obs_frequency}",
+        ]
+        return "_".join(parts)
+
     # For many obs_components (like Lorenz96), just indicate count
     if len(config.obs_components) > 4:
         dim = config.system_params.get('dim')

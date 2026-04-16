@@ -31,7 +31,15 @@ from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
 from models.ensf import EnsembleScoreFilter
 from models.ensf_proposal import EnsembleScoreFilterWithProposal
-from models.proposals import RectifiedFlowProposal, ShortcutF2D2Proposal, MeanFlowF2D2Proposal, TransitionProposal
+from models.proposals import (
+    RectifiedFlowProposal,
+    ShortcutF2D2Proposal,
+    MeanFlowF2D2Proposal,
+    LocalizedRFProposalWrapper,
+    TransitionProposal,
+)
+from models.localized_pf import LocalizedParticleFilter
+from models.localization import LocalizedPFConfig
 
 
 def compute_crps_ensemble(ensemble: np.ndarray, truth: np.ndarray) -> float:
@@ -614,7 +622,13 @@ def log_config_to_wandb(
     }
 
     if hasattr(pf, "proposal") and isinstance(
-        pf.proposal, (RectifiedFlowProposal, ShortcutF2D2Proposal, MeanFlowF2D2Proposal)
+        pf.proposal,
+        (
+            RectifiedFlowProposal,
+            ShortcutF2D2Proposal,
+            MeanFlowF2D2Proposal,
+            LocalizedRFProposalWrapper,
+        ),
     ):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
 
@@ -644,15 +658,49 @@ def parse_args():
     parser.add_argument("--obs-components", type=str, default=None, help="Comma-separated list of observed components (overrides config)")
     parser.add_argument("--obs-frequency", type=int, default=1, help="Observation frequency (default: 1, observe every step)")
     parser.add_argument("--num-eval-trajectories", type=int, default=None, help="Number of trajectories to evaluate on (default: all)")
+    parser.add_argument("--max-timesteps", type=int, default=None, help="Truncate each trajectory to this many timesteps (default: use full length from dataset)")
 
     # Particle filter configuration
-    parser.add_argument("--method", type=str, default="bpf", choices=["bpf", "enkf", "letkf", "ensf"], help="Filtering method to use")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default="bpf",
+        choices=["bpf", "enkf", "letkf", "ensf", "lpf", "lfppf"],
+        help=(
+            "Filtering method to use. 'lfppf' = Localized Flow-Proposal PF "
+            "(LocalizedParticleFilter with weight_type='full' and a "
+            "LocalizedRFProposal)."
+        ),
+    )
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
     parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
     parser.add_argument("--inflation", type=float, default=1.0, help="Multiplicative inflation factor (EnKF/LETKF)")
-    parser.add_argument("--localization-radius", type=float, default=4.0, help="Localization radius (LETKF)")
+    parser.add_argument("--localization-radius", type=float, default=4.0, help="Localization radius (LETKF/LPF)")
     
+    # Localized PF configuration
+    parser.add_argument("--block-size", type=int, default=4, help="Block size for localized PF")
+    parser.add_argument("--lpf-taper", type=str, default="gaspari_cohn", choices=["gaspari_cohn", "gaussian", "none"], help="Taper type for localized PF")
+    parser.add_argument("--post-regularization", type=str, default="none", choices=["none", "white", "colored"], help="Post-regularization type for localized PF")
+    parser.add_argument("--post-jitter-std", type=float, default=0.01, help="Jitter std for white post-regularization")
+    parser.add_argument("--colored-jitter-scale", type=float, default=0.1, help="Scale for colored post-regularization")
+    parser.add_argument("--weight-smoothing", action="store_true", help="Enable weight smoothing for localized PF")
+    parser.add_argument("--smoothing-radius", type=int, default=1, help="Smoothing radius in blocks for localized PF")
+    parser.add_argument("--smoothing-strength", type=float, default=0.5, help="Smoothing strength [0, 1] for localized PF")
+    parser.add_argument(
+        "--lpf-weight-type",
+        type=str,
+        default=None,
+        choices=["likelihood_only", "full"],
+        help=(
+            "Localized PF weight formulation. 'likelihood_only' (default for --method lpf)"
+            " uses only the tapered observation term (Farchi & Bocquet Eq. 29). 'full'"
+            " adds the per-block per-dim correction sum_j[log p(x_j | x_prev) - ell_j]"
+            " (requires a proposal that exposes sample_and_per_dim_log_prob, e.g."
+            " --proposal-type lrf). --method lfppf forces 'full' unless overridden."
+        ),
+    )
+
     # EnSF configuration
     parser.add_argument("--ensf-steps", type=int, default=100, help="Number of Euler-Maruyama steps for EnSF")
     parser.add_argument("--ensf-eps-b", type=float, default=0.025, help="Initial noise variance (eps_b) for EnSF")
@@ -664,17 +712,38 @@ def parse_args():
     parser.add_argument(
         "--proposal-type",
         type=str,
-        choices=["transition", "rf", "shortcut", "meanflow"],
+        choices=["transition", "rf", "shortcut", "meanflow", "lrf"],
         default="transition",
         help="'rf' = RectifiedFlowProposal (FM/RF teacher); "
         "'shortcut' = ShortcutF2D2Proposal (Stage 2/3 shortcut ckpt); "
-        "'meanflow' = MeanFlowF2D2Proposal (Stage 2/3 MeanFlow ckpt).",
+        "'meanflow' = MeanFlowF2D2Proposal (Stage 2/3 MeanFlow ckpt); "
+        "'lrf' = LocalizedRFProposalWrapper (patch-based RF, required for "
+        "--method lfppf with weight_type='full').",
     )
     parser.add_argument("--rf-checkpoint", type=str, default=None)
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
     parser.add_argument("--rf-sampling-steps", type=int, default=None)
     parser.add_argument("--rf-trace-estimator", type=str, default="rademacher", choices=["gaussian", "rademacher"], help="Trace estimator type for RF log_prob")
     parser.add_argument("--rf-num-probes", type=int, default=1, help="Number of probes for Hutchinson trace estimator")
+    parser.add_argument(
+        "--lrf-state-dim-override",
+        type=int,
+        default=None,
+        help=(
+            "Override the state dim of a LocalizedRFProposal at inference. Useful "
+            "for zero-shot transfer (e.g. train on L96-40, apply to L96-400)."
+        ),
+    )
+    parser.add_argument("--sampling-grid-type", type=str, default=None,
+                        choices=["uniform", "cosine", "power_front", "power_back", "piecewise"],
+                        help="Override sampling integration grid type in RF proposal")
+    parser.add_argument("--sampling-grid-param", type=str, default=None,
+                        help="JSON for sampling grid params, e.g. '{\"gamma\": 2.0}'")
+    parser.add_argument("--likelihood-grid-type", type=str, default=None,
+                        choices=["uniform", "cosine", "power_front", "power_back", "piecewise"],
+                        help="Override likelihood integration grid type in RF proposal")
+    parser.add_argument("--likelihood-grid-param", type=str, default=None,
+                        help="JSON for likelihood grid params, e.g. '{\"gamma\": 2.0}'")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     
     # Guidance configuration
@@ -740,6 +809,41 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             localization_radius=args.localization_radius,
             device=args.device,
         )
+    elif args.method in ("lpf", "lfppf"):
+        # Default weight_type depends on method; --lpf-weight-type overrides.
+        if args.lpf_weight_type is not None:
+            weight_type = args.lpf_weight_type
+        else:
+            weight_type = "full" if args.method == "lfppf" else "likelihood_only"
+        if weight_type == "full" and args.proposal_type != "lrf":
+            print(
+                "[WARN] weight_type='full' selected but proposal_type != 'lrf'. "
+                "Falling back to 'likelihood_only' (proposal has no per-dim "
+                "log-density interface)."
+            )
+            weight_type = "likelihood_only"
+        lpf_config = LocalizedPFConfig(
+            block_size=args.block_size,
+            localization_radius=args.localization_radius,
+            taper_type=args.lpf_taper,
+            post_regularization=args.post_regularization,
+            post_jitter_std=args.post_jitter_std,
+            colored_jitter_scale=args.colored_jitter_scale,
+            weight_smoothing=args.weight_smoothing,
+            smoothing_radius=args.smoothing_radius,
+            smoothing_strength=args.smoothing_strength,
+            weight_type=weight_type,
+        )
+        pf = LocalizedParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            localized_config=lpf_config,
+        )
     elif args.method == "ensf":
         # Choose between standard EnSF and EnSF with Proposal Support
         if args.proposal_type != "transition":
@@ -780,7 +884,8 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
         num_trajectories=test_dataset.n_trajectories,
         traj_len=traj_len_inference,
         batch_size=args.batch_size,
-        shuffle=False
+        shuffle=False,
+        max_time_steps=args.max_timesteps,
     )
     
     test_loader = DataLoader(
@@ -1048,6 +1153,39 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             inflation_factor=args.inflation,
             localization_radius=args.localization_radius,
             device=args.device,
+        )
+    elif args.method in ("lpf", "lfppf"):
+        if args.lpf_weight_type is not None:
+            weight_type = args.lpf_weight_type
+        else:
+            weight_type = "full" if args.method == "lfppf" else "likelihood_only"
+        if weight_type == "full" and args.proposal_type != "lrf":
+            print(
+                "[WARN] weight_type='full' selected but proposal_type != 'lrf'. "
+                "Falling back to 'likelihood_only'."
+            )
+            weight_type = "likelihood_only"
+        lpf_config = LocalizedPFConfig(
+            block_size=args.block_size,
+            localization_radius=args.localization_radius,
+            taper_type=args.lpf_taper,
+            post_regularization=args.post_regularization,
+            post_jitter_std=args.post_jitter_std,
+            colored_jitter_scale=args.colored_jitter_scale,
+            weight_smoothing=args.weight_smoothing,
+            smoothing_radius=args.smoothing_radius,
+            smoothing_strength=args.smoothing_strength,
+            weight_type=weight_type,
+        )
+        pf = LocalizedParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            localized_config=lpf_config,
         )
     elif args.method == "ensf":
         # Choose between standard EnSF and EnSF with Proposal Support
@@ -1389,9 +1527,10 @@ def main():
     # - "rf": RectifiedFlowProposal (FM/RF teacher checkpoint)
     # - "shortcut": ShortcutF2D2Proposal (Stage 2 / F2D2 shortcut checkpoint)
     # - "meanflow": MeanFlowF2D2Proposal (Stage 2 / F2D2 MeanFlow checkpoint)
+    # - "lrf": LocalizedRFProposalWrapper (patch-based RF with per-dim log-density)
     # - Otherwise: transition prior.
     rf_checkpoint = None
-    if args.proposal_type in ("rf", "shortcut", "meanflow"):
+    if args.proposal_type in ("rf", "shortcut", "meanflow", "lrf"):
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
@@ -1440,6 +1579,18 @@ def main():
                 obs_std=obs_std,
                 obs_components=config.obs_components,
             )
+        elif args.proposal_type == "lrf":
+            proposal = LocalizedRFProposalWrapper(
+                rf_checkpoint,
+                device=args.device,
+                num_sampling_steps=args.rf_sampling_steps,
+                num_likelihood_steps=args.rf_likelihood_steps,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                obs_components=config.obs_components,
+                state_dim_override=args.lrf_state_dim_override,
+            )
         else:
             proposal = ShortcutF2D2Proposal(
                 rf_checkpoint,
@@ -1452,7 +1603,36 @@ def main():
                 obs_components=config.obs_components,
             )
 
-        test_rf_log_probs(proposal, system)
+        # The log-prob smoke test in test_rf_log_probs targets the global RF
+        # path and isn't applicable to the localized wrapper.
+        if args.proposal_type != "lrf":
+            test_rf_log_probs(proposal, system)
+
+        # Override integration grid types on the underlying RF model if requested
+        # (only applies to the global RF/shortcut/meanflow models, not LRF).
+        import json as _json
+        if args.proposal_type == "lrf":
+            if any(getattr(args, a, None) is not None for a in
+                   ("sampling_grid_type", "sampling_grid_param",
+                    "likelihood_grid_type", "likelihood_grid_param")):
+                print("[WARN] Integration-grid overrides are not applicable to "
+                      "LocalizedRFProposal; ignoring.")
+        else:
+            rf = proposal.rf_model
+            if args.sampling_grid_type is not None:
+                rf.sampling_grid_type = args.sampling_grid_type
+            if args.likelihood_grid_type is not None:
+                rf.likelihood_grid_type = args.likelihood_grid_type
+            if args.sampling_grid_param is not None:
+                rf.sampling_grid_param = _json.loads(args.sampling_grid_param)
+            if args.likelihood_grid_param is not None:
+                rf.likelihood_grid_param = _json.loads(args.likelihood_grid_param)
+            if any(getattr(args, a, None) is not None for a in
+                   ("sampling_grid_type", "sampling_grid_param",
+                    "likelihood_grid_type", "likelihood_grid_param")):
+                print(f"  Grid overrides applied: "
+                      f"sampling={rf.sampling_grid_type}({rf.sampling_grid_param}), "
+                      f"likelihood={rf.likelihood_grid_type}({rf.likelihood_grid_param})")
 
     else:
         proposal = TransitionProposal(system, process_noise_std=args.process_noise_std)
@@ -1523,7 +1703,7 @@ def main():
     # EnKF and LETKF are implemented as batched filters, so we use run_batched_eval
     # even if batch_size is 1.
     # Climatology initialization is also implemented only in run_batched_eval logic.
-    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf"]) or (args.init_mode == "climatology")
+    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf", "lpf", "lfppf"]) or (args.init_mode == "climatology")
 
     if use_batched:
         trajectory_results = run_batched_eval(

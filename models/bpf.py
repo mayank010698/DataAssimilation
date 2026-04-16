@@ -734,6 +734,34 @@ class BootstrapParticleFilter(FilteringMethod):
 
         return log_prob_flat.reshape(batch_size, n_particles)
 
+    def compute_transition_log_prob_per_dim(
+        self, x_curr: torch.Tensor, x_prev: torch.Tensor, dt: float
+    ) -> torch.Tensor:
+        """
+        Per-dimension Gaussian transition log-prob log p(x_{t,j}^i | x_{t-1}^i)
+        under an isotropic (or diagonal) process-noise model.
+
+        Returns:
+            (Batch, N, D). Summing over the last dim reproduces
+            `compute_transition_log_prob`. Used by `LocalizedParticleFilter`
+            when `weight_type='full'`.
+        """
+        batch_size, n_particles, _ = x_curr.shape
+        x_curr_flat = x_curr.reshape(-1, self.state_dim)
+        x_prev_flat = x_prev.reshape(-1, self.state_dim)
+
+        integration_result = self.system.integrate(x_prev_flat, 2, dt)
+        x_expected_flat = integration_result[:, 1, :]
+        noise_std = torch.tensor(self.process_noise_std, device=self.device)
+
+        diff = x_curr_flat - x_expected_flat
+        noise_var = noise_std ** 2
+        # Per-dim log N(diff; 0, sigma^2):
+        #   -0.5 * diff^2 / sigma^2 - 0.5 * log(2 pi) - log(sigma)
+        log_prob_per_dim_flat = -0.5 * (diff ** 2) / noise_var \
+            - 0.5 * float(np.log(2 * np.pi)) - torch.log(noise_std)
+        return log_prob_per_dim_flat.reshape(batch_size, n_particles, self.state_dim)
+
     def compute_predictive_log_likelihood(
         self, x_prev: torch.Tensor, observation: torch.Tensor, dt: float
     ) -> torch.Tensor:
