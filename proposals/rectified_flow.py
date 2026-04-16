@@ -289,28 +289,37 @@ class RFProposal(pl.LightningModule):
         Returns (corrupted x_prev, fraction of batch corrupted).
         """
         batch_size = x_prev.shape[0]
+        device = x_prev.device
+        dtype = x_prev.dtype
         p = self._get_corruption_prob()
         if p <= 0 or (self.prev_state_corr_sigma <= 0 and self.prev_state_corr_mask_ratio <= 0):
             return x_prev, 0.0
 
-        out = x_prev.clone()
-        which = torch.rand(batch_size, device=x_prev.device) < p
-        n_corr = which.sum().item()
-        if n_corr == 0:
-            return out, 0.0
+        which = torch.rand(batch_size, device=device) < p
+        if not which.any():
+            return x_prev, 0.0
 
+        out = x_prev.clone()
         if self.prev_state_corr_sigma > 0:
-            noise = self.prev_state_corr_sigma * torch.randn_like(x_prev, device=x_prev.device)
+            noise = self.prev_state_corr_sigma * torch.randn_like(x_prev, device=device)
             out = out + noise * which.unsqueeze(1).float()
 
         if self.prev_state_corr_mask_ratio > 0:
-            n_mask = max(1, int(round(self.state_dim * self.prev_state_corr_mask_ratio)))
-            for i in range(batch_size):
-                if which[i]:
-                    idx = torch.randperm(self.state_dim, device=x_prev.device)[:n_mask]
-                    out[i, idx] = 0.0
+            d = self.state_dim
+            n_mask = max(1, int(round(d * self.prev_state_corr_mask_ratio)))
+            n_mask = min(d, n_mask)
+            keys = torch.rand(batch_size, d, device=device, dtype=dtype)
+            idx = keys.argsort(dim=-1)[:, :n_mask]
+            rows = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(idx)
+            cur = out[rows, idx]
+            out[rows, idx] = torch.where(
+                which.unsqueeze(1).expand_as(idx),
+                torch.zeros_like(cur),
+                cur,
+            )
 
-        return out, n_corr / batch_size
+        corr_frac = which.float().mean().item()
+        return out, corr_frac
 
     def _apply_obs_operator_scaled(self, x_scaled: torch.Tensor) -> torch.Tensor:
         """

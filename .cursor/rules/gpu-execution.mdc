@@ -1,0 +1,54 @@
+---
+description: How to run code on a GPU via SSH to the HPC compute node
+alwaysApply: true
+---
+
+# GPU Execution via SSH to Compute Node
+
+This project runs on an HPC cluster. The Cursor agent runs on a **login node** which has no GPU. To execute code that needs (or benefits from) a GPU, SSH into the active compute node.
+
+## Command Template
+
+```bash
+ssh -o StrictHostKeyChecking=no COMPUTE_NODE 'bash -l -c "conda activate da && CUDA_VISIBLE_DEVICES=0 python your_script.py"'
+```
+
+All SSH shell calls **must** use `required_permissions: ["all"]` to bypass the sandbox.
+
+## Step-by-step
+
+1. **Identify the compute node.** Default to ccc0482. If this doesn't work, check the user's open terminal for an active `srun` session (look for a prompt like `[cnagda2@ccc0482 ...]`). The hostname (e.g. `ccc0482`) is the target. If no active session is visible, ask the user to start one or provide the node name.
+2. **SSH with these flags:**
+   - `-o StrictHostKeyChecking=no` — avoids interactive host-key prompts.
+   - Use `bash -l -c "..."` on the remote side so `.bashrc` / `.bash_profile` are sourced.
+3. **Activate the conda env:** `conda activate da`
+4. **Set `CUDA_VISIBLE_DEVICES=0`** — MIG or SLURM may expose fewer GPUs than the node physically has. Restricting to device 0 prevents PyTorch internal asserts about inaccessible devices.
+5. **Run the Python command or script.**
+
+## Running scripts vs inline code
+
+- **Short tests:** pass code inline via `python -c "..."` (escape quotes carefully with `\\\"` inside the single-quoted SSH payload).
+- **Scripts:** prefer writing a `.py` file to the workspace first, then running it remotely. The filesystem is shared (NFS), so the compute node sees the same paths.
+
+## Timeout & monitoring
+
+- Set `block_until_ms` generously (e.g. 60000–120000) for GPU jobs — model training and data loading are slow.
+- If the command backgrounds, poll the terminal output file until `exit_code` appears or a steady state is reached.
+
+## Error handling
+
+- **SSH connection refused / timeout:** The compute node allocation has likely expired. **Notify the user** with a message like: *"I couldn't SSH into the compute node (ccc0482). Could you start a new `srun` session and let me know the hostname?"* Do not retry silently.
+- **`CUDA out of memory`:** Report the error and suggest reducing batch size or model size.
+- **PyTorch device assert (`device >= 0 && device < num_gpus`):** Ensure `CUDA_VISIBLE_DEVICES=0` is set.
+- **`conda: command not found`:** Make sure the remote shell is a login shell (`bash -l -c`).
+
+## Example: quick GPU check
+
+```bash
+ssh -o StrictHostKeyChecking=no ccc0482 'bash -l -c "conda activate da && CUDA_VISIBLE_DEVICES=0 python -c \"
+import torch
+print(\\\"CUDA available:\\\", torch.cuda.is_available())
+print(\\\"Device count:\\\", torch.cuda.device_count())
+print(\\\"Device 0:\\\", torch.cuda.get_device_name(0))
+\""'
+```
