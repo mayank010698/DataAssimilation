@@ -87,6 +87,7 @@ class LocalizedRFProposal(pl.LightningModule):
         trajectory_length: int = 1000,
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
+        obs_dropout: float = 0.0,
         **arch_kwargs,
     ):
         super().__init__()
@@ -105,6 +106,7 @@ class LocalizedRFProposal(pl.LightningModule):
         self.trajectory_length = trajectory_length
         self.learning_rate = learning_rate
         self.weight_decay = weight_decay
+        self.obs_dropout = obs_dropout
 
         self.local_net = create_local_velocity_network(
             architecture=architecture,
@@ -186,6 +188,23 @@ class LocalizedRFProposal(pl.LightningModule):
             target_v_center = target_center - z_center
 
         t_norm = self._normalize_t(t, batch_size=B)
+
+        # Observation dropout (training only): per-sample, with prob `obs_dropout`,
+        # null the observation window (zero values + zero mask). This teaches the
+        # model an unconditional branch analogous to classifier-free guidance.
+        if (
+            self.use_observations
+            and self.training
+            and self.obs_dropout > 0
+            and obs_w is not None
+        ):
+            drop = (torch.rand(B, 1, device=device) < self.obs_dropout).to(obs_w.dtype)
+            keep = 1.0 - drop
+            obs_w = obs_w * keep
+            if mask_w is not None:
+                mask_w = mask_w * keep
+            else:
+                mask_w = keep.expand_as(obs_w)
 
         # Forward local net
         pred_v_center = self.local_net(

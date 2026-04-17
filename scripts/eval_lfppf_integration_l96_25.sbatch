@@ -20,6 +20,16 @@
 #   GLOBAL_RF_CHECKPOINT   — global RectifiedFlowProposal checkpoint; enables
 #                            arms (2) and (4) when provided.
 #
+# Note on predict_delta:
+#   The LRF model's predict_delta flag is restored from the checkpoint's
+#   saved hyperparameters (see LocalizedRFProposalWrapper -> LocalizedRFProposal
+#   .load_from_checkpoint in eval.py). There is no CLI override for it here,
+#   so the mode is fixed by whichever LRF_CHECKPOINT is passed in. If the LRF
+#   is trained with predict_delta=True while GLOBAL_RF_CHECKPOINT is
+#   predict_delta=False (current situation), arms (1) vs (4) mix a
+#   "local vs global proposal" contrast with a "delta vs absolute target"
+#   contrast; interpret that comparison accordingly.
+#
 # Usage:
 #   LRF_CHECKPOINT=/path/to/lrf.ckpt \
 #   GLOBAL_RF_CHECKPOINT=/path/to/rf.ckpt \

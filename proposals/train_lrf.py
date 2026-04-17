@@ -31,10 +31,15 @@ try:
     from .localized_rf import LocalizedRFProposal
     from .patch_dataset import PatchDataModule
     from .patch_utils import WindowSpec
+    from .eval_proposal import run_proposal_eval
 except ImportError:
     from localized_rf import LocalizedRFProposal
     from patch_dataset import PatchDataModule
     from patch_utils import WindowSpec
+    try:
+        from eval_proposal import run_proposal_eval
+    except ImportError:
+        from proposals.eval_proposal import run_proposal_eval
 
 
 def setup_logging(log_dir: Path) -> logging.Logger:
@@ -74,7 +79,11 @@ def train_localized_rf(
     num_likelihood_steps: int = 25,
     gpus: int = 1,
     wandb_project: str = "lrf-train-96",
+    wandb_run_name: str = None,
     save_every_n_epochs: int = None,
+    train_fraction: float = 1.0,
+    early_stopping_patience: int = 50,
+    obs_dropout: float = 0.0,
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -101,6 +110,7 @@ def train_localized_rf(
         use_observations=use_observations,
         obs_components=obs_components,
         window_spec=window_spec,
+        train_fraction=train_fraction,
     )
     data_module.setup("fit")
 
@@ -127,6 +137,7 @@ def train_localized_rf(
         trajectory_length=trajectory_length,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        obs_dropout=obs_dropout,
         **arch_kwargs,
     )
     log.info(
@@ -142,7 +153,12 @@ def train_localized_rf(
         save_top_k=3,
         save_last=True,
     )
-    early_stop = EarlyStopping(monitor="val_loss", patience=50, mode="min", verbose=True)
+    early_stop = EarlyStopping(
+        monitor="val_loss",
+        patience=early_stopping_patience,
+        mode="min",
+        verbose=True,
+    )
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     callbacks = [checkpoint_callback, early_stop, lr_monitor]
     if save_every_n_epochs:
@@ -160,7 +176,7 @@ def train_localized_rf(
     wandb_logger = WandbLogger(
         entity="ml-climate",
         project=wandb_project,
-        name=output_dir.name,
+        name=wandb_run_name if wandb_run_name else output_dir.name,
         save_dir=str(output_dir),
     )
     wandb_logger.log_hyperparams(
@@ -186,6 +202,8 @@ def train_localized_rf(
             num_sampling_steps=num_sampling_steps,
             num_likelihood_steps=num_likelihood_steps,
             data_dir=str(data_dir),
+            train_fraction=train_fraction,
+            obs_dropout=obs_dropout,
         )
     )
 
@@ -208,7 +226,7 @@ def train_localized_rf(
     final_path = output_dir / "final_model.ckpt"
     trainer.save_checkpoint(final_path)
     log.info(f"Final checkpoint: {final_path}")
-    return model, checkpoint_callback.best_model_path
+    return model, checkpoint_callback.best_model_path, wandb_logger
 
 
 def main():
@@ -250,7 +268,71 @@ def main():
     parser.add_argument("--num_likelihood_steps", type=int, default=25)
 
     parser.add_argument("--wandb_project", type=str, default="lrf-train-96")
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="Custom wandb run name. Defaults to the output_dir basename.",
+    )
     parser.add_argument("--save_every_n_epochs", type=int, default=None)
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=50,
+        help="Number of epochs with no val_loss improvement before stopping.",
+    )
+    parser.add_argument(
+        "--obs_dropout",
+        type=float,
+        default=0.0,
+        help=(
+            "Per-sample probability of dropping the observation window during "
+            "training (zero values + zero mask). Analogous to classifier-free "
+            "guidance dropout in train_rf.py."
+        ),
+    )
+    parser.add_argument(
+        "--train_fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of training trajectories to use, in (0, 1]. "
+            "E.g. 0.5 trains on the first half of the train split. "
+            "Validation and test splits are unaffected."
+        ),
+    )
+
+    # Post-training autoregressive evaluation (logged to the same wandb run)
+    parser.add_argument(
+        "--evaluate",
+        action="store_true",
+        help=(
+            "After training, run autoregressive proposal evaluation "
+            "(proposals.eval_proposal.run_proposal_eval) on the best checkpoint "
+            "and log eval/* metrics + trajectory plots to the same wandb run."
+        ),
+    )
+    parser.add_argument(
+        "--eval_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Optional explicit checkpoint to evaluate. If unset and --evaluate is "
+            "passed, uses the best checkpoint from training."
+        ),
+    )
+    parser.add_argument("--eval_n_trajectories", type=int, default=None,
+                        help="Number of test trajectories for eval (None = all).")
+    parser.add_argument("--eval_n_vis_trajectories", type=int, default=10,
+                        help="How many trajectories to visualize in wandb.")
+    parser.add_argument("--eval_n_samples_per_traj", type=int, default=20,
+                        help="Ensemble size per trajectory for CRPS / spread.")
+    parser.add_argument("--eval_batch_size", type=int, default=32,
+                        help="Batch size for autoregressive eval.")
+    parser.add_argument("--eval_num_sampling_steps", type=int, default=None,
+                        help="Override Euler steps for sampling at eval time.")
+    parser.add_argument("--eval_num_likelihood_steps", type=int, default=None,
+                        help="Override Euler steps for likelihood at eval time.")
     args = parser.parse_args()
 
     if args.output_dir is None:
@@ -280,7 +362,7 @@ def main():
     if args.seed is not None:
         pl.seed_everything(args.seed, workers=True)
 
-    train_localized_rf(
+    model, best_checkpoint, wandb_logger = train_localized_rf(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
         radius=args.radius,
@@ -306,8 +388,40 @@ def main():
         num_likelihood_steps=args.num_likelihood_steps,
         gpus=args.gpus,
         wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
         save_every_n_epochs=args.save_every_n_epochs,
+        train_fraction=args.train_fraction,
+        early_stopping_patience=args.early_stopping_patience,
+        obs_dropout=args.obs_dropout,
     )
+
+    if args.evaluate:
+        checkpoint_to_eval = args.eval_checkpoint or best_checkpoint
+        if not checkpoint_to_eval:
+            logging.getLogger(__name__).warning(
+                "--evaluate set but no checkpoint available (training produced no "
+                "best_model_path and --eval_checkpoint is unset). Skipping eval."
+            )
+        else:
+            wandb_run = None
+            if wandb_logger is not None and hasattr(wandb_logger, "experiment"):
+                wandb_run = wandb_logger.experiment
+
+            logging.getLogger(__name__).info(
+                f"Running post-training autoregressive eval on {checkpoint_to_eval}"
+            )
+            run_proposal_eval(
+                checkpoint_path=checkpoint_to_eval,
+                data_dir=args.data_dir,
+                n_trajectories=args.eval_n_trajectories,
+                n_vis_trajectories=args.eval_n_vis_trajectories,
+                batch_size=args.eval_batch_size,
+                n_samples_per_traj=args.eval_n_samples_per_traj,
+                device="cuda" if (args.gpus > 0 and torch.cuda.is_available()) else "cpu",
+                wandb_run=wandb_run,
+                num_sampling_steps=args.eval_num_sampling_steps,
+                num_likelihood_steps=args.eval_num_likelihood_steps,
+            )
 
 
 if __name__ == "__main__":

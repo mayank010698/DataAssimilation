@@ -84,6 +84,20 @@ def load_proposal_from_checkpoint(checkpoint_path: str):
         raw = torch.load(checkpoint_path, **load_kw)
     hparams = raw.get("hyper_parameters")
 
+    # LocalizedRFProposal is uniquely identified by a 'radius' hparam (absent in
+    # all global proposals). Check first so it doesn't fall through to RFProposal.
+    if (
+        isinstance(hparams, dict)
+        and "radius" in hparams
+        and "tr_sampler" not in hparams
+        and "teacher_ckpt_path" not in hparams
+    ):
+        from proposals.localized_rf import LocalizedRFProposal
+
+        return LocalizedRFProposal.load_from_checkpoint(
+            checkpoint_path, map_location="cpu", strict=False
+        )
+
     if isinstance(hparams, dict) and "tr_sampler" in hparams:
         from proposals.meanflow_proposal import MeanFlowProposal
 
@@ -398,11 +412,17 @@ def run_proposal_eval(
         train_has_pnoise = False
         
     # Determine number of observed dimensions
+    # LocalizedRFProposal exposes ``obs_components`` instead of ``obs_indices``;
+    # use getattr so this works across all proposal classes.
     num_obs_dims = 0
+    model_obs_indices = getattr(model, "obs_indices", None)
+    model_obs_components = getattr(model, "obs_components", None)
     if not model.hparams.get("use_observations", True):
         num_obs_dims = 0
-    elif model.obs_indices is not None:
-        num_obs_dims = len(model.obs_indices)
+    elif model_obs_indices is not None:
+        num_obs_dims = len(model_obs_indices)
+    elif model_obs_components is not None:
+        num_obs_dims = len(model_obs_components)
     elif model.hparams.get("obs_dim") is not None:
         num_obs_dims = model.hparams.get("obs_dim")
     elif config.obs_components is not None:
@@ -839,6 +859,12 @@ if __name__ == "__main__":
     parser.add_argument("--mc-guidance", action="store_true", help="Enable Monte Carlo guidance")
     parser.add_argument("--guidance-scale", type=float, default=1.0, help="Scale for Monte Carlo guidance")
     parser.add_argument("--run-name", type=str, default=None, help="Name for the wandb run")
+    parser.add_argument(
+        "--wandb-dir",
+        type=str,
+        default=os.environ.get("WANDB_DIR"),
+        help="Directory for wandb run files. Defaults to $WANDB_DIR, then ./wandb.",
+    )
     
     args = parser.parse_args()
     
@@ -851,10 +877,23 @@ if __name__ == "__main__":
         else:
             run_name = _derive_eval_run_name(args.checkpoint, args.mc_guidance)
         
-        # Ensure wandb dir exists
-        wandb_dir = Path("/data/da_outputs/wandb")
-        wandb_dir.mkdir(parents=True, exist_ok=True)
-        
+        # Resolve a writable wandb dir: CLI > env > project-local fallback.
+        # (The previous hard-coded "/data/da_outputs/wandb" fails on HPC where
+        # /data is not writable.)
+        if args.wandb_dir:
+            wandb_dir = Path(args.wandb_dir)
+        else:
+            wandb_dir = Path.cwd() / "wandb"
+        try:
+            wandb_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            fallback = Path.cwd() / "wandb"
+            logging.warning(
+                f"No write access to {wandb_dir}; falling back to {fallback}."
+            )
+            wandb_dir = fallback
+            wandb_dir.mkdir(parents=True, exist_ok=True)
+
         run = wandb.init(project="rf-proposal-eval", name=run_name, entity="ml-climate", dir=str(wandb_dir))
         
     run_proposal_eval(

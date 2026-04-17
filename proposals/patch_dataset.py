@@ -183,8 +183,13 @@ class PatchDataModule(pl.LightningDataModule):
         use_observations: bool = False,
         obs_components: Optional[Sequence[int]] = None,
         window_spec: Optional[WindowSpec] = None,
+        train_fraction: float = 1.0,
     ):
         super().__init__()
+        if not (0.0 < train_fraction <= 1.0):
+            raise ValueError(
+                f"train_fraction must be in (0, 1], got {train_fraction}"
+            )
         self.data_dir = Path(data_dir)
         self.radius = radius
         self.batch_size = batch_size
@@ -192,6 +197,7 @@ class PatchDataModule(pl.LightningDataModule):
         self.use_observations = use_observations
         self.obs_components = obs_components
         self.window_spec = window_spec or WindowSpec(radius=radius, stride=1, periodic=True)
+        self.train_fraction = float(train_fraction)
 
         self.train_dataset = None
         self.val_dataset = None
@@ -223,6 +229,17 @@ class PatchDataModule(pl.LightningDataModule):
                     if self.obs_components is not None:
                         train_obs = train_obs[..., list(self.obs_components)]
                         val_obs = val_obs[..., list(self.obs_components)]
+
+                if self.train_fraction < 1.0:
+                    n_train_full = train_traj.shape[0]
+                    n_train_keep = max(1, int(round(n_train_full * self.train_fraction)))
+                    train_traj = train_traj[:n_train_keep]
+                    if train_obs is not None:
+                        train_obs = train_obs[:n_train_keep]
+                    logging.info(
+                        f"train_fraction={self.train_fraction}: keeping "
+                        f"{n_train_keep}/{n_train_full} training trajectories"
+                    )
 
                 self.train_dataset = PatchTransitionDataset(
                     train_traj,
