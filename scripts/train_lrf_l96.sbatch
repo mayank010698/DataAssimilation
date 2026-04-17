@@ -5,10 +5,10 @@
 #SBATCH --account=dali
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gres=gpu:A100:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=80g
-#SBATCH --time=12:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=/projects/illinois/eng/cs/arindamb/cnagda2/slurm_output/%j.log
 
 set -euo pipefail
@@ -77,10 +77,11 @@ run_experiment() {
         --num_sampling_steps 100 \
         --num_likelihood_steps 100 \
         --obs_dropout 0.1 \
-        --early_stopping_patience 10 \
+        --early_stopping_patience 50 \
         --gpus 1 \
         --wandb_project "$WANDB_PROJECT" \
         --wandb_run_name "$run_name" \
+        --evaluate \
         > "$train_log" 2>&1
 }
 
