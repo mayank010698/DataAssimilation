@@ -63,7 +63,9 @@ export PYTHONPATH="$(pwd)"
 mkdir -p logs
 
 DATA_DIR="${DATA_DIR:-/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/datasets/lorenz96_n2048_len200_dt0p0100_obs0p100_freq1_comp25of25_arctan_init3p000}"
-LRF_CHECKPOINT="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/lrf_runs/run_8092322/checkpoints/lrf-epoch=062-val_loss=0.022068.ckpt"
+# LRF_CHECKPOINT="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/lrf_runs/run_8092322/checkpoints/lrf-epoch=062-val_loss=0.022068.ckpt"
+# New LRF checkpoint
+LRF_CHECKPOINT="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/lrf_runs/run_8108115_r4_lr1e-3/checkpoints/lrf-epoch=059-val_loss=0.021012.ckpt"
 GLOBAL_RF_CHECKPOINT="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/rf_runs_96/l96_noise_dim25_20260109_193733/checkpoints/rf-epoch=067-val_loss=0.020633.ckpt"
 
 if [ -z "$LRF_CHECKPOINT" ] || [ ! -f "$LRF_CHECKPOINT" ]; then
@@ -73,6 +75,15 @@ fi
 WANDB_PROJECT="${WANDB_PROJECT:-lfppf-ablations-l96}"
 JOB_TAG="${SLURM_JOB_ID:-manual}"
 
+# Comment out any line below to skip that experiment.
+# Names must match the run_<name> functions defined further down.
+EXPERIMENTS=(
+    lfppf       # L-FPPF (lfppf + LRF proposal, weight_type=full)
+    # lbpf        # L-BPF baseline (lpf + transition proposal)
+    # lpf_grf     # LPF + global RF proposal (weight_type=likelihood_only)
+    # fppf        # global FPPF baseline (bpf + global RF proposal)
+)
+
 BATCH_SIZE=10
 NUM_EVAL_TRAJECTORIES=10
 RESAMPLING_THRESHOLD=0.33
@@ -80,8 +91,8 @@ MAX_TIMESTEPS=100
 SEED=42
 N_PARTICLES=500
 PROCESS_NOISE_STD=0.2
-RF_SAMPLING_STEPS=50
-RF_LIKELIHOOD_STEPS=50
+RF_SAMPLING_STEPS=100
+RF_LIKELIHOOD_STEPS=100
 LPF_TAPER="gaussian"
 LPF_BLOCK_SIZE=1
 LPF_LOC_RADIUS=5.0
@@ -89,63 +100,71 @@ LPF_LOC_RADIUS=5.0
 pids=()
 run_names=()
 
-# --- L-FPPF ---
-label="lfppf_integration_L96_25_N${N_PARTICLES}_${JOB_TAG}"
-log="logs/${label}.log"
-echo "  -> L-FPPF (weight_type=full)"
-(
-    CUDA_VISIBLE_DEVICES=0 python eval.py \
-        --data-dir "$DATA_DIR" \
-        --method lfppf --proposal-type lrf \
-        --rf-checkpoint "$LRF_CHECKPOINT" \
-        --rf-sampling-steps "$RF_SAMPLING_STEPS" \
-        --rf-likelihood-steps "$RF_LIKELIHOOD_STEPS" \
-        --n-particles "$N_PARTICLES" --batch-size "$BATCH_SIZE" \
-        --resampling-threshold "$RESAMPLING_THRESHOLD" \
-        --process-noise-std "$PROCESS_NOISE_STD" \
-        --max-timesteps "$MAX_TIMESTEPS" \
-        --num-eval-trajectories "$NUM_EVAL_TRAJECTORIES" \
-        --block-size "$LPF_BLOCK_SIZE" \
-        --localization-radius "$LPF_LOC_RADIUS" \
-        --lpf-taper "$LPF_TAPER" \
-        --experiment-label "$label" --wandb-project "$WANDB_PROJECT" \
-        --wandb-tags "integration,lfppf,L96_25" \
-        --run-name "$label" --seed "$SEED" --device cuda
-) 2>&1 | tee "$log" &
-pids+=("$!")
-run_names+=("$label")
+# --- Experiment definitions ---
+# Each function launches one arm in the background and appends to pids/run_names.
 
-# --- L-BPF baseline (no RF proposal) ---
-label2="lbpf_integration_L96_25_N${N_PARTICLES}_${JOB_TAG}"
-log2="logs/${label2}.log"
-echo "  -> L-BPF baseline"
-(
-    CUDA_VISIBLE_DEVICES=0 python eval.py \
-        --data-dir "$DATA_DIR" \
-        --method lpf --proposal-type transition \
-        --n-particles "$N_PARTICLES" --batch-size "$BATCH_SIZE" \
-        --resampling-threshold "$RESAMPLING_THRESHOLD" \
-        --process-noise-std "$PROCESS_NOISE_STD" \
-        --max-timesteps "$MAX_TIMESTEPS" \
-        --num-eval-trajectories "$NUM_EVAL_TRAJECTORIES" \
-        --block-size "$LPF_BLOCK_SIZE" \
-        --localization-radius "$LPF_LOC_RADIUS" \
-        --lpf-taper "$LPF_TAPER" \
-        --experiment-label "$label2" --wandb-project "$WANDB_PROJECT" \
-        --wandb-tags "integration,lbpf,L96_25" \
-        --run-name "$label2" --seed "$SEED" --device cuda
-) 2>&1 | tee "$log2" &
-pids+=("$!")
-run_names+=("$label2")
+run_lfppf() {
+    local label="lfppf_integration_L96_25_N${N_PARTICLES}_s${RF_SAMPLING_STEPS}_l${RF_LIKELIHOOD_STEPS}_${JOB_TAG}"
+    local log="logs/${label}.log"
+    echo "  -> L-FPPF (weight_type=full)"
+    (
+        CUDA_VISIBLE_DEVICES=0 python eval.py \
+            --data-dir "$DATA_DIR" \
+            --method lfppf --proposal-type lrf \
+            --rf-checkpoint "$LRF_CHECKPOINT" \
+            --rf-sampling-steps "$RF_SAMPLING_STEPS" \
+            --rf-likelihood-steps "$RF_LIKELIHOOD_STEPS" \
+            --n-particles "$N_PARTICLES" --batch-size "$BATCH_SIZE" \
+            --resampling-threshold "$RESAMPLING_THRESHOLD" \
+            --process-noise-std "$PROCESS_NOISE_STD" \
+            --max-timesteps "$MAX_TIMESTEPS" \
+            --num-eval-trajectories "$NUM_EVAL_TRAJECTORIES" \
+            --block-size "$LPF_BLOCK_SIZE" \
+            --localization-radius "$LPF_LOC_RADIUS" \
+            --lpf-taper "$LPF_TAPER" \
+            --experiment-label "$label" --wandb-project "$WANDB_PROJECT" \
+            --wandb-tags "integration,lfppf,L96_25" \
+            --run-name "$label" --seed "$SEED" --device cuda
+    ) 2>&1 | tee "$log" &
+    pids+=("$!")
+    run_names+=("$label")
+}
 
-# --- LPF + global RF proposal, weight_type=likelihood_only (optional) ---
+run_lbpf() {
+    local label="lbpf_integration_L96_25_N${N_PARTICLES}_${JOB_TAG}"
+    local log="logs/${label}.log"
+    echo "  -> L-BPF baseline"
+    (
+        CUDA_VISIBLE_DEVICES=0 python eval.py \
+            --data-dir "$DATA_DIR" \
+            --method lpf --proposal-type transition \
+            --n-particles "$N_PARTICLES" --batch-size "$BATCH_SIZE" \
+            --resampling-threshold "$RESAMPLING_THRESHOLD" \
+            --process-noise-std "$PROCESS_NOISE_STD" \
+            --max-timesteps "$MAX_TIMESTEPS" \
+            --num-eval-trajectories "$NUM_EVAL_TRAJECTORIES" \
+            --block-size "$LPF_BLOCK_SIZE" \
+            --localization-radius "$LPF_LOC_RADIUS" \
+            --lpf-taper "$LPF_TAPER" \
+            --experiment-label "$label" --wandb-project "$WANDB_PROJECT" \
+            --wandb-tags "integration,lbpf,L96_25" \
+            --run-name "$label" --seed "$SEED" --device cuda
+    ) 2>&1 | tee "$log" &
+    pids+=("$!")
+    run_names+=("$label")
+}
+
 # Isolates the effect of "localized vs global proposal" while keeping the
 # weight formulation fixed to the standard tapered-likelihood LPF. Compare
-# against L-FPPF (arm 1) to attribute any gain specifically to the learned
-# local proposal, not just to "any RF proposal".
-if [ -n "$GLOBAL_RF_CHECKPOINT" ] && [ -f "$GLOBAL_RF_CHECKPOINT" ]; then
-    label_lpf_grf="lpf_globalRF_L96_25_N${N_PARTICLES}_${JOB_TAG}"
-    log_lpf_grf="logs/${label_lpf_grf}.log"
+# against L-FPPF to attribute any gain specifically to the learned local
+# proposal, not just to "any RF proposal".
+run_lpf_grf() {
+    if [ -z "$GLOBAL_RF_CHECKPOINT" ] || [ ! -f "$GLOBAL_RF_CHECKPOINT" ]; then
+        echo "  -> SKIP lpf_grf: GLOBAL_RF_CHECKPOINT not set or missing"
+        return
+    fi
+    local label="lpf_globalRF_L96_25_N${N_PARTICLES}_${JOB_TAG}"
+    local log="logs/${label}.log"
     echo "  -> LPF + global RF (likelihood_only)"
     (
         CUDA_VISIBLE_DEVICES=0 python eval.py \
@@ -163,18 +182,21 @@ if [ -n "$GLOBAL_RF_CHECKPOINT" ] && [ -f "$GLOBAL_RF_CHECKPOINT" ]; then
             --block-size "$LPF_BLOCK_SIZE" \
             --localization-radius "$LPF_LOC_RADIUS" \
             --lpf-taper "$LPF_TAPER" \
-            --experiment-label "$label_lpf_grf" --wandb-project "$WANDB_PROJECT" \
+            --experiment-label "$label" --wandb-project "$WANDB_PROJECT" \
             --wandb-tags "integration,lpf_globalRF,likelihood_only,L96_25" \
-            --run-name "$label_lpf_grf" --seed "$SEED" --device cuda
-    ) 2>&1 | tee "$log_lpf_grf" &
+            --run-name "$label" --seed "$SEED" --device cuda
+    ) 2>&1 | tee "$log" &
     pids+=("$!")
-    run_names+=("$label_lpf_grf")
-fi
+    run_names+=("$label")
+}
 
-# --- global FPPF baseline (optional) ---
-if [ -n "$GLOBAL_RF_CHECKPOINT" ] && [ -f "$GLOBAL_RF_CHECKPOINT" ]; then
-    label3="fppf_integration_L96_25_N${N_PARTICLES}_${JOB_TAG}"
-    log3="logs/${label3}.log"
+run_fppf() {
+    if [ -z "$GLOBAL_RF_CHECKPOINT" ] || [ ! -f "$GLOBAL_RF_CHECKPOINT" ]; then
+        echo "  -> SKIP fppf: GLOBAL_RF_CHECKPOINT not set or missing"
+        return
+    fi
+    local label="fppf_integration_L96_25_N${N_PARTICLES}_${JOB_TAG}"
+    local log="logs/${label}.log"
     echo "  -> global FPPF baseline"
     (
         CUDA_VISIBLE_DEVICES=0 python eval.py \
@@ -188,13 +210,22 @@ if [ -n "$GLOBAL_RF_CHECKPOINT" ] && [ -f "$GLOBAL_RF_CHECKPOINT" ]; then
             --process-noise-std "$PROCESS_NOISE_STD" \
             --max-timesteps "$MAX_TIMESTEPS" \
             --num-eval-trajectories "$NUM_EVAL_TRAJECTORIES" \
-            --experiment-label "$label3" --wandb-project "$WANDB_PROJECT" \
+            --experiment-label "$label" --wandb-project "$WANDB_PROJECT" \
             --wandb-tags "integration,fppf,L96_25" \
-            --run-name "$label3" --seed "$SEED" --device cuda
-    ) 2>&1 | tee "$log3" &
+            --run-name "$label" --seed "$SEED" --device cuda
+    ) 2>&1 | tee "$log" &
     pids+=("$!")
-    run_names+=("$label3")
-fi
+    run_names+=("$label")
+}
+
+# --- Dispatch ---
+for exp in "${EXPERIMENTS[@]}"; do
+    fn="run_${exp}"
+    if ! declare -F "$fn" > /dev/null; then
+        echo "ERROR: unknown experiment '${exp}' (no function ${fn})"; exit 1
+    fi
+    "$fn"
+done
 
 echo "Waiting for ${#pids[@]} jobs …"
 failures=0

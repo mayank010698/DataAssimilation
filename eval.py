@@ -27,6 +27,7 @@ from data import (
     load_config_yaml,
 )
 from models.base_pf import FilteringMethod
+from models.apf import AuxiliaryParticleFilter
 from models.bpf import BootstrapParticleFilter, BootstrapParticleFilterUnbatched
 from models.enkf import EnsembleKalmanFilter, LocalEnsembleTransformKalmanFilter
 from models.ensf import EnsembleScoreFilter
@@ -632,6 +633,9 @@ def log_config_to_wandb(
     ):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
 
+    if args.method == "apf":
+        wandb_config["apf_adjustment"] = getattr(args, "apf_adjustment", "point")
+
     wandb.config.update(wandb_config)
 
 
@@ -665,15 +669,30 @@ def parse_args():
         "--method",
         type=str,
         default="bpf",
-        choices=["bpf", "enkf", "letkf", "ensf", "lpf", "lfppf"],
+        choices=["bpf", "enkf", "letkf", "ensf", "lpf", "lfppf", "apf"],
         help=(
             "Filtering method to use. 'lfppf' = Localized Flow-Proposal PF "
             "(LocalizedParticleFilter with weight_type='full' and a "
-            "LocalizedRFProposal)."
+            "LocalizedRFProposal). 'apf' = Auxiliary Particle Filter "
+            "(Pitt-Shephard 1999, one-resampling variant)."
         ),
     )
     parser.add_argument("--n-particles", type=int, default=100)
     parser.add_argument("--process-noise-std", type=float, default=0.25)
+
+    # APF configuration
+    parser.add_argument(
+        "--apf-adjustment",
+        type=str,
+        default="point",
+        choices=["point", "predictive"],
+        help=(
+            "APF adjustment multiplier m_t. 'point' (default): Pitt-Shephard "
+            "point surrogate m_t = g(y_t | mu_t). 'predictive': Gaussian-"
+            "inflated approximation of p(y_t | x_{t-1}) with total variance "
+            "obs_var + process_var."
+        ),
+    )
     parser.add_argument("--obs-noise-std", type=float, default=None, help="Override observation noise std")
     parser.add_argument("--inflation", type=float, default=1.0, help="Multiplicative inflation factor (EnKF/LETKF)")
     parser.add_argument("--localization-radius", type=float, default=4.0, help="Localization radius (LETKF/LPF)")
@@ -784,6 +803,18 @@ def run_batched_eval(args, config, system, data_module, obs_dim, proposal, wandb
             process_noise_std=args.process_noise_std,
             device=args.device,
             use_optimal_weight_update=args.use_opt_weight_update,
+            resampling_threshold_ratio=args.resampling_threshold,
+        )
+    elif args.method == "apf":
+        pf = AuxiliaryParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            adjustment_type=args.apf_adjustment,
             resampling_threshold_ratio=args.resampling_threshold,
         )
     elif args.method == "enkf":
@@ -1129,6 +1160,21 @@ def run_sequential_eval(args, config, system, data_module, obs_dim, proposal, wa
             process_noise_std=args.process_noise_std,
             device=args.device,
             use_optimal_weight_update=args.use_opt_weight_update,
+            resampling_threshold_ratio=args.resampling_threshold,
+        )
+    elif args.method == "apf":
+        # APF is always run via the batched path; this branch is only reached
+        # if the user forces sequential for some reason. The batched APF class
+        # is safe to use with batch_size=1.
+        pf = AuxiliaryParticleFilter(
+            system=system,
+            proposal_distribution=proposal,
+            n_particles=args.n_particles,
+            state_dim=system.state_dim,
+            obs_dim=obs_dim,
+            process_noise_std=args.process_noise_std,
+            device=args.device,
+            adjustment_type=args.apf_adjustment,
             resampling_threshold_ratio=args.resampling_threshold,
         )
     elif args.method == "enkf":
@@ -1653,6 +1699,8 @@ def main():
         tags.extend([args.method])
         if args.method == "bpf":
             tags.append(args.proposal_type)
+        if args.method == "apf":
+            tags.append(f"apf-{args.apf_adjustment}")
         if args.batch_size > 1:
             tags.append("batched")
             
@@ -1703,7 +1751,7 @@ def main():
     # EnKF and LETKF are implemented as batched filters, so we use run_batched_eval
     # even if batch_size is 1.
     # Climatology initialization is also implemented only in run_batched_eval logic.
-    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf", "lpf", "lfppf"]) or (args.init_mode == "climatology")
+    use_batched = (args.batch_size > 1) or (args.method in ["enkf", "letkf", "lpf", "lfppf", "apf"]) or (args.init_mode == "climatology")
 
     if use_batched:
         trajectory_results = run_batched_eval(
