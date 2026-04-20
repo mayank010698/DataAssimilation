@@ -633,8 +633,14 @@ class LocalizedRFProposalWrapper(ProposalDistribution):
                 self.obs_mean = self.obs_mean[obs_components]
             if self.obs_std is not None:
                 self.obs_std = self.obs_std[obs_components]
-            # The model also needs obs_components to scatter sparse obs -> dense
-            if self.lrf_model.obs_components is None:
+            # The model also needs obs_components to scatter sparse obs -> dense.
+            # If we are doing a zero-shot state_dim override, the obs_components
+            # baked into the checkpoint correspond to the *training* state_dim
+            # and must be replaced by the target dataset's obs_components.
+            if (
+                self.lrf_model.obs_components is None
+                or state_dim_override is not None
+            ):
                 self.lrf_model.obs_components = list(obs_components)
 
     # ---- helpers ----
@@ -1041,3 +1047,169 @@ class MeanFlowF2D2Proposal(ProposalDistribution):
             )
 
         return self.mf_model.log_prob(x_curr, x_prev, y_curr, t=t)
+
+
+# =============================================================================
+# NASMC Gaussian Proposal (Gu, Ghahramani & Turner, 2015)
+# =============================================================================
+
+
+class NASMCProposal(ProposalDistribution):
+    """Wrapper for a trained NASMC :class:`GaussianProposal`.
+
+    Mirrors the interface of :class:`RectifiedFlowProposal`:
+
+    - Loads a :class:`GaussianProposal` checkpoint and freezes it.
+    - Scales observations with ``obs_mean``/``obs_std`` when provided.
+    - Pre/post-processes states with ``system.preprocess``/
+      ``system.postprocess`` so the filter talks in *physical* space
+      while the proposal talks in *scaled* space.
+    - Returns ``log_prob`` in *scaled* space (matching the convention
+      used elsewhere in the particle filter).
+
+    The checkpoint does not carry state scalers, so the wrapper
+    re-attaches them explicitly via ``attach_scalers`` on the loaded
+    module so that the SMC log-density helpers stay consistent if the
+    module is ever reused for downstream training.
+
+    Args:
+        checkpoint_path: Path to a :class:`GaussianProposal` checkpoint.
+        device: Torch device string.
+        system: DynamicalSystem for pre/post processing.
+        obs_mean / obs_std: Observation scalers.
+        obs_components: Indices of observed state sites (to slice the
+            observation scalers).
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
+        obs_components: Optional[list] = None,
+    ):
+        import sys
+        from pathlib import Path
+
+        proposals_dir = Path(__file__).parent.parent / "proposals"
+        if str(proposals_dir) not in sys.path:
+            sys.path.insert(0, str(proposals_dir))
+
+        from proposals.nasmc import GaussianProposal
+
+        self.nasmc_model = GaussianProposal.load_from_checkpoint(
+            checkpoint_path, map_location=device, strict=False
+        )
+        self.nasmc_model.eval()
+        self.nasmc_model.to(device)
+        for param in self.nasmc_model.parameters():
+            param.requires_grad = False
+
+        self.device = device
+        self.system = system
+        self.state_dim = self.nasmc_model.state_dim
+
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+
+        # If the checkpoint was trained with the -f- variant
+        # (use_dynamics_mean=True), we need the system attached to the
+        # GaussianProposal to evaluate the deterministic dynamics mean.
+        if getattr(self.nasmc_model, "use_dynamics_mean", False):
+            if system is None:
+                raise ValueError(
+                    "NASMCProposal: checkpoint uses use_dynamics_mean=True, "
+                    "which requires a DynamicalSystem to be passed via `system`."
+                )
+            dt = None
+            if hasattr(system, "config"):
+                dt = getattr(system.config, "dt", None)
+            self.nasmc_model.attach_system(system, dt=dt)
+
+        # Attach state scalers so log_prob helpers used by the -f- variant
+        # operate in the correct space. The filter wrapper itself always
+        # preprocesses state into scaled space before calling the module.
+        state_mean = getattr(system, "init_mean", None) if system is not None else None
+        state_std = getattr(system, "init_std", None) if system is not None else None
+        if state_mean is not None and state_std is not None:
+            self.nasmc_model.attach_scalers(
+                state_scaler_mean=torch.as_tensor(state_mean, dtype=torch.float32),
+                state_scaler_std=torch.as_tensor(state_std, dtype=torch.float32),
+                obs_scaler_mean=self.obs_mean,
+                obs_scaler_std=self.obs_std,
+            )
+
+    # ---- helpers ----
+
+    def _to_device(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.to(self.device) if x.device.type != self.device else x
+
+    def _scale_obs(self, y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = self._to_device(y)
+        if self.obs_mean is not None and self.obs_std is not None:
+            y = (y - self.obs_mean) / self.obs_std
+        return y
+
+    # ---- ProposalDistribution interface ----
+
+    def sample(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.nasmc_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "NASMC model has use_time_step=True but t was not provided to sample()."
+            )
+
+        with torch.no_grad():
+            x_curr_scaled = self.nasmc_model.sample(x_prev, y_curr, dt, t=t)
+
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+        return x_curr_scaled
+
+    def log_prob(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_curr = self._to_device(x_curr)
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+
+        if getattr(self.nasmc_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "NASMC model has use_time_step=True but t was not provided to log_prob()."
+            )
+
+        with torch.no_grad():
+            return self.nasmc_model.log_prob(x_curr, x_prev, y_curr, dt, t=t)

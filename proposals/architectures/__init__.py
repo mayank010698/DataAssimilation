@@ -15,6 +15,7 @@ from .shortcut_mlp import ShortcutMLPVelocityNetwork
 from .shortcut_resnet1d import ShortcutResNet1DVelocityNetwork
 from .local_mlp import LocalMLPVelocityNetwork
 from .local_resnet1d import LocalResNet1DVelocityNetwork
+from .gaussian_head import MLPGaussianHead, ResNet1DGaussianHead
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -210,6 +211,66 @@ def create_velocity_network(
         )
 
 
+def create_gaussian_head_network(
+    architecture: str,
+    state_dim: int,
+    obs_dim: int = 0,
+    use_time_step: bool = False,
+    **kwargs,
+):
+    """Factory for the NASMC Gaussian-head backbones.
+
+    Constructs a network that maps ``(x_prev, y, [t])`` to
+    ``(B, 2 * state_dim)``, interpreted as ``[mu_raw, log_sigma]`` per
+    site.
+
+    Args:
+        architecture: 'mlp' or 'resnet1d'.
+        state_dim: State dimension.
+        obs_dim: Observation dimension (0 = unconditional).
+        use_time_step: Whether the network conditions on trajectory time.
+        **kwargs: Architecture-specific hyperparameters. Accepts the same
+            options as :func:`create_velocity_network` plus
+            ``init_log_sigma`` which controls the initial value of the
+            log-std bias (default -1.0, i.e. sigma ~ 0.37).
+    """
+    init_log_sigma = float(kwargs.pop("init_log_sigma", -1.0))
+    zero_init_output = bool(kwargs.pop("zero_init_output", True))
+
+    if architecture in ("mlp", "mlp_fixed"):
+        return MLPGaussianHead(
+            state_dim=state_dim,
+            obs_dim=obs_dim,
+            obs_indices=kwargs.get("obs_indices", None),
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            depth=kwargs.get("depth", 4),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            dropout=kwargs.get("dropout", 0.0),
+            use_time_step=use_time_step,
+            zero_init_output=zero_init_output,
+            init_log_sigma=init_log_sigma,
+        )
+    elif architecture == "resnet1d":
+        return ResNet1DGaussianHead(
+            state_dim=state_dim,
+            obs_dim=obs_dim,
+            obs_indices=kwargs.get("obs_indices", None),
+            channels=kwargs.get("channels", 64),
+            num_blocks=kwargs.get("num_blocks", 6),
+            kernel_size=kwargs.get("kernel_size", 5),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            dropout=kwargs.get("dropout", 0.0),
+            use_time_step=use_time_step,
+            zero_init_output=zero_init_output,
+            init_log_sigma=init_log_sigma,
+        )
+    else:
+        raise ValueError(
+            f"Unknown architecture for gaussian head: {architecture}. "
+            "Available: 'mlp', 'resnet1d'"
+        )
+
+
 __all__ = [
     # Base classes
     'BaseVelocityNetwork',
@@ -226,6 +287,9 @@ __all__ = [
     'LocalResNet1DVelocityNetwork',
     # Deterministic networks
     'ResNet1DDeterministic',
+    # Gaussian-head networks (NASMC)
+    'MLPGaussianHead',
+    'ResNet1DGaussianHead',
     # Conditioning modules
     'ConcatConditioning',
     'FiLMConditioning',
@@ -235,5 +299,6 @@ __all__ = [
     'create_velocity_network',
     'create_shortcut_network',
     'create_local_velocity_network',
+    'create_gaussian_head_network',
     'create_conditioning',
 ]

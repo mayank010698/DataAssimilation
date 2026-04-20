@@ -7,7 +7,7 @@
 #SBATCH --ntasks=3
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=32g
-#SBATCH --time=04:00:00
+#SBATCH --time=12:00:00
 #SBATCH --output=/projects/illinois/eng/cs/arindamb/cnagda2/slurm_output/%j.log
 
 set -euo pipefail
@@ -37,7 +37,7 @@ echo "=========================================="
 
 # Keep this list length in sync with #SBATCH --ntasks
 # DIMS=(5 10 15 20 25 30 40 50)
-DIMS=(100 500 1000)
+DIMS=(5 10 15 20 25 50 100 500 1000)
 OUTPUT_DIR="/projects/illinois/eng/cs/arindamb/cnagda2/da/da_outputs/datasets/l96_dims"
 
 mkdir -p "$OUTPUT_DIR"
@@ -48,7 +48,7 @@ for DIM in "${DIMS[@]}"; do
         --system lorenz96 \
         --l96-dim "$DIM" \
         --process-noise-variations "0.0,0.1" \
-        --obs-noise-variations "0.1,0.5,1,3,5" \
+        --obs-noise-variations "0.2,0.5,1,3,5" \
         --num-trajectories 2048 \
         --len-trajectory 200 \
         --obs-frequency 1 \

@@ -37,6 +37,7 @@ from models.proposals import (
     ShortcutF2D2Proposal,
     MeanFlowF2D2Proposal,
     LocalizedRFProposalWrapper,
+    NASMCProposal,
     TransitionProposal,
 )
 from models.localized_pf import LocalizedParticleFilter
@@ -629,6 +630,7 @@ def log_config_to_wandb(
             ShortcutF2D2Proposal,
             MeanFlowF2D2Proposal,
             LocalizedRFProposalWrapper,
+            NASMCProposal,
         ),
     ):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
@@ -731,13 +733,14 @@ def parse_args():
     parser.add_argument(
         "--proposal-type",
         type=str,
-        choices=["transition", "rf", "shortcut", "meanflow", "lrf"],
+        choices=["transition", "rf", "shortcut", "meanflow", "lrf", "nasmc"],
         default="transition",
         help="'rf' = RectifiedFlowProposal (FM/RF teacher); "
         "'shortcut' = ShortcutF2D2Proposal (Stage 2/3 shortcut ckpt); "
         "'meanflow' = MeanFlowF2D2Proposal (Stage 2/3 MeanFlow ckpt); "
         "'lrf' = LocalizedRFProposalWrapper (patch-based RF, required for "
-        "--method lfppf with weight_type='full').",
+        "--method lfppf with weight_type='full'); "
+        "'nasmc' = NASMC Gaussian proposal (Gu, Ghahramani & Turner 2015).",
     )
     parser.add_argument("--rf-checkpoint", type=str, default=None)
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
@@ -1576,7 +1579,7 @@ def main():
     # - "lrf": LocalizedRFProposalWrapper (patch-based RF with per-dim log-density)
     # - Otherwise: transition prior.
     rf_checkpoint = None
-    if args.proposal_type in ("rf", "shortcut", "meanflow", "lrf"):
+    if args.proposal_type in ("rf", "shortcut", "meanflow", "lrf", "nasmc"):
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
@@ -1637,6 +1640,15 @@ def main():
                 obs_components=config.obs_components,
                 state_dim_override=args.lrf_state_dim_override,
             )
+        elif args.proposal_type == "nasmc":
+            proposal = NASMCProposal(
+                rf_checkpoint,
+                device=args.device,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                obs_components=config.obs_components,
+            )
         else:
             proposal = ShortcutF2D2Proposal(
                 rf_checkpoint,
@@ -1650,19 +1662,19 @@ def main():
             )
 
         # The log-prob smoke test in test_rf_log_probs targets the global RF
-        # path and isn't applicable to the localized wrapper.
-        if args.proposal_type != "lrf":
+        # path and isn't applicable to the localized wrapper or NASMC.
+        if args.proposal_type not in ("lrf", "nasmc"):
             test_rf_log_probs(proposal, system)
 
         # Override integration grid types on the underlying RF model if requested
-        # (only applies to the global RF/shortcut/meanflow models, not LRF).
+        # (only applies to the global RF/shortcut/meanflow models, not LRF/NASMC).
         import json as _json
-        if args.proposal_type == "lrf":
+        if args.proposal_type in ("lrf", "nasmc"):
             if any(getattr(args, a, None) is not None for a in
                    ("sampling_grid_type", "sampling_grid_param",
                     "likelihood_grid_type", "likelihood_grid_param")):
                 print("[WARN] Integration-grid overrides are not applicable to "
-                      "LocalizedRFProposal; ignoring.")
+                      f"{args.proposal_type.upper()} proposals; ignoring.")
         else:
             rf = proposal.rf_model
             if args.sampling_grid_type is not None:
