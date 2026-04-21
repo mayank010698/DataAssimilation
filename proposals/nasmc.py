@@ -21,6 +21,35 @@ forward pass of the proposal. This is the NASMC gradient estimator.
 The module exposes ``sample`` / ``log_prob`` in scaled state space,
 matching the :class:`RFProposal` convention so that the two proposals
 can be swapped in the bootstrap particle filter.
+
+Paper-faithful vs. our additions
+--------------------------------
+Paper-faithful (Gu, Ghahramani & Turner, 2015):
+  * Phase 2 weighted log-density objective (Eq. 12-13 of the paper).
+  * Detached (stop-gradient) SMC particles / weights in the gradient
+    pass.
+  * SMC with systematic resampling at an ESS threshold.
+  * Optional bootstrap-filter particle generation during early training
+    (see ``use_bootstrap`` in :meth:`set_phase`; driven by
+    ``--bootstrap_warmup_epochs`` in the CLI trainer).
+
+Our additions / simplifications:
+  * Phase 1 local-MLE pretrain on ground-truth transitions is NOT in
+    Gu et al. 2015; it is a supervised warm-start we add to stabilise
+    phase 2. Use ``--preset gaussian_mle`` for a standalone
+    supervised-MLE baseline, ``--preset pure_nasmc`` for the literal
+    paper method, or ``--preset nasmc_warmstart`` for phase 1 + 2.
+  * Single-component diagonal Gaussian head (paper uses an MDN).
+  * Markovian conditioning ``q_phi(x_t | x_{t-1}, y_t)`` (paper uses
+    an LSTM over ``y_{1:t}, x_{1:t-1}``).
+  * ``predict_delta=True`` parametrisation (``mu = x_{t-1} + mu_raw``).
+    Related to, but not identical to, the paper's "-f-" variant which
+    centres the mean on the deterministic dynamics ``f(x_{t-1})``;
+    that variant is available via ``use_dynamics_mean=True``.
+
+Potential v2 items (explicitly out of scope for the current
+implementation): MDN head, LSTM history conditioning, differentiable
+SMC.
 """
 
 from __future__ import annotations

@@ -16,6 +16,15 @@ from .shortcut_resnet1d import ShortcutResNet1DVelocityNetwork
 from .local_mlp import LocalMLPVelocityNetwork
 from .local_resnet1d import LocalResNet1DVelocityNetwork
 from .gaussian_head import MLPGaussianHead, ResNet1DGaussianHead
+from .feature_backbones import MLPFeatureBackbone, ResNet1DFeatureBackbone
+from .cde_heads import (
+    BaseCDEHead,
+    GaussianHead,
+    MDNHead,
+    JointMoGHead,
+    RNADEHead,
+    create_cde_head,
+)
 from .conditioning import (
     BaseConditioning,
     ConcatConditioning,
@@ -211,6 +220,65 @@ def create_velocity_network(
         )
 
 
+def create_feature_backbone(
+    architecture: str,
+    state_dim: int,
+    obs_dim: int = 0,
+    use_time_step: bool = False,
+    **kwargs,
+):
+    """Factory for the inference-network feature backbones.
+
+    Constructs a network that maps ``(x_prev, y, [t])`` to a pooled
+    feature vector in ``R^feature_dim``, ready to feed a CDE head
+    (see :func:`create_cde_head`).
+
+    Args:
+        architecture: 'mlp' or 'resnet1d'.
+        state_dim: State dimension.
+        obs_dim: Observation dimension (0 = unconditional).
+        use_time_step: Whether to condition on trajectory time.
+        **kwargs: Architecture-specific hyperparameters. Accepts the same
+            options as :func:`create_velocity_network` plus an MLP-only
+            ``hidden_dim`` (which doubles as the feature dim) and a
+            ResNet1D-only ``feature_dim`` override (default 128).
+
+    Returns:
+        :class:`MLPFeatureBackbone` or :class:`ResNet1DFeatureBackbone`.
+        The returned module exposes a ``feature_dim`` attribute used by
+        the CDE-head factory to size its linear projections.
+    """
+    if architecture in ("mlp", "mlp_fixed"):
+        return MLPFeatureBackbone(
+            state_dim=state_dim,
+            obs_dim=obs_dim,
+            obs_indices=kwargs.get("obs_indices", None),
+            hidden_dim=kwargs.get("hidden_dim", 128),
+            depth=kwargs.get("depth", 4),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            dropout=kwargs.get("dropout", 0.0),
+            use_time_step=use_time_step,
+        )
+    elif architecture == "resnet1d":
+        return ResNet1DFeatureBackbone(
+            state_dim=state_dim,
+            obs_dim=obs_dim,
+            obs_indices=kwargs.get("obs_indices", None),
+            channels=kwargs.get("channels", 64),
+            num_blocks=kwargs.get("num_blocks", 6),
+            kernel_size=kwargs.get("kernel_size", 5),
+            time_embed_dim=kwargs.get("time_embed_dim", 64),
+            dropout=kwargs.get("dropout", 0.0),
+            use_time_step=use_time_step,
+            feature_dim=kwargs.get("feature_dim", 128),
+        )
+    else:
+        raise ValueError(
+            f"Unknown architecture for feature backbone: {architecture}. "
+            "Available: 'mlp', 'resnet1d'"
+        )
+
+
 def create_gaussian_head_network(
     architecture: str,
     state_dim: int,
@@ -290,6 +358,16 @@ __all__ = [
     # Gaussian-head networks (NASMC)
     'MLPGaussianHead',
     'ResNet1DGaussianHead',
+    # Inference-network feature backbones & CDE heads (Paige-Wood)
+    'MLPFeatureBackbone',
+    'ResNet1DFeatureBackbone',
+    'BaseCDEHead',
+    'GaussianHead',
+    'MDNHead',
+    'JointMoGHead',
+    'RNADEHead',
+    'create_cde_head',
+    'create_feature_backbone',
     # Conditioning modules
     'ConcatConditioning',
     'FiLMConditioning',

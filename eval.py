@@ -38,6 +38,7 @@ from models.proposals import (
     MeanFlowF2D2Proposal,
     LocalizedRFProposalWrapper,
     NASMCProposal,
+    InferenceNetworkProposal,
     TransitionProposal,
 )
 from models.localized_pf import LocalizedParticleFilter
@@ -631,6 +632,7 @@ def log_config_to_wandb(
             MeanFlowF2D2Proposal,
             LocalizedRFProposalWrapper,
             NASMCProposal,
+            InferenceNetworkProposal,
         ),
     ):
         wandb_config["rf_checkpoint"] = rf_checkpoint if rf_checkpoint else "not_found"
@@ -733,14 +735,15 @@ def parse_args():
     parser.add_argument(
         "--proposal-type",
         type=str,
-        choices=["transition", "rf", "shortcut", "meanflow", "lrf", "nasmc"],
+        choices=["transition", "rf", "shortcut", "meanflow", "lrf", "nasmc", "inn"],
         default="transition",
         help="'rf' = RectifiedFlowProposal (FM/RF teacher); "
         "'shortcut' = ShortcutF2D2Proposal (Stage 2/3 shortcut ckpt); "
         "'meanflow' = MeanFlowF2D2Proposal (Stage 2/3 MeanFlow ckpt); "
         "'lrf' = LocalizedRFProposalWrapper (patch-based RF, required for "
         "--method lfppf with weight_type='full'); "
-        "'nasmc' = NASMC Gaussian proposal (Gu, Ghahramani & Turner 2015).",
+        "'nasmc' = NASMC Gaussian proposal (Gu, Ghahramani & Turner 2015); "
+        "'inn' = Paige-Wood inference-network proposal (ICML 2016).",
     )
     parser.add_argument("--rf-checkpoint", type=str, default=None)
     parser.add_argument("--rf-likelihood-steps", type=int, default=None)
@@ -1579,7 +1582,7 @@ def main():
     # - "lrf": LocalizedRFProposalWrapper (patch-based RF with per-dim log-density)
     # - Otherwise: transition prior.
     rf_checkpoint = None
-    if args.proposal_type in ("rf", "shortcut", "meanflow", "lrf", "nasmc"):
+    if args.proposal_type in ("rf", "shortcut", "meanflow", "lrf", "nasmc", "inn"):
         rf_checkpoint = args.rf_checkpoint
         if not rf_checkpoint or not os.path.exists(rf_checkpoint):
             raise FileNotFoundError(
@@ -1649,6 +1652,15 @@ def main():
                 obs_std=obs_std,
                 obs_components=config.obs_components,
             )
+        elif args.proposal_type == "inn":
+            proposal = InferenceNetworkProposal(
+                rf_checkpoint,
+                device=args.device,
+                system=system,
+                obs_mean=obs_mean,
+                obs_std=obs_std,
+                obs_components=config.obs_components,
+            )
         else:
             proposal = ShortcutF2D2Proposal(
                 rf_checkpoint,
@@ -1663,13 +1675,13 @@ def main():
 
         # The log-prob smoke test in test_rf_log_probs targets the global RF
         # path and isn't applicable to the localized wrapper or NASMC.
-        if args.proposal_type not in ("lrf", "nasmc"):
+        if args.proposal_type not in ("lrf", "nasmc", "inn"):
             test_rf_log_probs(proposal, system)
 
         # Override integration grid types on the underlying RF model if requested
         # (only applies to the global RF/shortcut/meanflow models, not LRF/NASMC).
         import json as _json
-        if args.proposal_type in ("lrf", "nasmc"):
+        if args.proposal_type in ("lrf", "nasmc", "inn"):
             if any(getattr(args, a, None) is not None for a in
                    ("sampling_grid_type", "sampling_grid_param",
                     "likelihood_grid_type", "likelihood_grid_param")):

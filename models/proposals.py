@@ -1213,3 +1213,147 @@ class NASMCProposal(ProposalDistribution):
 
         with torch.no_grad():
             return self.nasmc_model.log_prob(x_curr, x_prev, y_curr, dt, t=t)
+
+
+# =============================================================================
+# Paige-Wood Inference-Network Proposal
+# =============================================================================
+
+
+class InferenceNetworkProposal(ProposalDistribution):
+    """Wrapper for a trained Paige-Wood inference-network proposal.
+
+    Loads an :class:`~proposals.inference_network.InferenceNetworkProposal`
+    Lightning module and adapts it to the filter-side
+    :class:`ProposalDistribution` interface (physical-space I/O, scaled
+    internals).
+
+    Design parallels :class:`NASMCProposal` and
+    :class:`RectifiedFlowProposal`: states are scaled/unscaled via
+    ``system.preprocess``/``postprocess``; observations are normalised by
+    ``obs_mean``/``obs_std`` (sliced to ``obs_components`` if given). The
+    underlying Lightning module already handles the CDE-head maths and
+    returns scaled-space samples / log-probs, so this wrapper is a thin
+    IO shim.
+
+    Args:
+        checkpoint_path: Path to the Lightning checkpoint written by
+            :mod:`proposals.train_inference_network`.
+        device: Torch device string.
+        system: DynamicalSystem for pre/post processing. Optional but
+            required if you want the wrapper to speak physical space to
+            the filter.
+        obs_mean, obs_std: Observation scalers. If ``obs_components`` is
+            also provided, we slice the full scalers down to the observed
+            sites (matching RF / NASMC wrappers).
+        obs_components: Indices of observed state sites, used only to
+            slice ``obs_mean``/``obs_std``.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        device: str = "cpu",
+        system: Optional[Any] = None,
+        obs_mean: Optional[torch.Tensor] = None,
+        obs_std: Optional[torch.Tensor] = None,
+        obs_components: Optional[list] = None,
+    ):
+        import sys
+        from pathlib import Path
+
+        proposals_dir = Path(__file__).parent.parent / "proposals"
+        if str(proposals_dir) not in sys.path:
+            sys.path.insert(0, str(proposals_dir))
+
+        from proposals.inference_network import InferenceNetworkProposal as _InnModule
+
+        self.inn_model = _InnModule.load_from_checkpoint(
+            checkpoint_path, map_location=device, strict=False
+        )
+        self.inn_model.eval()
+        self.inn_model.to(device)
+        for param in self.inn_model.parameters():
+            param.requires_grad = False
+
+        self.device = device
+        self.system = system
+        self.state_dim = self.inn_model.state_dim
+
+        self.obs_mean = obs_mean.to(device) if obs_mean is not None else None
+        self.obs_std = obs_std.to(device) if obs_std is not None else None
+        if obs_components is not None:
+            if self.obs_mean is not None:
+                self.obs_mean = self.obs_mean[obs_components]
+            if self.obs_std is not None:
+                self.obs_std = self.obs_std[obs_components]
+
+    # ---- helpers (match the NASMC wrapper's convention) ----
+
+    def _to_device(self, x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.to(self.device) if x.device.type != self.device else x
+
+    def _scale_obs(self, y: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if y is None:
+            return None
+        y = self._to_device(y)
+        if self.obs_mean is not None and self.obs_std is not None:
+            y = (y - self.obs_mean) / self.obs_std
+        return y
+
+    # ---- ProposalDistribution interface ----
+
+    def sample(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+
+        if getattr(self.inn_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "InferenceNetworkProposal has use_time_step=True but t was "
+                "not provided to sample()."
+            )
+
+        with torch.no_grad():
+            x_curr_scaled = self.inn_model.sample(x_prev, y_curr, dt=dt, t=t)
+
+        if self.system is not None:
+            return self.system.postprocess(x_curr_scaled)
+        return x_curr_scaled
+
+    def log_prob(
+        self,
+        x_curr: torch.Tensor,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor],
+        dt: float,
+        t: Optional[torch.Tensor] = None,
+        static_params: Optional[dict] = None,
+    ) -> torch.Tensor:
+        x_curr = self._to_device(x_curr)
+        x_prev = self._to_device(x_prev)
+        y_curr = self._scale_obs(y_curr)
+
+        if self.system is not None:
+            x_prev = self.system.preprocess(x_prev)
+            x_curr = self.system.preprocess(x_curr)
+
+        if getattr(self.inn_model, "use_time_step", False) and t is None:
+            raise ValueError(
+                "InferenceNetworkProposal has use_time_step=True but t was "
+                "not provided to log_prob()."
+            )
+
+        with torch.no_grad():
+            return self.inn_model.log_prob(x_curr, x_prev, y_curr, dt=dt, t=t)

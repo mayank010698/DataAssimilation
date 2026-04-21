@@ -60,6 +60,36 @@
 ### Proposal Distributions
 1. **TransitionProposal**: Uses system dynamics with process noise
 2. **RectifiedFlowProposal**: Neural network learned from trajectory data
+3. **NASMCProposal**: Diagonal-Gaussian proposal trained either by supervised
+   MLE on ground-truth transitions (phase 1) or by the Gu, Ghahramani &
+   Turner (2015) weighted log-density objective on SMC particles (phase 2).
+   See `proposals/train_nasmc.py` for the three named training presets
+   (`gaussian_mle`, `pure_nasmc`, `nasmc_warmstart`) that populate the
+   paper's comparison table.
+
+#### NASMC training presets
+
+`python -m proposals.train_nasmc --preset <name>` selects one of three
+preset configurations for a head-to-head comparison against the RF
+baseline:
+
+- `--preset gaussian_mle` -- phase 1 only. A standalone *supervised*
+  Gaussian-MLE proposal, not NASMC. Clean baseline that isolates the
+  effect of "flow matching vs Gaussian" at fixed training signal.
+- `--preset pure_nasmc` -- phase 2 only (no MLE warmstart). Uses the
+  bootstrap proposal for the first `--bootstrap_warmup_epochs` epochs
+  then switches to the learned `q_phi`. This is the literal Gu et al.
+  2015 method, modulo the MDN head and LSTM history conditioning that
+  we deliberately omit (documented in `proposals/nasmc.py`).
+- `--preset nasmc_warmstart` -- phase 1 (MLE) + phase 2 (NASMC). The
+  "steelman" configuration.
+
+All presets leave the underlying model, SMC loop, and objective
+unchanged; they only toggle which epochs run and how particles are
+generated during the SMC sweep.
+
+See `scripts/train_nasmc_l96_dim5.sbatch` for an sbatch template that
+launches all three presets in parallel on the L96 5-dim dataset.
 
 ## Quick Start
 
