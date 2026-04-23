@@ -107,18 +107,25 @@ PRESETS = {
         "tag": "gaussian_mle",
         "description": (
             "Phase 1 only (supervised MLE on ground-truth transitions). "
-            "NOT NASMC; a standalone Gaussian-proposal baseline."
+            "NOT NASMC; a standalone Gaussian-proposal baseline. "
+            "Fixed at K=1 (this is a different method, not the MDN variant)."
         ),
         "max_epochs_pretrain": 30,
         "max_epochs_refine": 0,
         "bootstrap_warmup_epochs": 0,
         "use_bootstrap_proposal": False,
+        # gaussian_mle is a separate Gaussian-MLE baseline, *not* NASMC.
+        # We keep it at K=1 so the baseline stays a single Gaussian; flip
+        # the flag on the CLI if you want an MDN MLE baseline specifically.
+        "num_components": 1,
     },
     "pure_nasmc": {
         "tag": "pure_nasmc",
         "description": (
             "Phase 2 only (Gu et al. 2015 NASMC, no MLE pretrain). "
-            "Bootstrap warmup for the first K epochs, then learned proposal."
+            "Bootstrap warmup for the first K epochs, then learned proposal. "
+            "Defaults to K=3 mixture components (paper's -MD- default); "
+            "use --preset pure_nasmc_K1 for the single-Gaussian ablation."
         ),
         "max_epochs_pretrain": 0,
         "max_epochs_refine": 60,
@@ -127,17 +134,50 @@ PRESETS = {
         # flips it off after K epochs. Keep this True so epoch 0 already uses
         # the bootstrap proposal.
         "use_bootstrap_proposal": True,
+        # Gu et al. 2015's reported -MD- configuration uses 3 mixture
+        # components for the toy benchmarks. Set explicitly here so the
+        # default preset matches the paper.
+        "num_components": 3,
+    },
+    "pure_nasmc_K1": {
+        "tag": "pure_nasmc_K1",
+        "description": (
+            "K=1 ablation of 'pure_nasmc': single-component Gaussian "
+            "proposal, same training budget and warmup. Use this to "
+            "isolate the contribution of the mixture head."
+        ),
+        "max_epochs_pretrain": 0,
+        "max_epochs_refine": 60,
+        "bootstrap_warmup_epochs": 5,
+        "use_bootstrap_proposal": True,
+        "num_components": 1,
     },
     "nasmc_warmstart": {
         "tag": "nasmc_warmstart",
         "description": (
             "Phase 1 (MLE pretrain) then Phase 2 (NASMC refinement). "
-            "The 'steelman' version of NASMC."
+            "The 'steelman' version of NASMC. Defaults to K=3 mixture "
+            "components (paper default); use --preset nasmc_warmstart_K1 "
+            "for the single-Gaussian ablation."
         ),
         "max_epochs_pretrain": 30,
         "max_epochs_refine": 30,
         "bootstrap_warmup_epochs": 0,
         "use_bootstrap_proposal": False,
+        "num_components": 3,
+    },
+    "nasmc_warmstart_K1": {
+        "tag": "nasmc_warmstart_K1",
+        "description": (
+            "K=1 ablation of 'nasmc_warmstart': warm-started single-"
+            "Gaussian proposal trained by NASMC. Use this to isolate "
+            "the contribution of the mixture head at matched budget."
+        ),
+        "max_epochs_pretrain": 30,
+        "max_epochs_refine": 30,
+        "bootstrap_warmup_epochs": 0,
+        "use_bootstrap_proposal": False,
+        "num_components": 1,
     },
 }
 
@@ -169,6 +209,8 @@ def _apply_preset(args: argparse.Namespace) -> Optional[dict]:
         "max_epochs_refine",
         "bootstrap_warmup_epochs",
         "use_bootstrap_proposal",
+        "num_components",
+        "mixture_weight_floor",
     ):
         if key not in preset:
             continue
@@ -304,6 +346,7 @@ def _build_wandb_logger(
     wandb_entity: Optional[str],
     disable_wandb: bool,
     output_dir: Path,
+    tags: Optional[List[str]] = None,
 ):
     """Create a Lightning ``WandbLogger`` or return ``None`` if disabled.
 
@@ -321,6 +364,7 @@ def _build_wandb_logger(
         project=wandb_project,
         name=wandb_run_name or output_dir.name,
         save_dir=str(output_dir),
+        tags=tags,
     )
 
 
@@ -344,6 +388,8 @@ def train_nasmc(
     init_log_sigma: float = -1.0,
     log_sigma_min: float = -7.0,
     log_sigma_max: float = 3.0,
+    num_components: int = 1,
+    mixture_weight_floor: float = 0.0,
     use_observations: bool = True,
     obs_components: Optional[List[int]] = None,
     batch_size: int = 64,
@@ -396,6 +442,10 @@ def train_nasmc(
     log.info("use_time_step   = %s, trajectory_length = %d", use_time_step, trajectory_length)
     log.info("num_particles   = %d, segment_length = %d", num_particles, segment_length)
     log.info(
+        "num_components  = %d, mixture_weight_floor = %.4f",
+        num_components, mixture_weight_floor,
+    )
+    log.info(
         "phase 1 epochs  = %d, phase 2 epochs = %d, bootstrap_warmup_epochs = %d",
         max_epochs_pretrain, max_epochs_refine, bootstrap_warmup_epochs,
     )
@@ -425,6 +475,8 @@ def train_nasmc(
         log_sigma_min=log_sigma_min,
         log_sigma_max=log_sigma_max,
         init_log_sigma=init_log_sigma,
+        num_components=num_components,
+        mixture_weight_floor=mixture_weight_floor,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
         process_noise_std=process_noise_std,
@@ -479,6 +531,7 @@ def train_nasmc(
             wandb_entity=wandb_entity,
             disable_wandb=disable_wandb,
             output_dir=output_dir / "pretrain",
+            tags=[f"K{num_components}", "phase:pretrain"],
         )
         trainer = pl.Trainer(
             max_epochs=max_epochs_pretrain,
@@ -541,6 +594,7 @@ def train_nasmc(
             wandb_entity=wandb_entity,
             disable_wandb=disable_wandb,
             output_dir=output_dir / "refine",
+            tags=[f"K{num_components}", "phase:refine"],
         )
         trainer = pl.Trainer(
             max_epochs=max_epochs_refine,
@@ -633,6 +687,37 @@ def main():
     parser.add_argument("--log_sigma_min", type=float, default=-7.0)
     parser.add_argument("--log_sigma_max", type=float, default=3.0)
 
+    # Mixture-density head (paper's '-MD-' variant). K=1 (default) is the
+    # single-component Gaussian proposal -- exactly the previous behaviour
+    # of this script. Presets pure_nasmc / nasmc_warmstart override the
+    # default to K=3 to match Gu et al. 2015. pure_nasmc_K1 /
+    # nasmc_warmstart_K1 pin K=1 for ablation runs.
+    parser.add_argument(
+        "--num_components",
+        type=int,
+        default=1,
+        help=(
+            "Number of mixture components K for the proposal's "
+            "output head. K=1 -> single diagonal Gaussian (the paper's "
+            "base variant and the original behaviour of this script). "
+            "K>1 -> mixture of K diagonal Gaussians (the paper's '-MD-' "
+            "variant; default 3 under the pure_nasmc / nasmc_warmstart "
+            "presets)."
+        ),
+    )
+    parser.add_argument(
+        "--mixture_weight_floor",
+        type=float,
+        default=0.0,
+        help=(
+            "Optional epsilon in [0, 1) for smoothing the mixing "
+            "distribution as pi = (1-eps)*softmax(logits) + eps/K. "
+            "Default 0 (exact softmax). Set to e.g. 0.01 if phase-2 "
+            "training shows component collapse (max_pi saturating "
+            "near 1.0)."
+        ),
+    )
+
     parser.add_argument("--use_observations", action="store_true")
     parser.add_argument("--obs_components", type=str, default=None)
 
@@ -710,6 +795,10 @@ def main():
 
     if args.wandb_run_name is None and preset_tag:
         args.wandb_run_name = f"{Path(args.output_dir).name}"
+    # Tag the wandb run with K so mixture vs. single-Gaussian runs are
+    # instantly filterable on the dashboard.
+    if args.wandb_run_name is not None and f"K{args.num_components}" not in args.wandb_run_name:
+        args.wandb_run_name = f"{args.wandb_run_name}-K{args.num_components}"
 
     obs_components = None
     if args.obs_components is not None:
@@ -764,6 +853,8 @@ def main():
         init_log_sigma=args.init_log_sigma,
         log_sigma_min=args.log_sigma_min,
         log_sigma_max=args.log_sigma_max,
+        num_components=args.num_components,
+        mixture_weight_floor=args.mixture_weight_floor,
         use_observations=args.use_observations,
         obs_components=obs_components,
         batch_size=args.batch_size,

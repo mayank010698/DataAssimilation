@@ -1,0 +1,31 @@
+---
+description: Slurm --output log naming convention (no descriptor prefix)
+globs: scripts/**/*.sbatch
+alwaysApply: true
+---
+
+# Slurm `--output` naming
+
+When writing `#SBATCH --output=` in any sbatch script, **do NOT prepend
+a job descriptor** (e.g. `probe_rf_bs_`, `tune_rf_steps_`, `rf_l96_neurips_`).
+The user relies on a `printlog` alias + shell autocomplete in the
+`slurm_output/` directory; descriptor prefixes make those slow to type.
+
+Use the bare Slurm patterns only: `%A_%a.log` for array jobs, `%j.log` for
+single-task jobs.
+
+- Do NOT change existing sbatch scripts that already use a descriptor
+  prefix unless the user asks — they were written before this rule.
+- The job name (`#SBATCH --job-name=...`) and the per-task `RUN_DIR`
+  / `RUN_NAME` inside `logs/` can and should still carry descriptive
+  prefixes; this rule only constrains the top-level `--output` path.
+
+```sbatch
+# BAD
+#SBATCH --output=/projects/.../slurm_output/probe_rf_bs_%A_%a.log
+#SBATCH --output=/projects/.../slurm_output/eval_lfppf_%j.log
+
+# GOOD
+#SBATCH --output=/projects/.../slurm_output/%A_%a.log
+#SBATCH --output=/projects/.../slurm_output/%j.log
+```

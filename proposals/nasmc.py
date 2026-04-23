@@ -3,8 +3,11 @@
 This module implements the learned proposal from
 Gu, Ghahramani & Turner (2015, arXiv:1506.03338) in a form compatible
 with the rest of this codebase. The proposal is a diagonal Gaussian
-whose mean and log-standard-deviation are produced by one of the
-``architectures/gaussian_head.py`` backbones.
+(``num_components=1``, the default) or a mixture of ``K`` diagonal
+Gaussians — the paper's ``-MD-`` variant — whose per-component mean,
+log-standard-deviation and mixing logit are produced by one of the
+``architectures/gaussian_head.py`` backbones. ``K=1`` reproduces the
+original single-Gaussian behaviour of this module exactly.
 
 Phase 1 (``training_phase == 'pretrain'``): the module is trained by
 standard maximum likelihood on ground-truth transition pairs
@@ -39,7 +42,8 @@ Our additions / simplifications:
     phase 2. Use ``--preset gaussian_mle`` for a standalone
     supervised-MLE baseline, ``--preset pure_nasmc`` for the literal
     paper method, or ``--preset nasmc_warmstart`` for phase 1 + 2.
-  * Single-component diagonal Gaussian head (paper uses an MDN).
+  * ``num_components`` selects between the paper's base Gaussian head
+    (``K=1``) and the ``-MD-`` mixture head (``K>1``, paper default 3).
   * Markovian conditioning ``q_phi(x_t | x_{t-1}, y_t)`` (paper uses
     an LSTM over ``y_{1:t}, x_{1:t-1}``).
   * ``predict_delta=True`` parametrisation (``mu = x_{t-1} + mu_raw``).
@@ -48,8 +52,7 @@ Our additions / simplifications:
     that variant is available via ``use_dynamics_mean=True``.
 
 Potential v2 items (explicitly out of scope for the current
-implementation): MDN head, LSTM history conditioning, differentiable
-SMC.
+implementation): LSTM history conditioning, differentiable SMC.
 """
 
 from __future__ import annotations
@@ -133,12 +136,77 @@ def _diagonal_gaussian_log_prob(
     mu: torch.Tensor,
     log_sigma: torch.Tensor,
 ) -> torch.Tensor:
-    """Sum-of-coordinates diag-Gaussian log-density."""
+    """Sum-of-coordinates diag-Gaussian log-density.
+
+    Retained as a utility for code paths that already have a single
+    ``(mu, log_sigma)`` pair (e.g. the bootstrap-proposal fallback and
+    the transition / observation log-density helpers). For mixture
+    densities use :func:`_mixture_log_prob`.
+    """
     return -0.5 * (
         ((x - mu) / log_sigma.exp()) ** 2
         + 2.0 * log_sigma
         + math.log(2.0 * math.pi)
     ).sum(dim=-1)
+
+
+def _mixture_log_prob(
+    x: torch.Tensor,
+    mixing_logits: torch.Tensor,
+    mu: torch.Tensor,
+    log_sigma: torch.Tensor,
+    weight_floor: float = 0.0,
+) -> torch.Tensor:
+    """Log-density of a mixture of ``K`` diagonal Gaussians.
+
+    Inputs:
+        x:               (..., D)
+        mixing_logits:   (..., K)
+        mu, log_sigma:   (..., K, D)
+        weight_floor:    epsilon in ``[0, 1)``; mixing distribution
+                         becomes ``pi = (1 - eps) * softmax(logits)
+                         + eps / K``. ``eps = 0`` (default) is pure
+                         ``softmax``.
+
+    Returns:
+        (..., ) log-density.
+
+    With ``K=1`` this reduces exactly to
+    ``_diagonal_gaussian_log_prob(x, mu[..., 0, :], log_sigma[..., 0, :])``:
+    ``log_softmax`` of a size-1 tensor is always ``0``, and
+    ``logsumexp`` over a single component is the identity. A unit
+    test enforces this.
+    """
+    K = mixing_logits.shape[-1]
+
+    # Per-component diag-Gaussian log density: (..., K).
+    x_b = x.unsqueeze(-2)                           # (..., 1, D)
+    diff = (x_b - mu) / log_sigma.exp()             # (..., K, D)
+    per_comp = -0.5 * (
+        (diff * diff).sum(dim=-1)
+        + 2.0 * log_sigma.sum(dim=-1)
+        + mu.shape[-1] * math.log(2.0 * math.pi)
+    )                                               # (..., K)
+
+    log_pi = torch.log_softmax(mixing_logits, dim=-1)
+    if weight_floor > 0.0:
+        # pi = (1 - eps) * softmax + eps / K; take log stably.
+        eps = float(weight_floor)
+        pi = (1.0 - eps) * log_pi.exp() + eps / K
+        log_pi = torch.log(pi.clamp_min(1e-30))
+    return torch.logsumexp(log_pi + per_comp, dim=-1)
+
+
+def _mixing_probs_with_floor(
+    mixing_logits: torch.Tensor,
+    weight_floor: float = 0.0,
+) -> torch.Tensor:
+    """Return ``(..., K)`` mixing weights with optional floor smoothing."""
+    probs = torch.softmax(mixing_logits, dim=-1)
+    if weight_floor > 0.0:
+        K = mixing_logits.shape[-1]
+        probs = (1.0 - float(weight_floor)) * probs + float(weight_floor) / K
+    return probs
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +246,10 @@ class GaussianProposal(pl.LightningModule):
         log_sigma_max: float = 3.0,
         init_log_sigma: float = -1.0,
         zero_init_output: bool = True,
+        # Mixture knobs (paper's -MD- variant). K=1 recovers the plain
+        # single-Gaussian proposal used in Gu et al. 2015's base model.
+        num_components: int = 1,
+        mixture_weight_floor: float = 0.0,
         # Optimisation (phase 1)
         learning_rate: float = 1e-3,
         weight_decay: float = 1e-5,
@@ -205,6 +277,11 @@ class GaussianProposal(pl.LightningModule):
             ]
         )
 
+        if num_components < 1:
+            raise ValueError("num_components must be >= 1")
+        if not (0.0 <= float(mixture_weight_floor) < 1.0):
+            raise ValueError("mixture_weight_floor must be in [0, 1)")
+
         self.state_dim = state_dim
         self.obs_dim = obs_dim
         self.architecture = architecture
@@ -220,6 +297,8 @@ class GaussianProposal(pl.LightningModule):
         self.obs_noise_std = float(obs_noise_std)
         self.obs_nonlinearity = obs_nonlinearity or "arctan"
         self.obs_indices = list(obs_indices) if obs_indices is not None else None
+        self.num_components = int(num_components)
+        self.mixture_weight_floor = float(mixture_weight_floor)
 
         self.net = create_gaussian_head_network(
             architecture=architecture,
@@ -236,6 +315,7 @@ class GaussianProposal(pl.LightningModule):
             obs_indices=obs_indices,
             zero_init_output=zero_init_output,
             init_log_sigma=init_log_sigma,
+            num_components=self.num_components,
         )
 
         # Register scalers as non-persistent buffers so they travel with
@@ -378,29 +458,48 @@ class GaussianProposal(pl.LightningModule):
     ) -> torch.Tensor:
         return self.net(x_prev, y_curr, t_normalized)
 
-    def mean_and_log_sigma(
+    def _mixture_params(
         self,
         x_prev: torch.Tensor,
         y_curr: Optional[torch.Tensor] = None,
         t: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Return the Gaussian parameters ``(mu, log_sigma)`` in scaled state space."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return ``(mixing_logits, mu, log_sigma)`` in scaled space.
+
+        Shapes:
+            mixing_logits: ``(B, K)``
+            mu:            ``(B, K, D)`` — ``predict_delta`` /
+                ``use_dynamics_mean`` applied per component so that
+                every component starts at the skip-connection
+                prediction when ``mu_raw == 0``.
+            log_sigma:     ``(B, K, D)`` — clamped to
+                ``[log_sigma_min, log_sigma_max]``.
+
+        With ``K=1`` this is equivalent to the previous
+        ``mean_and_log_sigma`` (up to a trailing component axis): the
+        mixing logit collapses to a ``softmax`` weight of ``1`` and the
+        single component's ``(mu, log_sigma)`` matches the old path.
+        """
         batch_size = x_prev.shape[0]
+        K = self.num_components
+        D = self.state_dim
         t_normalized = self._normalize_trajectory_time(
-            t=t, batch_size=batch_size, caller_name="mean_and_log_sigma",
+            t=t, batch_size=batch_size, caller_name="_mixture_params",
         )
-        out = self._raw_forward(x_prev, y_curr, t_normalized)
-        mu_raw, log_sigma = out.chunk(2, dim=-1)
+        out = self._raw_forward(x_prev, y_curr, t_normalized)  # (B, K*(2D+1))
+        packed = out.reshape(batch_size, K, 2 * D + 1)
+        mixing_logits = packed[..., 0]                          # (B, K)
+        mu_raw = packed[..., 1 : 1 + D]                         # (B, K, D)
+        log_sigma = packed[..., 1 + D :]                        # (B, K, D)
         log_sigma = torch.clamp(log_sigma, min=self.log_sigma_min, max=self.log_sigma_max)
 
+        # Skip-connection / dynamics mean, broadcast across K components.
         if self.use_dynamics_mean:
             if self._system is None or self._dt is None:
                 raise ValueError(
                     "use_dynamics_mean=True requires a DynamicalSystem to be "
                     "attached via attach_system(system, dt)."
                 )
-            # Deterministic one-step dynamics in *scaled* space:
-            # unscale -> RK4/integrate -> scale again.
             with torch.no_grad():
                 x_prev_phys = (
                     x_prev * self.state_scaler_std.to(x_prev.device)
@@ -414,16 +513,70 @@ class GaussianProposal(pl.LightningModule):
                 x_next_scaled = (
                     x_next_phys - self.state_scaler_mean.to(x_prev.device)
                 ) / self.state_scaler_std.to(x_prev.device)
-            mu = x_next_scaled + mu_raw
+            mu = x_next_scaled.unsqueeze(-2) + mu_raw              # (B, K, D)
         elif self.predict_delta:
-            mu = x_prev + mu_raw
+            mu = x_prev.unsqueeze(-2) + mu_raw                      # (B, K, D)
         else:
             mu = mu_raw
-        return mu, log_sigma
+        return mixing_logits, mu, log_sigma
+
+    # Back-compat convenience: collapse the mixture to a single
+    # ``(mu, log_sigma)`` pair by argmax over components (or taking
+    # component 0 when ``K == 1``). The mean under the mixture weights
+    # is also available, but the old code path expected the modal
+    # component.
+    def mean_and_log_sigma(
+        self,
+        x_prev: torch.Tensor,
+        y_curr: Optional[torch.Tensor] = None,
+        t: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return ``(mu, log_sigma)`` under the modal mixture component.
+
+        Kept for backwards compatibility / diagnostics. For training,
+        always go through :meth:`_mixture_params` +
+        :func:`_mixture_log_prob`.
+        """
+        mixing_logits, mu, log_sigma = self._mixture_params(x_prev, y_curr, t)
+        if self.num_components == 1:
+            return mu.squeeze(-2), log_sigma.squeeze(-2)
+        B, K, D = mu.shape
+        idx = mixing_logits.argmax(dim=-1)  # (B,)
+        idx_exp = idx.view(B, 1, 1).expand(B, 1, D)
+        return mu.gather(1, idx_exp).squeeze(1), log_sigma.gather(1, idx_exp).squeeze(1)
 
     # ------------------------------------------------------------------
     # ProposalDistribution-style API (scaled space).
     # ------------------------------------------------------------------
+
+    def _select_component_per_batch(
+        self,
+        mixing_logits: torch.Tensor,
+        mu: torch.Tensor,
+        log_sigma: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Draw one component index per batch row and gather its params.
+
+        For ``K == 1`` the single component is returned directly — this
+        shortcut keeps ``num_components=1`` deterministically identical
+        to the single-Gaussian path (no extra RNG draw for the
+        Categorical sampler, which would otherwise perturb run-level
+        reproducibility).
+
+        The ``mixture_weight_floor`` (if > 0) is applied to the mixing
+        distribution before sampling.
+        """
+        if self.num_components == 1:
+            return mu.squeeze(-2), log_sigma.squeeze(-2)
+        probs = _mixing_probs_with_floor(mixing_logits, self.mixture_weight_floor)
+        # Categorical(logits=log_pi) matches probs; use probs form for
+        # numerical clarity when weight_floor is applied.
+        idx = torch.distributions.Categorical(probs=probs).sample()   # (B,)
+        B, K, D = mu.shape
+        idx_exp = idx.view(B, 1, 1).expand(B, 1, D)
+        mu_sel = mu.gather(1, idx_exp).squeeze(1)
+        log_sigma_sel = log_sigma.gather(1, idx_exp).squeeze(1)
+        return mu_sel, log_sigma_sel
 
     def sample(
         self,
@@ -433,23 +586,36 @@ class GaussianProposal(pl.LightningModule):
         t: Optional[torch.Tensor] = None,
         return_params: bool = False,
     ) -> torch.Tensor:
-        """Draw a reparameterised Gaussian sample ``x_t`` in scaled space."""
+        """Draw a reparameterised mixture-Gaussian sample in scaled space.
+
+        With ``K > 1`` we first draw a component index from
+        ``Categorical(pi)`` (where ``pi`` is the mixing distribution,
+        optionally floor-smoothed), then take a reparameterised Gaussian
+        draw from that component. With ``K = 1`` the Categorical draw is
+        skipped entirely so the RNG sequence matches the original
+        single-Gaussian implementation.
+        """
         was_1d = x_prev.dim() == 1
         if was_1d:
             x_prev = x_prev.unsqueeze(0)
             if y_curr is not None:
                 y_curr = y_curr.unsqueeze(0)
 
-        mu, log_sigma = self.mean_and_log_sigma(x_prev, y_curr, t)
-        eps = torch.randn_like(mu)
-        x = mu + log_sigma.exp() * eps
+        mixing_logits, mu, log_sigma = self._mixture_params(x_prev, y_curr, t)
+        mu_sel, log_sigma_sel = self._select_component_per_batch(
+            mixing_logits, mu, log_sigma
+        )
+        eps = torch.randn_like(mu_sel)
+        x = mu_sel + log_sigma_sel.exp() * eps
 
         if was_1d:
             x = x.squeeze(0)
-            mu = mu.squeeze(0)
-            log_sigma = log_sigma.squeeze(0)
+            mu_sel = mu_sel.squeeze(0)
+            log_sigma_sel = log_sigma_sel.squeeze(0)
         if return_params:
-            return x, mu, log_sigma
+            # Preserved for older callers; returns the *selected*
+            # component's params (the relevant local Gaussian).
+            return x, mu_sel, log_sigma_sel
         return x
 
     def log_prob(
@@ -460,7 +626,11 @@ class GaussianProposal(pl.LightningModule):
         dt: Optional[float] = None,
         t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Closed-form diagonal-Gaussian log-density in scaled space."""
+        """Closed-form mixture-Gaussian log-density in scaled space.
+
+        With ``K=1`` this reduces to the original single-Gaussian
+        closed form (a trailing ``logsumexp`` over a single component).
+        """
         was_1d = x_curr.dim() == 1
         if was_1d:
             x_curr = x_curr.unsqueeze(0)
@@ -468,8 +638,10 @@ class GaussianProposal(pl.LightningModule):
             if y_curr is not None:
                 y_curr = y_curr.unsqueeze(0)
 
-        mu, log_sigma = self.mean_and_log_sigma(x_prev, y_curr, t)
-        lp = _diagonal_gaussian_log_prob(x_curr, mu, log_sigma)
+        mixing_logits, mu, log_sigma = self._mixture_params(x_prev, y_curr, t)
+        lp = _mixture_log_prob(
+            x_curr, mixing_logits, mu, log_sigma, weight_floor=self.mixture_weight_floor,
+        )
 
         if was_1d:
             lp = lp.squeeze(0)
@@ -485,11 +657,30 @@ class GaussianProposal(pl.LightningModule):
         y_curr = batch.get("y_curr", None)
         t = batch.get("time_idx", None)
 
-        log_prob = self.log_prob(x_curr, x_prev, y_curr, t=t)
+        # Call the mixture parser directly so we can log the
+        # component-collapse diagnostic (mean max mixing weight per
+        # batch). For K=1 this collapses to the old single-Gaussian
+        # MLE loss bit-for-bit (up to a trivial log_softmax of a
+        # singleton, which is exactly 0).
+        was_1d = x_prev.dim() == 1
+        if was_1d:
+            x_prev = x_prev.unsqueeze(0)
+            x_curr = x_curr.unsqueeze(0)
+            if y_curr is not None:
+                y_curr = y_curr.unsqueeze(0)
+
+        mixing_logits, mu, log_sigma = self._mixture_params(x_prev, y_curr, t)
+        log_prob = _mixture_log_prob(
+            x_curr, mixing_logits, mu, log_sigma, weight_floor=self.mixture_weight_floor,
+        )
         nll = -log_prob.mean()
+
+        pi = _mixing_probs_with_floor(mixing_logits, self.mixture_weight_floor)
+        max_pi = pi.max(dim=-1).values
         metrics = {
             "nll": float(nll.detach().item()),
             "log_prob_mean": float(log_prob.detach().mean().item()),
+            "max_pi_mean": float(max_pi.detach().mean().item()),
         }
         return nll, metrics
 
@@ -667,10 +858,21 @@ class GaussianProposal(pl.LightningModule):
 
             proposal_enabled = has_obs and not use_bootstrap
             if proposal_enabled:
-                mu, log_sigma = self.mean_and_log_sigma(x_prev_flat, y_flat, t_flat)
-                eps = torch.randn_like(mu)
-                x_new_flat = mu + log_sigma.exp() * eps
-                log_q = _diagonal_gaussian_log_prob(x_new_flat, mu, log_sigma)
+                mixing_logits, mu, log_sigma = self._mixture_params(
+                    x_prev_flat, y_flat, t_flat,
+                )
+                mu_sel, log_sigma_sel = self._select_component_per_batch(
+                    mixing_logits, mu, log_sigma
+                )
+                eps = torch.randn_like(mu_sel)
+                x_new_flat = mu_sel + log_sigma_sel.exp() * eps
+                # Evaluate the mixture density at the drawn point — not
+                # the selected component's density. This is the correct
+                # proposal log-density for importance weighting.
+                log_q = _mixture_log_prob(
+                    x_new_flat, mixing_logits, mu, log_sigma,
+                    weight_floor=self.mixture_weight_floor,
+                )
             else:
                 # Bootstrap (prior) proposal: sample from the transition.
                 mu_trans = self._dynamics_next_scaled(x_prev_flat)
@@ -762,6 +964,7 @@ class GaussianProposal(pl.LightningModule):
         self.train()
         total_loss = torch.zeros((), device=self.device)
         total_ess_sum = 0.0
+        total_max_pi_sum = 0.0
         n_obs_steps = 0
 
         for t in range(1, T):
@@ -786,9 +989,13 @@ class GaussianProposal(pl.LightningModule):
                     (B * N,), float(t), device=self.device, dtype=x_prev_flat.dtype
                 )
 
-            mu, log_sigma = self.mean_and_log_sigma(x_prev_flat, y_flat, t_flat)
-            log_q = _diagonal_gaussian_log_prob(x_curr_flat, mu, log_sigma)
-            log_q = log_q.reshape(B, N)
+            mixing_logits, mu, log_sigma = self._mixture_params(
+                x_prev_flat, y_flat, t_flat,
+            )
+            log_q = _mixture_log_prob(
+                x_curr_flat, mixing_logits, mu, log_sigma,
+                weight_floor=self.mixture_weight_floor,
+            ).reshape(B, N)
 
             # Only count batch items that have an observation at step t.
             w = weights[:, t]                         # (B, N)
@@ -801,6 +1008,14 @@ class GaussianProposal(pl.LightningModule):
             total_ess_sum += (
                 (1.0 / torch.sum(w ** 2 + 1e-30, dim=-1)) * mask_b.squeeze(-1)
             ).sum().item() / max(denom.item(), 1.0)
+
+            # Component-collapse diagnostic: mean max-mixing-weight per
+            # particle per observed step. For K=1 this is trivially 1.0.
+            pi = _mixing_probs_with_floor(mixing_logits, self.mixture_weight_floor)
+            max_pi = pi.max(dim=-1).values.reshape(B, N)
+            total_max_pi_sum += (
+                max_pi.detach() * mask_b
+            ).sum().item() / max(denom.item() * N, 1.0)
             n_obs_steps += 1
 
         if n_obs_steps == 0:
@@ -812,6 +1027,7 @@ class GaussianProposal(pl.LightningModule):
         metrics = {
             "nasmc_loss": float(total_loss.detach().item()),
             "mean_ess": total_ess_sum / max(n_obs_steps, 1),
+            "max_pi_mean": total_max_pi_sum / max(n_obs_steps, 1),
         }
         return total_loss, metrics
 
@@ -824,6 +1040,10 @@ class GaussianProposal(pl.LightningModule):
             loss, metrics = self._mle_loss(batch)
             self.log("train_nll", metrics["nll"], prog_bar=True, on_step=True, on_epoch=True)
             self.log("train_log_prob", metrics["log_prob_mean"], on_epoch=True)
+            # Component-collapse diagnostic: if this saturates near 1.0
+            # the mixture has effectively collapsed to a single
+            # component. Always 1.0 when K=1 (expected).
+            self.log("train_max_pi", metrics["max_pi_mean"], on_epoch=True)
         elif self.training_phase == "refine":
             num_particles = int(self._refine_cfg.get("num_particles", 64))
             resample_threshold = float(self._refine_cfg.get("resample_threshold", 0.5))
@@ -836,6 +1056,10 @@ class GaussianProposal(pl.LightningModule):
             )
             self.log("train_nasmc", metrics["nasmc_loss"], prog_bar=True, on_step=True, on_epoch=True)
             self.log("train_mean_ess", metrics["mean_ess"], on_epoch=True, prog_bar=True)
+            # Component-collapse diagnostic over the SMC particles used
+            # for the gradient. Watch this in phase 2: saturation near
+            # 1.0 under K>1 is the canonical MDN collapse pathology.
+            self.log("train_max_pi", metrics["max_pi_mean"], on_epoch=True)
         else:
             raise ValueError(f"Unknown training_phase: {self.training_phase}")
         return loss
@@ -845,6 +1069,7 @@ class GaussianProposal(pl.LightningModule):
             _, metrics = self._mle_loss(batch)
             self.log("val_nll", metrics["nll"], prog_bar=True, on_epoch=True)
             self.log("val_log_prob", metrics["log_prob_mean"], on_epoch=True)
+            self.log("val_max_pi", metrics["max_pi_mean"], on_epoch=True)
         else:
             # Validation in refine mode is costly (another SMC pass).
             # We compute the phase-1 NLL on a dummy (x_prev, x_curr) view
@@ -865,6 +1090,7 @@ class GaussianProposal(pl.LightningModule):
             _, metrics = self._mle_loss(mle_batch)
             self.log("val_nll", metrics["nll"], prog_bar=True, on_epoch=True)
             self.log("val_log_prob", metrics["log_prob_mean"], on_epoch=True)
+            self.log("val_max_pi", metrics["max_pi_mean"], on_epoch=True)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(

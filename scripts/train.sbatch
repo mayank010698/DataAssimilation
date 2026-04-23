@@ -1,15 +1,14 @@
 #!/bin/bash
 #
 #SBATCH --job-name="train-nasmc-l96-dim5"
-#SBATCH --partition=secondary
+#SBATCH --partition=dali
 #SBATCH --account=cnagda2-ic
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=1
-#SBATCH --mem=16g
-#SBATCH --time=04:00:00
-#SBATCH --requeue
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=64g
+#SBATCH --time=72:00:00
 #SBATCH --output=/projects/illinois/eng/cs/arindamb/cnagda2/slurm_output/%j.log
 
 # Train NASMC baseline presets on the Lorenz96 5-dimensional dataset.
@@ -87,6 +86,9 @@ JOB_ID="${SLURM_JOB_ID:-manual}"
 # Project lives under the ml-climate entity (matching train_rf.py).
 WANDB_PROJECT=nasmc-train-96
 WANDB_ENTITY=ml-climate
+
+sleep $((3 * 24 * 60 * 60))
+
 
 run_preset() {
     local preset="$1"

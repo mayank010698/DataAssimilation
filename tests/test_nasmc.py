@@ -51,6 +51,7 @@ np.random.seed(0)
 
 
 def test_mlp_gaussian_head_shapes():
+    """K=1 default: output dim is K*(2D+1). With K=1 that's 2D+1."""
     state_dim = 4
     obs_dim = 2
     net = MLPGaussianHead(
@@ -66,7 +67,27 @@ def test_mlp_gaussian_head_shapes():
     y = torch.randn(B, obs_dim)
     t = torch.randint(0, 100, (B,)).float() / 100.0
     out = net(x_prev, y, t)
-    assert out.shape == (B, 2 * state_dim)
+    assert out.shape == (B, 1 * (2 * state_dim + 1))
+
+
+def test_mlp_gaussian_head_shapes_mixture():
+    """K>1: output dim scales as K*(2D+1)."""
+    state_dim = 4
+    obs_dim = 2
+    K = 3
+    net = MLPGaussianHead(
+        state_dim=state_dim,
+        obs_dim=obs_dim,
+        obs_indices=[0, 2],
+        hidden_dim=32,
+        depth=2,
+        num_components=K,
+    )
+    B = 5
+    x_prev = torch.randn(B, state_dim)
+    y = torch.randn(B, obs_dim)
+    out = net(x_prev, y)
+    assert out.shape == (B, K * (2 * state_dim + 1))
 
 
 def test_resnet1d_gaussian_head_shapes():
@@ -83,7 +104,26 @@ def test_resnet1d_gaussian_head_shapes():
     x_prev = torch.randn(B, state_dim)
     y = torch.randn(B, obs_dim)
     out = net(x_prev, y)
-    assert out.shape == (B, 2 * state_dim)
+    assert out.shape == (B, 1 * (2 * state_dim + 1))
+
+
+def test_resnet1d_gaussian_head_shapes_mixture():
+    state_dim = 8
+    obs_dim = 4
+    K = 4
+    net = ResNet1DGaussianHead(
+        state_dim=state_dim,
+        obs_dim=obs_dim,
+        obs_indices=[0, 2, 4, 6],
+        channels=16,
+        num_blocks=2,
+        num_components=K,
+    )
+    B = 3
+    x_prev = torch.randn(B, state_dim)
+    y = torch.randn(B, obs_dim)
+    out = net(x_prev, y)
+    assert out.shape == (B, K * (2 * state_dim + 1))
 
 
 def test_factory_constructs_heads():
@@ -171,6 +211,185 @@ def test_gaussian_proposal_zero_init_recovers_delta_zero():
     mu, log_sigma = model.mean_and_log_sigma(x_prev)
     assert torch.allclose(mu, x_prev, atol=1e-5)
     assert torch.allclose(log_sigma, torch.full_like(log_sigma, init_log_sigma), atol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Mixture-of-Gaussians (-MD-) variant tests.
+# ---------------------------------------------------------------------------
+
+
+def test_mixture_proposal_K1_reduces_to_single_gaussian():
+    """K=1 mixture log_prob must match the analytic single-Gaussian log-density."""
+    state_dim = 3
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=0, hidden_dim=16, depth=2,
+        predict_delta=True, num_components=1,
+    )
+    model.eval()
+    B = 5
+    x_prev = torch.randn(B, state_dim)
+    x_curr = torch.randn(B, state_dim)
+
+    # mean_and_log_sigma is the modal-component shim; under K=1 the
+    # single component *is* the modal component.
+    mu, log_sigma = model.mean_and_log_sigma(x_prev)
+    lp_mixture = model.log_prob(x_curr, x_prev, y_curr=None, dt=0.01)
+    lp_manual = -0.5 * (
+        ((x_curr - mu) / log_sigma.exp()) ** 2
+        + 2 * log_sigma
+        + math.log(2 * math.pi)
+    ).sum(dim=-1)
+    assert torch.allclose(lp_mixture, lp_manual, atol=1e-5)
+
+
+def test_mixture_proposal_K3_log_prob_matches_manual_logsumexp():
+    """Mixture log_prob equals a hand-rolled log-sum-exp of component log-probs."""
+    torch.manual_seed(42)
+    state_dim = 4
+    K = 3
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=0, hidden_dim=16, depth=2,
+        predict_delta=True, num_components=K, zero_init_output=False,
+    )
+    # Break the symmetry so components produce different params.
+    for p in model.parameters():
+        if p.requires_grad:
+            torch.nn.init.normal_(p, mean=0.0, std=0.05)
+    model.eval()
+
+    B = 7
+    x_prev = torch.randn(B, state_dim)
+    x_curr = torch.randn(B, state_dim)
+
+    mixing_logits, mu, log_sigma = model._mixture_params(x_prev)
+    assert mixing_logits.shape == (B, K)
+    assert mu.shape == (B, K, state_dim)
+    assert log_sigma.shape == (B, K, state_dim)
+
+    log_pi = torch.log_softmax(mixing_logits, dim=-1)                # (B, K)
+    x_b = x_curr.unsqueeze(1)                                        # (B, 1, D)
+    per_comp = -0.5 * (
+        ((x_b - mu) / log_sigma.exp()) ** 2
+        + 2 * log_sigma
+        + math.log(2 * math.pi)
+    ).sum(dim=-1)                                                    # (B, K)
+    manual = torch.logsumexp(log_pi + per_comp, dim=-1)              # (B,)
+
+    lp = model.log_prob(x_curr, x_prev, y_curr=None, dt=0.01)
+    assert lp.shape == (B,)
+    assert torch.allclose(lp, manual, atol=1e-5)
+
+
+def test_mixture_proposal_sample_and_log_prob_shapes():
+    """sample() should pick one component per batch row and return a draw in state space."""
+    torch.manual_seed(0)
+    state_dim = 3
+    obs_dim = 1
+    K = 3
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=obs_dim, hidden_dim=16, depth=2,
+        obs_indices=[0], predict_delta=True, num_components=K,
+    )
+    model.eval()
+    B = 5
+    x_prev = torch.randn(B, state_dim)
+    y = torch.randn(B, obs_dim)
+    x_draw = model.sample(x_prev, y, dt=0.01)
+    assert x_draw.shape == (B, state_dim)
+
+    lp = model.log_prob(x_draw, x_prev, y, dt=0.01)
+    assert lp.shape == (B,)
+    assert torch.isfinite(lp).all()
+
+
+def test_mixture_proposal_weight_floor_applied_to_log_prob():
+    """With eps > 0, pi = (1-eps)*softmax + eps/K; log-prob must reflect that."""
+    torch.manual_seed(1)
+    state_dim = 2
+    K = 3
+    eps = 0.25
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=0, hidden_dim=16, depth=2,
+        predict_delta=True, num_components=K, mixture_weight_floor=eps,
+        zero_init_output=False,
+    )
+    for p in model.parameters():
+        if p.requires_grad:
+            torch.nn.init.normal_(p, std=0.1)
+    model.eval()
+
+    B = 4
+    x_prev = torch.randn(B, state_dim)
+    x_curr = torch.randn(B, state_dim)
+
+    mixing_logits, mu, log_sigma = model._mixture_params(x_prev)
+    sm = torch.softmax(mixing_logits, dim=-1)
+    pi = (1 - eps) * sm + eps / K
+    x_b = x_curr.unsqueeze(1)
+    per_comp = -0.5 * (
+        ((x_b - mu) / log_sigma.exp()) ** 2
+        + 2 * log_sigma
+        + math.log(2 * math.pi)
+    ).sum(dim=-1)
+    manual = torch.logsumexp(torch.log(pi) + per_comp, dim=-1)
+    lp = model.log_prob(x_curr, x_prev, y_curr=None, dt=0.01)
+    assert torch.allclose(lp, manual, atol=1e-5)
+
+
+def test_mixture_proposal_zero_init_uniform_mixing_and_skip_prediction():
+    """Zero-init: uniform mixing, all K components peaked at x_prev with log_sigma=init."""
+    state_dim = 3
+    K = 4
+    init_log_sigma = -1.5
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=0, hidden_dim=16, depth=2,
+        predict_delta=True, num_components=K, init_log_sigma=init_log_sigma,
+        zero_init_output=True,
+    )
+    model.eval()
+    x_prev = torch.randn(6, state_dim)
+    mixing_logits, mu, log_sigma = model._mixture_params(x_prev)
+    # Every component centred on the skip prediction (x_prev).
+    for k in range(K):
+        assert torch.allclose(mu[:, k, :], x_prev, atol=1e-5)
+        assert torch.allclose(
+            log_sigma[:, k, :],
+            torch.full((6, state_dim), init_log_sigma),
+            atol=1e-5,
+        )
+    # Uniform mixing weights (all logits equal to zero).
+    pi = torch.softmax(mixing_logits, dim=-1)
+    expected = torch.full((6, K), 1.0 / K)
+    assert torch.allclose(pi, expected, atol=1e-5)
+
+
+def test_mixture_proposal_mle_training_step_runs_and_differentiates_components():
+    """One gradient step on toy data should break the zero-init symmetry for K=3."""
+    torch.manual_seed(0)
+    state_dim = 3
+    obs_dim = 1
+    K = 3
+    model = GaussianProposal(
+        state_dim=state_dim, obs_dim=obs_dim, hidden_dim=16, depth=2,
+        obs_indices=[0], predict_delta=True, num_components=K,
+    )
+    model.set_phase("pretrain")
+    B = 32
+    batch = {
+        "x_prev": torch.randn(B, state_dim),
+        "x_curr": torch.randn(B, state_dim),
+        "y_curr": torch.randn(B, obs_dim),
+    }
+    loss = model.training_step(batch, 0)
+    assert loss.dim() == 0
+    loss.backward()
+    # Gradient should be non-zero on at least one output-layer parameter,
+    # which is what actually breaks the component symmetry.
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None and torch.any(p.grad != 0):
+            break
+    else:
+        raise AssertionError("No parameter received a non-zero gradient.")
 
 
 # ---------------------------------------------------------------------------

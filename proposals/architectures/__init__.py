@@ -286,11 +286,14 @@ def create_gaussian_head_network(
     use_time_step: bool = False,
     **kwargs,
 ):
-    """Factory for the NASMC Gaussian-head backbones.
+    """Factory for the NASMC (mixture-of-)Gaussian head backbones.
 
     Constructs a network that maps ``(x_prev, y, [t])`` to
-    ``(B, 2 * state_dim)``, interpreted as ``[mu_raw, log_sigma]`` per
-    site.
+    ``(B, num_components * (2 * state_dim + 1))``, interpreted
+    per-component as ``[logit, mu_raw_D, log_sigma_D]``. With
+    ``num_components == 1`` (default) this is exactly a single
+    diagonal-Gaussian head (the extra mixing-logit slot collapses to a
+    constant ``softmax`` weight of ``1``).
 
     Args:
         architecture: 'mlp' or 'resnet1d'.
@@ -299,11 +302,15 @@ def create_gaussian_head_network(
         use_time_step: Whether the network conditions on trajectory time.
         **kwargs: Architecture-specific hyperparameters. Accepts the same
             options as :func:`create_velocity_network` plus
-            ``init_log_sigma`` which controls the initial value of the
-            log-std bias (default -1.0, i.e. sigma ~ 0.37).
+            ``init_log_sigma`` (default -1.0) which controls the initial
+            log-std bias, and ``num_components`` (default 1) which
+            selects the number of mixture components — ``K=1`` is the
+            paper's base Gaussian proposal; ``K>1`` is the paper's
+            ``-MD-`` (mixture-density) variant.
     """
     init_log_sigma = float(kwargs.pop("init_log_sigma", -1.0))
     zero_init_output = bool(kwargs.pop("zero_init_output", True))
+    num_components = int(kwargs.pop("num_components", 1))
 
     if architecture in ("mlp", "mlp_fixed"):
         return MLPGaussianHead(
@@ -317,6 +324,7 @@ def create_gaussian_head_network(
             use_time_step=use_time_step,
             zero_init_output=zero_init_output,
             init_log_sigma=init_log_sigma,
+            num_components=num_components,
         )
     elif architecture == "resnet1d":
         return ResNet1DGaussianHead(
@@ -331,6 +339,7 @@ def create_gaussian_head_network(
             use_time_step=use_time_step,
             zero_init_output=zero_init_output,
             init_log_sigma=init_log_sigma,
+            num_components=num_components,
         )
     else:
         raise ValueError(
